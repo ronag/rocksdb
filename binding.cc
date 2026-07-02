@@ -334,6 +334,12 @@ struct BaseIterator : public Closable {
                const int limit,
                rocksdb::ReadOptions readOptions = {})
       : database_(database), column_(column), reverse_(reverse), limit_(limit) {
+    // TODO (correctness): the +'\0' byte-successor trick below converts
+    // inclusive/exclusive bounds correctly only under bytewise ordering. With a
+    // custom CF comparator (InitOptions "comparator", e.g.
+    // rocksdb.ReverseBytewiseComparator) RocksDB applies these bounds with that
+    // comparator, silently inverting the lte/gt boundary semantics. Seek()'s
+    // manual bound check below uses raw bytewise Slice::compare as well.
     if (lte) {
       upper_bound_ = rocksdb::PinnableSlice();
       *upper_bound_->GetSelf() = std::move(*lte) + '\0';
