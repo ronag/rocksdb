@@ -294,7 +294,7 @@ class RocksLevel extends AbstractLevel {
     return binding.db_get_identity(this[kContext])
   }
 
-  getProperty (property) {
+  getProperty (property, options) {
     if (typeof property !== 'string') {
       throw new TypeError("The first argument 'property' must be a string")
     }
@@ -306,7 +306,7 @@ class RocksLevel extends AbstractLevel {
       })
     }
 
-    return binding.db_get_property(this[kContext], property)
+    return binding.db_get_property(this[kContext], property, options ?? kEmpty)
   }
 
   query (options, callback) {
