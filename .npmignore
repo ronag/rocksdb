@@ -57,6 +57,7 @@ benchmarks/
 *.csv
 
 # Misc
+.claude/
 .tap/
 .vscode/
 .nyc_output/

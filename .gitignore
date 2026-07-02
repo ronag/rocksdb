@@ -26,3 +26,4 @@ package-lock.json
 tmp/
 yarn-error.log
 prebuilds.zip
+.claude/settings.local.json
