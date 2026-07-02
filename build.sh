@@ -7,6 +7,11 @@ set -e
 # arm64 gcc rejects -march=znver3 ("unknown value 'znver3'") and the build fails.
 PLATFORM=linux/amd64
 
+# Build on the remote x86-64 docker host by default (avoids emulation on
+# Apple Silicon). Override with DOCKER_HOST=... ./build.sh, or
+# DOCKER_HOST= ./build.sh to use the local docker daemon.
+export DOCKER_HOST="${DOCKER_HOST-ssh://nxtop@hq-test-srv1.nxt.io}"
+
 echo "Initializing submodules..."
 git submodule update --init
 
