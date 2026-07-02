@@ -64,3 +64,27 @@ test('getProperty() throws if db is closed', function (t) {
   })
   t.end()
 })
+
+test('test getProperty() with column option', async function (t) {
+  const db2 = testCommon.factory()
+  await db2.open({
+    columns: { test: {}, default: {} }
+  })
+  const column = db2.columns.test
+
+  const batch = db2.batch()
+  batch.put('a', 'val1', { column })
+  batch.put('b', 'val2', { column })
+  batch.put('c', 'val3', { column })
+  await batch.write()
+
+  t.equal(db2.getProperty('rocksdb.num-entries-active-mem-table', { column }),
+    '3', 'column-scoped property reads the given column')
+  t.equal(db2.getProperty('rocksdb.num-entries-active-mem-table'),
+    '0', 'no options reads the default column')
+  t.equal(db2.getProperty('rocksdb.num-entries-active-mem-table', {}),
+    '0', 'empty options reads the default column')
+
+  await db2.close()
+  t.end()
+})

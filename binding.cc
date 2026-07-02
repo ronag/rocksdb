@@ -1811,7 +1811,7 @@ NAPI_METHOD(db_clear) {
 }
 
 NAPI_METHOD(db_get_property) {
-  NAPI_ARGV(2);
+  NAPI_ARGV(3);
 
   Database* database;
   NAPI_STATUS_THROWS(napi_get_value_external(env, argv[0], reinterpret_cast<void**>(&database)));
@@ -1824,8 +1824,13 @@ NAPI_METHOD(db_get_property) {
   rocksdb::PinnableSlice property;
   NAPI_STATUS_THROWS(GetValue(env, argv[1], property));
 
+  // Most rocksdb properties are column-family scoped; without an explicit
+  // column they answer for the default CF only.
+  rocksdb::ColumnFamilyHandle* column = database->db->DefaultColumnFamily();
+  NAPI_STATUS_THROWS(GetProperty(env, argv[2], "column", column));
+
   std::string value;
-  database->db->GetProperty(property, &value);
+  database->db->GetProperty(column, property, &value);
 
   napi_value result;
   NAPI_STATUS_THROWS(napi_create_string_utf8(env, value.data(), value.size(), &result));
