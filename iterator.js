@@ -16,6 +16,7 @@ const kFirst = Symbol('first')
 const kPosition = Symbol('position')
 const kBusy = Symbol('busy')
 const kPendingClose = Symbol('pendingClose')
+const kHasFilter = Symbol('hasFilter')
 
 const kEmpty = Object.freeze([])
 
@@ -32,6 +33,7 @@ class Iterator extends AbstractIterator {
     this[kDB] = db
     this[kBusy] = false
     this[kPendingClose] = null
+    this[kHasFilter] = options.keyFilter != null || options.valueFilter != null
   }
 
   [Symbol.asyncDispose] () {
@@ -85,15 +87,41 @@ class Iterator extends AbstractIterator {
       const size = this[kFirst] ? 1 : 1000
       this[kFirst] = false
 
-      try {
-        const { rows, finished } = binding.iterator_nextv_sync(this[kContext], size, null)
-        this[kCache] = rows
-        this[kFinished] = finished
-        this[kPosition] = 0
+      if (this[kHasFilter]) {
+        try {
+          this[kDB][kRef]()
+          this[kBusy] = true
+          binding.iterator_nextv(this[kContext], size, null, (err, result) => {
+            this[kBusy] = false
+            this[kDB][kUnref]()
 
-        setImmediate(() => this._next(callback))
-      } catch (err) {
-        process.nextTick(callback, err)
+            if (err) {
+              callback(err)
+            } else {
+              this[kCache] = result.rows
+              this[kFinished] = result.finished
+              this[kPosition] = 0
+              this._next(callback)
+            }
+
+            this._flushPendingClose()
+          })
+        } catch (err) {
+          this[kBusy] = false
+          this[kDB][kUnref]()
+          process.nextTick(callback, err)
+        }
+      } else {
+        try {
+          const { rows, finished } = binding.iterator_nextv_sync(this[kContext], size, null)
+          this[kCache] = rows
+          this[kFinished] = finished
+          this[kPosition] = 0
+
+          setImmediate(() => this._next(callback))
+        } catch (err) {
+          process.nextTick(callback, err)
+        }
       }
     }
 
@@ -189,9 +217,24 @@ class Iterator extends AbstractIterator {
     return callback[kPromise]
   }
 
+  _nextvCached (size) {
+    const end = Math.min(this[kCache].length, this[kPosition] + size * 2)
+    const rows = this[kCache].slice(this[kPosition], end)
+    this[kPosition] = end
+
+    const finished = this[kFinished] && this[kPosition] >= this[kCache].length
+    const limited = !finished && rows.length >= size * 2
+
+    return { rows, finished, limited }
+  }
+
   _nextvSync (size, options) {
     assert(this[kContext])
     assert(!this[kBusy])
+
+    if (this[kPosition] < this[kCache].length) {
+      return this._nextvCached(size)
+    }
 
     if (this[kFinished]) {
       return { rows: [], finished: true }
@@ -210,7 +253,9 @@ class Iterator extends AbstractIterator {
     callback = fromCallback(callback, kPromise)
 
     try {
-      if (this[kFinished]) {
+      if (this[kPosition] < this[kCache].length) {
+        process.nextTick(callback, null, this._nextvCached(size))
+      } else if (this[kFinished]) {
         process.nextTick(callback, null, { rows: [], finished: true })
       } else {
         this[kDB][kRef]()
@@ -239,6 +284,8 @@ class Iterator extends AbstractIterator {
   }
 
   _closeSync () {
+    assert(!this[kBusy])
+
     this[kCache] = kEmpty
 
     if (this[kContext]) {

@@ -334,6 +334,12 @@ struct BaseIterator : public Closable {
                const int limit,
                rocksdb::ReadOptions readOptions = {})
       : database_(database), column_(column), reverse_(reverse), limit_(limit) {
+    // TODO (correctness): the +'\0' byte-successor trick below converts
+    // inclusive/exclusive bounds correctly only under bytewise ordering. With a
+    // custom CF comparator (InitOptions "comparator", e.g.
+    // rocksdb.ReverseBytewiseComparator) RocksDB applies these bounds with that
+    // comparator, silently inverting the lte/gt boundary semantics. Seek()'s
+    // manual bound check below uses raw bytewise Slice::compare as well.
     if (lte) {
       upper_bound_ = rocksdb::PinnableSlice();
       *upper_bound_->GetSelf() = std::move(*lte) + '\0';
@@ -446,7 +452,17 @@ struct BaseIterator : public Closable {
     // otherwise an iterator that already yielded `limit` rows returns nothing
     // after a refresh even though every other piece of state was reset.
     count_ = 0;
-    return iterator_->Refresh();
+    ROCKS_STATUS_RETURN(iterator_->Refresh());
+    // rocksdb::Iterator::Refresh invalidates the iterator (a Seek* is required
+    // before use), so re-establish the starting position like the constructor
+    // does — otherwise the next read sees Valid()==false and reports an empty
+    // database.
+    if (reverse_) {
+      iterator_->SeekToLast();
+    } else {
+      iterator_->SeekToFirst();
+    }
+    return iterator_->status();
   }
 
   Database* database_;
@@ -701,9 +717,9 @@ class Iterator final : public BaseIterator {
               v.PinSelf(CurrentValue());
               state.bytes += v.size();
               state.values.push_back(std::move(v));
-            } else {
-              assert(false);
             }
+            // keys:false + values:false is valid per abstract-level: rows still
+            // count, each entry surfaces as [undefined, undefined].
             state.count += 1;
           }
 
@@ -733,7 +749,8 @@ class Iterator final : public BaseIterator {
               NAPI_STATUS_RETURN(napi_get_undefined(env, &key));
               NAPI_STATUS_RETURN(Convert(env, std::move(state.values[n]), valueEncoding_, val, unsafe_));
             } else {
-              assert(false);
+              NAPI_STATUS_RETURN(napi_get_undefined(env, &key));
+              NAPI_STATUS_RETURN(napi_get_undefined(env, &val));
             }
 
             NAPI_STATUS_RETURN(napi_set_element(env, rows, n * 2 + 0, key));
@@ -827,7 +844,8 @@ class Iterator final : public BaseIterator {
         NAPI_STATUS_THROWS(napi_get_undefined(env, &key));
         NAPI_STATUS_THROWS(Convert(env, CurrentValue(), valueEncoding_, val, unsafe_));
       } else {
-        assert(false);
+        NAPI_STATUS_THROWS(napi_get_undefined(env, &key));
+        NAPI_STATUS_THROWS(napi_get_undefined(env, &val));
       }
 
       NAPI_STATUS_THROWS(napi_set_element(env, rows, idx++, key));
