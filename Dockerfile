@@ -94,7 +94,14 @@ RUN cd deps/rocksdb/rocksdb && make libzstd.a && \
 # This will build rocksdb (deps/rocksdb/rocksdb.gyp)
 RUN yarn --ignore-scripts
 
-# This will build rocks-level bindings (binding.gyp)
-RUN npx prebuildify -t 25.6.0 --napi --strip --arch x64
+# This will build rocks-level bindings (binding.gyp).
+# rocksdb's translation units are memory-heavy; compiling them 32-wide (the
+# global MAKEFLAGS/JOBS above) exhausts memory under x86 emulation on arm64
+# hosts ("cannot allocate memory" — cc1plus killed). Cap parallelism for this
+# step to the project default (8, see package.json). Override on large x86
+# hosts via: docker build --build-arg JOBS=32 ...
+ARG JOBS=8
+RUN MAKEFLAGS="-j${JOBS}" JOBS="${JOBS}" CMAKE_BUILD_PARALLEL_LEVEL="${JOBS}" \
+  npx prebuildify -t 25.6.0 --napi --strip --arch x64
 
 RUN yarn test-prebuild
