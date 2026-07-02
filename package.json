@@ -9,7 +9,8 @@
     "test": "standard && (nyc -s tape test/*-test.js | faucet) && nyc report",
     "test-prebuild": "cross-env PREBUILDS_ONLY=1 npm t",
     "prebuildify": "JOBS=8 prebuildify --napi --strip",
-    "rebuild": "JOBS=8 npm run install --build-from-source"
+    "rebuild": "JOBS=8 npm run install --build-from-source",
+    "release": "./release.sh"
   },
   "dependencies": {
     "abstract-level": "^1.0.2",
