@@ -34,4 +34,7 @@ esac
 npm version "$BUMP"
 npm publish
 
-echo "Published $(node -p "require('./package.json').version"). Don't forget to: git push && git push --tags"
+git push
+git push --tags
+
+echo "Published $(node -p "require('./package.json').version")."
