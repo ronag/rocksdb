@@ -9,6 +9,27 @@ if [ -n "$(git status --porcelain)" ]; then
   exit 1
 fi
 
+# Fail fast: don't build/publish on a branch that's behind or diverged from origin.
+BRANCH=$(git rev-parse --abbrev-ref HEAD)
+echo "Fetching origin..."
+git fetch origin "$BRANCH"
+
+LOCAL=$(git rev-parse HEAD)
+REMOTE=$(git rev-parse "origin/$BRANCH")
+BASE=$(git merge-base HEAD "origin/$BRANCH")
+
+if [ "$LOCAL" = "$REMOTE" ]; then
+  : # up to date
+elif [ "$LOCAL" = "$BASE" ]; then
+  echo "Branch '$BRANCH' is behind origin, pull the latest changes first." >&2
+  exit 1
+elif [ "$REMOTE" = "$BASE" ]; then
+  : # local is ahead, fine to push
+else
+  echo "Branch '$BRANCH' has diverged from origin, reconcile before releasing." >&2
+  exit 1
+fi
+
 # Keep the local arm64 build targeting the same node version as the Docker image.
 NODE_TARGET=$(sed -n 's/^FROM node:\([0-9.]*\).*/\1/p' Dockerfile)
 if [ -z "$NODE_TARGET" ]; then
