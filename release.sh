@@ -3,6 +3,14 @@ set -e
 
 cd "$(dirname "$0")"
 
+export DOCKER_HOST="${DOCKER_HOST:-ssh://nxtop@hq-test-srv1.nxt.io}"
+
+# Fail fast: npm publish needs a valid login, so check before the slow builds.
+if ! npm whoami --registry https://registry.npmjs.org > /dev/null 2>&1; then
+  echo "Not logged in to npm, run 'npm login' first." >&2
+  exit 1
+fi
+
 # Fail fast: npm version refuses a dirty tree, so check before the slow builds.
 if [ -n "$(git status --porcelain)" ]; then
   echo "Working tree is not clean, commit or stash changes first." >&2
