@@ -6,6 +6,7 @@ const ModuleError = require('module-error')
 const binding = require('./binding')
 const { ChainedBatch } = require('./chained-batch')
 const { RocksCache } = require('./cache')
+const { RocksWriteBufferManager } = require('./write-buffer-manager')
 const { Iterator } = require('./iterator')
 const fs = require('node:fs')
 const assert = require('node:assert')
@@ -414,3 +415,11 @@ class RocksLevel extends AbstractLevel {
 
 exports.RocksLevel = RocksLevel
 exports.RocksCache = RocksCache
+exports.RocksWriteBufferManager = RocksWriteBufferManager
+
+// null on platforms where io_uring does not apply (non-Linux); boolean on
+// Linux, where `false` means RocksDB's async_io silently degrades to serial
+// reads (seccomp, kernel.io_uring_disabled, or a kernel without io_uring).
+exports.ioUringAvailable = function ioUringAvailable () {
+  return binding.io_uring_available()
+}

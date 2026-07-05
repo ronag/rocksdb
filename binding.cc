@@ -17,6 +17,7 @@
 #include <rocksdb/status.h>
 #include <rocksdb/table.h>
 #include <rocksdb/write_batch.h>
+#include <rocksdb/write_buffer_manager.h>
 
 #include <re2/re2.h>
 
@@ -28,6 +29,13 @@
 #include <string>
 #include <thread>
 #include <vector>
+
+#ifdef __linux__
+#include <sys/syscall.h>
+#include <unistd.h>
+
+#include <cerrno>
+#endif
 
 #include "max_rev_operator.h"
 #include "util.h"
@@ -1110,6 +1118,10 @@ napi_status InitOptions(napi_env env, T& columnOptions, const U& options) {
 
   NAPI_STATUS_RETURN(GetProperty(env, options, "optimizeFiltersForHits", columnOptions.optimize_filters_for_hits));
   NAPI_STATUS_RETURN(GetProperty(env, options, "periodicCompactionSeconds", columnOptions.periodic_compaction_seconds));
+  // memtable_huge_page_size is a column-family option: when the DB is opened
+  // with explicit column descriptors the copy read into dbOptions in db_open is
+  // sliced away, so it must be settable per column to take effect at all.
+  NAPI_STATUS_RETURN(GetProperty(env, options, "memTableHugePageSize", columnOptions.memtable_huge_page_size));
 
   // Compat
   NAPI_STATUS_RETURN(GetProperty(env, options, "enableBlobFiles", columnOptions.enable_blob_files));
@@ -1379,6 +1391,14 @@ NAPI_METHOD(db_open) {
     NAPI_STATUS_THROWS(GetProperty(env, options, "parallelism", parallelism));
     dbOptions.IncreaseParallelism(parallelism);
 
+    // IncreaseParallelism sizes the (process-wide) Env LOW pool to `parallelism`
+    // but pins the HIGH pool — where every flush of every DB sharing the default
+    // Env runs — at a single thread, so flushes across DBs serialize behind one
+    // thread. Both pools are process-wide: the last opened DB's value wins.
+    int flushParallelism = std::max(1, parallelism / 4);
+    NAPI_STATUS_THROWS(GetProperty(env, options, "flushParallelism", flushParallelism));
+    dbOptions.env->SetBackgroundThreads(std::max(1, flushParallelism), rocksdb::Env::HIGH);
+
     NAPI_STATUS_THROWS(GetProperty(env, options, "walDir", dbOptions.wal_dir));
 
     // 64-bit inputs: walTTL is in ms and walSizeLimit in bytes, so a 32-bit type
@@ -1444,6 +1464,30 @@ NAPI_METHOD(db_open) {
     NAPI_STATUS_THROWS(GetProperty(env, options, "useAdaptiveMutex", dbOptions.use_adaptive_mutex));
 
     NAPI_STATUS_THROWS(GetProperty(env, options, "writeBufferSize", dbOptions.db_write_buffer_size));
+
+    {
+      napi_value wbmValue;
+      NAPI_STATUS_THROWS(napi_get_named_property(env, options, "writeBufferManager", &wbmValue));
+
+      napi_valuetype wbmType;
+      NAPI_STATUS_THROWS(napi_typeof(env, wbmValue, &wbmType));
+
+      if (wbmType == napi_object || wbmType == napi_bigint) {
+        napi_value handleValue = wbmValue;
+        if (wbmType == napi_object) {
+          NAPI_STATUS_THROWS(napi_get_named_property(env, wbmValue, "handle", &handleValue));
+        }
+
+        bool lossless;
+        int64_t ptr;
+        NAPI_STATUS_THROWS(napi_get_value_bigint_int64(env, handleValue, &ptr, &lossless));
+
+        dbOptions.write_buffer_manager = *reinterpret_cast<std::shared_ptr<rocksdb::WriteBufferManager>*>(ptr);
+      } else if (wbmType != napi_undefined && wbmType != napi_null) {
+        napi_throw_error(env, nullptr, "invalid writeBufferManager");
+        return NULL;
+      }
+    }
 
     NAPI_STATUS_THROWS(GetProperty(env, options, "manualWALFlush", dbOptions.manual_wal_flush));
     NAPI_STATUS_THROWS(GetProperty(env, options, "walManualFlush", dbOptions.manual_wal_flush));
@@ -2462,6 +2506,116 @@ NAPI_METHOD(cache_get_handle) {
   return result;
 }
 
+NAPI_METHOD(write_buffer_manager_init) {
+  NAPI_ARGV(1);
+
+  size_t bufferSize = 256 * 1024 * 1024;  // 256 MiB
+  NAPI_STATUS_THROWS(GetProperty(env, argv[0], "bufferSize", bufferSize));
+
+  bool allowStall = false;
+  NAPI_STATUS_THROWS(GetProperty(env, argv[0], "allowStall", allowStall));
+
+  std::shared_ptr<rocksdb::Cache> cache;
+  {
+    napi_value cacheValue;
+    NAPI_STATUS_THROWS(napi_get_named_property(env, argv[0], "cache", &cacheValue));
+
+    napi_valuetype cacheType;
+    NAPI_STATUS_THROWS(napi_typeof(env, cacheValue, &cacheType));
+
+    if (cacheType == napi_object || cacheType == napi_bigint) {
+      napi_value handleValue = cacheValue;
+      if (cacheType == napi_object) {
+        NAPI_STATUS_THROWS(napi_get_named_property(env, cacheValue, "handle", &handleValue));
+      }
+
+      bool lossless;
+      int64_t ptr;
+      NAPI_STATUS_THROWS(napi_get_value_bigint_int64(env, handleValue, &ptr, &lossless));
+
+      cache = *reinterpret_cast<std::shared_ptr<rocksdb::Cache>*>(ptr);
+    } else if (cacheType != napi_undefined && cacheType != napi_null) {
+      napi_throw_error(env, nullptr, "invalid cache");
+      return NULL;
+    }
+  }
+
+  auto wbm = new std::shared_ptr<rocksdb::WriteBufferManager>(
+      std::make_shared<rocksdb::WriteBufferManager>(bufferSize, cache, allowStall));
+
+  napi_value result;
+  NAPI_STATUS_THROWS(
+      napi_create_external(env, wbm, Finalize<std::shared_ptr<rocksdb::WriteBufferManager>>, wbm, &result));
+
+  return result;
+}
+
+NAPI_METHOD(write_buffer_manager_get_handle) {
+  NAPI_ARGV(1);
+
+  std::shared_ptr<rocksdb::WriteBufferManager>* wbm;
+  NAPI_STATUS_THROWS(napi_get_value_external(env, argv[0], reinterpret_cast<void**>(&wbm)));
+
+  napi_value result;
+  NAPI_STATUS_THROWS(napi_create_bigint_int64(env, reinterpret_cast<intptr_t>(wbm), &result));
+
+  return result;
+}
+
+NAPI_METHOD(write_buffer_manager_get_usage) {
+  NAPI_ARGV(1);
+
+  std::shared_ptr<rocksdb::WriteBufferManager>* wbm;
+  NAPI_STATUS_THROWS(napi_get_value_external(env, argv[0], reinterpret_cast<void**>(&wbm)));
+
+  napi_value result;
+  NAPI_STATUS_THROWS(napi_create_object(env, &result));
+
+  napi_value memoryUsage;
+  NAPI_STATUS_THROWS(napi_create_double(env, static_cast<double>((*wbm)->memory_usage()), &memoryUsage));
+  NAPI_STATUS_THROWS(napi_set_named_property(env, result, "memoryUsage", memoryUsage));
+
+  napi_value mutableMemoryUsage;
+  NAPI_STATUS_THROWS(
+      napi_create_double(env, static_cast<double>((*wbm)->mutable_memtable_memory_usage()), &mutableMemoryUsage));
+  NAPI_STATUS_THROWS(napi_set_named_property(env, result, "mutableMemoryUsage", mutableMemoryUsage));
+
+  napi_value bufferSize;
+  NAPI_STATUS_THROWS(napi_create_double(env, static_cast<double>((*wbm)->buffer_size()), &bufferSize));
+  NAPI_STATUS_THROWS(napi_set_named_property(env, result, "bufferSize", bufferSize));
+
+  return result;
+}
+
+// Probes whether io_uring is actually usable in this process: RocksDB gates its
+// async MultiGet / prefetch I/O on io_uring_setup succeeding at runtime and
+// falls back to serial reads SILENTLY when the syscall is denied (seccomp — the
+// default Docker/containerd profiles since late 2023 — or the
+// kernel.io_uring_disabled sysctl) or missing (ENOSYS). io_uring_setup(0, NULL)
+// never succeeds; a functional kernel rejects the arguments (EINVAL/EFAULT)
+// while a blocked one fails with EPERM/EACCES/ENOSYS before looking at them.
+NAPI_METHOD(io_uring_available) {
+#if defined(__linux__) && defined(SYS_io_uring_setup)
+  errno = 0;
+  const long rc = syscall(SYS_io_uring_setup, 0, nullptr);
+  const bool available = rc >= 0 || (errno != ENOSYS && errno != EPERM && errno != EACCES);
+  if (rc >= 0) {
+    close(static_cast<int>(rc));
+  }
+
+  napi_value result;
+  NAPI_STATUS_THROWS(napi_get_boolean(env, available, &result));
+
+  return result;
+#else
+  // Not applicable on this platform.
+  napi_value result;
+  NAPI_STATUS_THROWS(napi_get_null(env, &result));
+
+  return result;
+#endif
+}
+
 NAPI_INIT() {
   NAPI_EXPORT_FUNCTION(db_init);
   NAPI_EXPORT_FUNCTION(db_open);
@@ -2504,4 +2658,10 @@ NAPI_INIT() {
 
   NAPI_EXPORT_FUNCTION(cache_init);
   NAPI_EXPORT_FUNCTION(cache_get_handle);
+
+  NAPI_EXPORT_FUNCTION(write_buffer_manager_init);
+  NAPI_EXPORT_FUNCTION(write_buffer_manager_get_handle);
+  NAPI_EXPORT_FUNCTION(write_buffer_manager_get_usage);
+
+  NAPI_EXPORT_FUNCTION(io_uring_available);
 }
