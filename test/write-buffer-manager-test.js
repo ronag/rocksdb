@@ -123,6 +123,31 @@ test('write buffer manager: invalid option rejects', async (t) => {
   t.end()
 })
 
+test('write buffer manager: non-lossless handle rejects instead of crashing', async (t) => {
+  const p = dbPath('nonlossless')
+  cleanup(p)
+
+  // A BigInt that does not fit int64 was previously truncated into a bogus
+  // pointer and dereferenced.
+  try {
+    await RocksLevel.open(p, { createIfMissing: true, writeBufferManager: 1n << 80n })
+    t.fail('open should have thrown')
+  } catch (err) {
+    t.ok(err, 'open rejects a non-lossless writeBufferManager handle')
+  }
+
+  try {
+    // eslint-disable-next-line no-new
+    new RocksWriteBufferManager({ bufferSize: 8 * 1024 * 1024, cache: 1n << 80n })
+    t.fail('constructor should have thrown')
+  } catch (err) {
+    t.ok(err, 'manager rejects a non-lossless cache handle')
+  }
+
+  cleanup(p)
+  t.end()
+})
+
 test('flushParallelism: db opens and flushes', async (t) => {
   const p = dbPath('flush_parallelism')
   cleanup(p)

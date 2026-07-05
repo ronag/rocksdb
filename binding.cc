@@ -35,6 +35,12 @@
 #include <unistd.h>
 
 #include <cerrno>
+
+// Older libc headers may lack the SYS_ alias for io_uring_setup even though
+// the kernel number (__NR_) is available — keep the Linux probe a boolean.
+#if !defined(SYS_io_uring_setup) && defined(__NR_io_uring_setup)
+#define SYS_io_uring_setup __NR_io_uring_setup
+#endif
 #endif
 
 #include "max_rev_operator.h"
@@ -930,6 +936,10 @@ NAPI_METHOD(db_init) {
     int64_t value;
     bool lossless;
     NAPI_STATUS_THROWS(napi_get_value_bigint_int64(env, argv[0], &value, &lossless));
+    if (!lossless) {
+      napi_throw_error(env, nullptr, "invalid database handle");
+      return NULL;
+    }
 
     database = reinterpret_cast<Database*>(value);
     NAPI_STATUS_THROWS(napi_create_external(env, database, nullptr, nullptr, &result));
@@ -1161,12 +1171,18 @@ napi_status InitOptions(napi_env env, T& columnOptions, const U& options) {
       bool lossless;
       int64_t ptr;
       NAPI_STATUS_RETURN(napi_get_value_bigint_int64(env, handleValue, &ptr, &lossless));
+      if (!lossless) {
+        return napi_invalid_arg;
+      }
 
       cache = *reinterpret_cast<std::shared_ptr<rocksdb::Cache>*>(ptr);
     } else if (cacheType == napi_bigint) {
       bool lossless;
       int64_t ptr;
       NAPI_STATUS_RETURN(napi_get_value_bigint_int64(env, cacheValue, &ptr, &lossless));
+      if (!lossless) {
+        return napi_invalid_arg;
+      }
 
       cache = *reinterpret_cast<std::shared_ptr<rocksdb::Cache>*>(ptr);
     } else if (cacheType != napi_undefined && cacheType != napi_null) {
@@ -1481,6 +1497,10 @@ NAPI_METHOD(db_open) {
         bool lossless;
         int64_t ptr;
         NAPI_STATUS_THROWS(napi_get_value_bigint_int64(env, handleValue, &ptr, &lossless));
+        if (!lossless) {
+          napi_throw_error(env, nullptr, "invalid writeBufferManager handle");
+          return NULL;
+        }
 
         dbOptions.write_buffer_manager = *reinterpret_cast<std::shared_ptr<rocksdb::WriteBufferManager>*>(ptr);
       } else if (wbmType != napi_undefined && wbmType != napi_null) {
@@ -2532,6 +2552,10 @@ NAPI_METHOD(write_buffer_manager_init) {
       bool lossless;
       int64_t ptr;
       NAPI_STATUS_THROWS(napi_get_value_bigint_int64(env, handleValue, &ptr, &lossless));
+      if (!lossless) {
+        napi_throw_error(env, nullptr, "invalid cache handle");
+        return NULL;
+      }
 
       cache = *reinterpret_cast<std::shared_ptr<rocksdb::Cache>*>(ptr);
     } else if (cacheType != napi_undefined && cacheType != napi_null) {

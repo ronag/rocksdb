@@ -100,6 +100,23 @@ if (isMainThread) {
     t.end()
   })
 
+  test('cache: non-lossless handle rejects instead of crashing', async (t) => {
+    const p = dbPath('nonlossless')
+    cleanup(p)
+
+    // A BigInt that does not fit int64 was previously truncated into a bogus
+    // pointer and dereferenced.
+    try {
+      await RocksLevel.open(p, { createIfMissing: true, cache: 1n << 80n })
+      t.fail('open should have thrown')
+    } catch (err) {
+      t.ok(err, 'open rejects a non-lossless cache handle')
+    }
+
+    cleanup(p)
+    t.end()
+  })
+
   test('cache: put and iterate with shared cache', async (t) => {
     const p = dbPath('iterate')
     cleanup(p)
