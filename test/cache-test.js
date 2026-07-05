@@ -100,6 +100,23 @@ if (isMainThread) {
     t.end()
   })
 
+  test('cache: non-lossless handle rejects instead of crashing', async (t) => {
+    const p = dbPath('nonlossless')
+    cleanup(p)
+
+    // A BigInt that does not fit int64 was previously truncated into a bogus
+    // pointer and dereferenced.
+    try {
+      await RocksLevel.open(p, { createIfMissing: true, cache: 1n << 80n })
+      t.fail('open should have thrown')
+    } catch (err) {
+      t.ok(err, 'open rejects a non-lossless cache handle')
+    }
+
+    cleanup(p)
+    t.end()
+  })
+
   test('cache: put and iterate with shared cache', async (t) => {
     const p = dbPath('iterate')
     cleanup(p)
@@ -136,6 +153,60 @@ if (isMainThread) {
     await db2.close()
 
     cleanup(p)
+    t.end()
+  })
+
+  test('cache: shared per-column cache across multiple databases', async (t) => {
+    // Sharded-DB pattern: N separate DBs whose column families all charge the
+    // same block/blob cache instead of one fixed-size cache per DB.
+    const p1 = dbPath('column_shared1')
+    const p2 = dbPath('column_shared2')
+    cleanup(p1)
+    cleanup(p2)
+
+    const cache = new RocksCache({ capacity: 32 * 1024 * 1024 })
+
+    const columns = () => ({
+      default: {},
+      records: {
+        cache,
+        compaction: 'level',
+        optimize: 'point-lookup',
+        blobFiles: true,
+        blobMinSize: 256,
+        cachePrepopulate: true
+      }
+    })
+
+    const db1 = await RocksLevel.open(p1, { createIfMissing: true, columns: columns() })
+    const db2 = await RocksLevel.open(p2, { createIfMissing: true, columns: columns() })
+
+    const big = 'x'.repeat(1024) // over blobMinSize so blob cache is exercised too
+    for (let i = 0; i < 100; i++) {
+      await db1.put(`key${i}`, `db1-${i}-${big}`, { column: db1.columns.records })
+      await db2.put(`key${i}`, `db2-${i}-${big}`, { column: db2.columns.records })
+    }
+
+    t.equal(await db1.get('key42', { column: db1.columns.records }), `db1-42-${big}`)
+    t.equal(await db2.get('key42', { column: db2.columns.records }), `db2-42-${big}`)
+
+    t.same(await db1.getMany(['key0', 'key99'], { column: db1.columns.records }), [
+      `db1-0-${big}`,
+      `db1-99-${big}`
+    ])
+    t.same(await db2.getMany(['key0', 'key99'], { column: db2.columns.records }), [
+      `db2-0-${big}`,
+      `db2-99-${big}`
+    ])
+
+    await db1.close()
+
+    // db2 must be unaffected by db1 releasing its reference to the shared cache.
+    t.equal(await db2.get('key7', { column: db2.columns.records }), `db2-7-${big}`)
+
+    await db2.close()
+    cleanup(p1)
+    cleanup(p2)
     t.end()
   })
 
