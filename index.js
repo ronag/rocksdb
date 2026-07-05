@@ -419,7 +419,8 @@ exports.RocksWriteBufferManager = RocksWriteBufferManager
 
 // null on platforms where io_uring does not apply (non-Linux); boolean on
 // Linux, where `false` means RocksDB's async_io silently degrades to serial
-// reads (seccomp, kernel.io_uring_disabled, or a kernel without io_uring).
+// reads (seccomp, kernel.io_uring_disabled, a kernel without io_uring, or a
+// binary built without an io_uring syscall number).
 exports.ioUringAvailable = function ioUringAvailable () {
   return binding.io_uring_available()
 }

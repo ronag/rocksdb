@@ -2631,6 +2631,14 @@ NAPI_METHOD(io_uring_available) {
   NAPI_STATUS_THROWS(napi_get_boolean(env, available, &result));
 
   return result;
+#elif defined(__linux__)
+  // Built without any syscall number for io_uring_setup (pre-io_uring-era
+  // headers): this binary cannot use io_uring regardless of the running
+  // kernel, so report it unavailable — the Linux contract stays boolean.
+  napi_value result;
+  NAPI_STATUS_THROWS(napi_get_boolean(env, false, &result));
+
+  return result;
 #else
   // Not applicable on this platform.
   napi_value result;
