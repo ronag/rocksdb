@@ -19,9 +19,12 @@ const packageRoot = path.join(__dirname, '..')
 
 // Mirrors node-gyp-build/bin.js's own --build-from-source handling, so
 // `npm run rebuild` (JOBS=8 npm run install --build-from-source) still forces
-// a real rebuild instead of short-circuiting on an existing binary.
+// a real rebuild instead of short-circuiting on an existing binary. npm also
+// supports the scoped form `--build-from-source=<pkg>`, which exports the
+// package name (not 'true') into the env.
 function buildFromSource () {
-  if (process.env.npm_config_build_from_source === 'true') return true
+  const flag = process.env.npm_config_build_from_source
+  if (flag === 'true' || flag === require('../package.json').name) return true
   try {
     return JSON.parse(process.env.npm_config_argv || '{}').original.includes('--build-from-source')
   } catch {
