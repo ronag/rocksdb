@@ -8,6 +8,7 @@
 /prebuilds
 /build
 /tmp
+/deps/.prefix
 Dockerfile
 build.sh
 *.md

@@ -8,6 +8,14 @@
       "direct_dependent_settings": {
         "include_dirs": ["rocksdb/include/"]
       },
+      # node-gyp does not define NDEBUG for addon Release builds, so without
+      # this rocksdb ships with assert() live — a hot-path perf tax, and under
+      # gcc 16 a CacheItemHelper static-init-order assert fires at load
+      # (advanced_cache.h) and kills the process. RocksDB's own release
+      # config (DEBUG_LEVEL=0) compiles with -DNDEBUG; match it.
+      "configurations": {
+        "Release": {"defines": ["NDEBUG"]}
+      },
       "defines": [
         "ZSTD=1",
         "ZSTD_STATIC_LINKING_ONLY=1",
@@ -72,56 +80,57 @@
               "-momit-leaf-frame-pointer",
               "-fno-builtin-memcmp",
             ],
-            "cflags": ["-std=c++20", "-march=znver1"],
+            "cflags": ["-std=c++20"],
             "cflags!": ["-fno-rtti"],
             "cflags_cc!": ["-fno-rtti"],
-            "cflags_cc+": ["-frtti", '-march=znver1']
+            "cflags_cc+": ["-frtti"],
+            # x64-only: an unconditional -march would hard-fail gcc on
+            # linux-arm64 from-source installs. (gyp's darwin generator takes
+            # flags from xcode_settings, so this block never applied on mac.)
+            "conditions": [
+              [
+                "target_arch == 'x64'",
+                {
+                  "cflags": ["-march=znver1"],
+                  "cflags_cc+": ["-march=znver1"],
+                }
+              ]
+            ]
           }
         ],
         [
           "OS == 'linux'",
           {
             "defines": [
-              "SNAPPY=1",
               "OS_LINUX=1",
               "ROCKSDB_FALLOCATE_PRESENT=1",
               "ROCKSDB_MALLOC_USABLE_SIZE=1",
               "ROCKSDB_PTHREAD_ADAPTIVE_MUTEX=1",
               "ROCKSDB_RANGESYNC_PRESENT=1",
               "ROCKSDB_SCHED_GETCPU_PRESENT=1",
-              "ROCKSDB_IOURING_PRESENT=1",
-              "USE_FOLLY=1",
-              "USE_COROUTINES=1",
               "HAVE_UINT128_EXTENSION=1",
               "HAVE_ALIGNED_NEW=1",
-              # "ROCKSDB_JEMALLOC=1",
-              # "JEMALLOC_NO_DEMANGLE=1"
-              # "HAVE_FULLFSYNC=1",
-              # "NUMA=1",
             ],
+            # Paths relative to this gyp file's dir (gyp runs <!() commands
+            # with cwd = the .gyp file's dir); interpolating
+            # <(module_root_dir) into the command breaks on paths containing
+            # spaces or quotes.
             "direct_dependent_settings": {
               "libraries": [
-                "/usr/lib/x86_64-linux-gnu/libzstd.a",
-                "/usr/lib/x86_64-linux-gnu/libfolly.a",
-                "/usr/lib/x86_64-linux-gnu/liburing.a",
-                "/usr/lib/x86_64-linux-gnu/libfmt.a",
-                "/usr/lib/x86_64-linux-gnu/libglog.a",
-                "/usr/lib/x86_64-linux-gnu/libiberty.a",
-                "/usr/lib/x86_64-linux-gnu/libunwind.a",
-                "/usr/lib/x86_64-linux-gnu/libgflags.a",
-                "/usr/local/lib/libsnappy.a"
-                # "/usr/lib/x86_64-linux-gnu/libjemalloc.a"
+                "<!(node ../../scripts/resolve-lib.js zstd)",
               ],
             },
             "include_dirs": [
+              "<!(node ../../scripts/resolve-lib.js --prefix-include)",
               "/usr/lib/x86_64-linux-gnu/include",
               "/usr/lib/include",
             ],
-            "cflags": ["-march=znver1"],
-            "ccflags": ["-march=znver1", "-flto", "-fcoroutines"],
+            "ccflags": ["-flto", "-fcoroutines"],
             "cflags!": ["-fno-exceptions"],
             "cflags_cc!": ["-fno-exceptions"],
             "ldflags": ["-flto", "-fuse-linker-plugin"],
+            # -march=znver1 comes from the posix block's x64 condition above;
+            # repeating it here would apply the flag twice on linux-x64.
           },
         ],
         [
@@ -130,20 +139,23 @@
             "defines": ["OS_MACOSX=1"],
             "direct_dependent_settings": {
               "libraries": [
-                "/opt/homebrew/Cellar/zstd/1.5.7/lib/libzstd.a"
+                "<!(node ../../scripts/resolve-lib.js zstd)"
               ],
             },
             "include_dirs": [
-              "/opt/homebrew/Cellar/zstd/1.5.7/include"
+              "<!(node ../../scripts/resolve-lib.js --prefix-include)",
+              # opt/ is Homebrew's stable symlink into the versioned Cellar
+              "/opt/homebrew/opt/zstd/include"
             ],
             "xcode_settings": {
+              # Host arch only: the from-source deps are single-arch, so a
+              # universal compile just built every TU twice and discarded
+              # the foreign slice at link.
               "OTHER_CPLUSPLUSFLAGS": [
                 "-mmacosx-version-min=13.4.0",
                 "-std=c++20",
                 "-fno-omit-frame-pointer",
                 "-momit-leaf-frame-pointer",
-                "-arch x86_64",
-                "-arch arm64"
               ],
               "GCC_ENABLE_CPP_RTTI": "YES",
               "GCC_ENABLE_CPP_EXCEPTIONS": "YES",

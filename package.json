@@ -5,10 +5,11 @@
   "license": "MIT",
   "main": "index.js",
   "scripts": {
-    "install": "node-gyp-build",
+    "install": "node scripts/install.js",
+    "build-deps": "node scripts/build-deps.js",
     "test": "standard && (nyc -s tape test/*-test.js | faucet) && nyc report",
     "test-prebuild": "cross-env PREBUILDS_ONLY=1 npm t",
-    "prebuildify": "JOBS=8 prebuildify --napi --strip",
+    "prebuildify": "npm run build-deps && JOBS=8 prebuildify --napi --strip",
     "rebuild": "JOBS=8 npm run install --build-from-source",
     "release": "./release.sh"
   },

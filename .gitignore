@@ -5,6 +5,7 @@ build/
 build-pre-gyp/
 Release/
 deps/*/Debug/
+deps/.prefix/
 libleveldb.so
 libleveldb.a
 leakydb
