@@ -129,14 +129,8 @@
             "cflags!": ["-fno-exceptions"],
             "cflags_cc!": ["-fno-exceptions"],
             "ldflags": ["-flto", "-fuse-linker-plugin"],
-            "conditions": [
-              [
-                "target_arch == 'x64'",
-                {
-                  "cflags": ["-march=znver1"],
-                }
-              ]
-            ],
+            # -march=znver1 comes from the posix block's x64 condition above;
+            # repeating it here would apply the flag twice on linux-x64.
           },
         ],
         [

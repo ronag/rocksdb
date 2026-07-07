@@ -74,6 +74,14 @@ function main () {
     return
   }
 
+  if (!Object.hasOwn(SYSTEM_FALLBACKS, arg)) {
+    console.error(
+      `rocks-level: unknown library '${arg}' — usage: resolve-lib.js ` +
+      `<${Object.keys(SYSTEM_FALLBACKS).join('|')}> | --prefix-include`
+    )
+    process.exit(1)
+  }
+
   const found = resolve(arg)
   if (!found.length) {
     const wanted = arg === 'absl' ? 'libabsl_*.a' : `lib${arg}.a`

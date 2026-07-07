@@ -4,9 +4,9 @@
 // Replaces the plain `node-gyp-build` install script. Behaves identically
 // when a matching prebuild (or an already-built binary) exists — same fast
 // path, no extra work, no network access. Only when neither is found does it
-// fetch+build the native deps (abseil/re2/zstd) a from-source rebuild needs,
-// into a throwaway temp directory that's removed again once the addon is
-// linked — nothing native-dependency-related is left behind on disk.
+// fetch+build the native deps (abseil/re2/zstd) that a from-source rebuild
+// needs, into a throwaway temp directory that's removed again once the addon
+// is linked — nothing native-dependency-related is left behind on disk.
 
 const path = require('path')
 const os = require('os')
