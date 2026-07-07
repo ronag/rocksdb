@@ -42,7 +42,10 @@ function sh (cmd, args, opts = {}) {
 function ensureTool (bin, hint) {
   try {
     execFileSync(bin, ['--version'], { stdio: 'ignore' })
-  } catch {
+  } catch (err) {
+    // A tool that runs but rejects --version still exists — only a spawn
+    // failure means it's missing from PATH.
+    if (err.code !== 'ENOENT') return
     throw new Error(
       `rocks-level: '${bin}' is required to build native dependencies from ` +
       `source but was not found on PATH. ${hint}`
