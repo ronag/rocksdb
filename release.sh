@@ -67,7 +67,11 @@ case "$BUMP" in
 esac
 
 npm version "$BUMP"
-npm publish
+
+# Pin the registry: if the script is invoked via yarn (or an .npmrc override),
+# npm_config_registry points at registry.yarnpkg.com where our npmjs auth
+# token doesn't apply, and publish fails with ENEEDAUTH.
+npm publish --registry https://registry.npmjs.org
 
 git push
 git push --tags
