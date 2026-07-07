@@ -1,107 +1,46 @@
-FROM node:25.6.0-bookworm
+FROM node:26.4.0-trixie
 
-ENV CMAKE_BUILD_PARALLEL_LEVEL=32 MAKEFLAGS=-j32 JOBS=32 DEBUG_LEVEL=0
+RUN apt-get update && apt-get install -y \
+  build-essential \
+  cmake \
+  git \
+  python3 \
+  curl \
+  ca-certificates \
+  make \
+  libssl-dev \
+  && rm -rf /var/lib/apt/lists/*
 
-# Install build dependencies for gcc
-RUN apt update && apt install -y build-essential libgmp-dev libmpfr-dev libmpc-dev flex bison wget
-
-RUN apt update && apt install liburing-dev cmake pip -y
-
-# Let pip write to system site-packages (Debian 12 + PEP 668)
-ENV PIP_BREAK_SYSTEM_PACKAGES=1
-
-RUN git clone --depth 1 --branch liburing-2.14 https://github.com/axboe/liburing.git /tmp/liburing && \
-    cd /tmp/liburing && ./configure && make -j"$(nproc)" && make install && ldconfig
-
-# Clone and build folly
-RUN apt update && apt install sudo -y
-RUN mkdir -p /opt/folly && cd /opt/folly && \
-  git clone --depth 1 --branch v2026.02.02.00 https://github.com/facebook/folly . && \
-  sed -i 's|https://zlib.net/|https://github.com/madler/zlib/releases/download/v1.3.1/|g' \
-    build/fbcode_builder/manifests/zlib && \
-  ./build/fbcode_builder/getdeps.py install-system-deps --recursive && \
-  ./build/fbcode_builder/getdeps.py build --no-tests \
-  --extra-cmake-defines='{"CMAKE_BUILD_TYPE":"Release", "CMAKE_C_FLAGS":"-march=znver3 -mtune=znver3 -O3 -fPIC", "CMAKE_CXX_FLAGS":"-march=znver3 -mtune=znver3 -O3 -fPIC" }'
-
-# Copy folly (lib + headers + boost) into system folder
-RUN cd `cd /opt/folly && ./build/fbcode_builder/getdeps.py show-inst-dir folly` && \
-  cp lib/libfolly.a /usr/lib/x86_64-linux-gnu/ && \
-  cp -rv include/ /usr/lib/x86_64-linux-gnu && \
-  cp -rv ../boost*/include/ /usr/lib/x86_64-linux-gnu
-
-RUN cd /opt && git clone https://github.com/fmtlib/fmt.git && cd fmt && \
-  cmake -DCMAKE_POSITION_INDEPENDENT_CODE=TRUE . && \
-  make && \
-  cp -rv include/ /usr/lib/x86_64-linux-gnu && \
-  cp libfmt.a /usr/lib/x86_64-linux-gnu/
-
-RUN cd /opt && git clone https://github.com/google/glog.git && cd glog && \
-  cmake -DCMAKE_POSITION_INDEPENDENT_CODE=TRUE -DBUILD_SHARED_LIBS=FALSE . && \
-  make && \
-  cp libglog.a /usr/lib/x86_64-linux-gnu/
-
-RUN cd /opt && git clone https://github.com/libunwind/libunwind.git && cd libunwind && \
-  autoreconf -i && ./configure CFLAGS="-fPIC" CXXFLAGS="-fPIC" && make && \
-  cp src/.libs/libunwind.a /usr/lib/x86_64-linux-gnu/
-
-RUN cd /opt && wget https://ftpmirror.gnu.org/binutils/binutils-2.43.tar.gz && \
-  tar -xvf binutils-2.43.tar.gz && \
-  cd binutils-2.43/libiberty && \
-  ./configure CFLAGS="-fPIC" && \
-  make && \
-  cp libiberty.a /usr/lib/x86_64-linux-gnu/
-
-RUN cd /opt && git clone https://github.com/gflags/gflags.git && cd gflags && \
-  cmake . -DCMAKE_POSITION_INDEPENDENT_CODE=TRUE -DBUILD_SHARED_LIBS=OFF && \
-  make && \
-  cp lib/libgflags.a /usr/lib/x86_64-linux-gnu/
-
-RUN cd /opt && git clone --depth 1 --branch 1.2.1 https://github.com/google/snappy.git && cd snappy && \
-  git submodule update --init && \
-  sed -i 's/-fno-rtti//g' CMakeLists.txt && \
-  cmake . -DCMAKE_BUILD_TYPE=Release -DCMAKE_POSITION_INDEPENDENT_CODE=ON \
-    -DCMAKE_CXX_FLAGS="-march=znver3 -mtune=znver3 -O3" \
-    -DSNAPPY_BUILD_TESTS=OFF \
-    -DSNAPPY_BUILD_BENCHMARKS=OFF && \
-  make -j"$(nproc)" && \
-  make install && ldconfig
-
-RUN cd /opt && git clone --depth 1 --branch 20240722.0 https://github.com/abseil/abseil-cpp.git && cd abseil-cpp && \
-  mkdir build && cd build && \
-  cmake .. -DCMAKE_BUILD_TYPE=Release -DCMAKE_POSITION_INDEPENDENT_CODE=ON \
-    -DCMAKE_CXX_FLAGS="-march=znver3 -mtune=znver3 -O3" \
-    -DABSL_BUILD_TESTING=OFF \
-    -DABSL_PROPAGATE_CXX_STD=ON && \
-  make -j"$(nproc)" && \
-  make install && ldconfig
-
-RUN cd /opt && git clone --depth 1 --branch 2025-11-05 https://github.com/google/re2.git && cd re2 && \
-  cmake . -DCMAKE_BUILD_TYPE=Release -DCMAKE_POSITION_INDEPENDENT_CODE=ON \
-    -DCMAKE_CXX_FLAGS="-march=znver3 -mtune=znver3 -O3" \
-    -DBUILD_SHARED_LIBS=OFF \
-    -DRE2_BUILD_TESTING=OFF && \
-  make -j"$(nproc)" && \
-  make install && ldconfig
-
-# Copy source
 WORKDIR /rocks-level
+
+# JOBS caps every build stage's parallelism (cmake --parallel, make -j,
+# node-gyp) — the rocksdb translation units are memory-heavy, so lower it
+# (docker build --build-arg JOBS=4) if the build OOMs, e.g. under x86
+# emulation on an arm64 host.
+ARG JOBS=8
+
+# Copy only what each step needs so the expensive dependency layers survive
+# source edits: package.json for npm install, scripts/ for build-deps, and
+# the full tree only for the final addon build.
+COPY package.json ./
+RUN npm install --ignore-scripts
+
+# Build abseil/re2/zstd once into the persistent deps/.prefix so the following
+# prebuildify step (a separate node-gyp build) can link against them. Tuned for
+# Zen 3 to match the -march=znver3 the gyp files apply to rocksdb + binding.cc,
+# so the shipped Linux prebuild is optimized for the deployment servers.
+COPY scripts/ scripts/
+RUN ROCKS_LEVEL_MARCH=znver3 JOBS=$JOBS npm run build-deps
+
 COPY . .
 
-# Build libzstd using makefile in rocksdb
-RUN cd deps/rocksdb/rocksdb && make libzstd.a && \
-  cp libzstd.a /usr/lib/x86_64-linux-gnu/
+# prebuildify is a pinned devDependency, so npx resolves the local install
+# instead of fetching the latest version from the registry. The ABI target is
+# the container's own node (the FROM image), so there is no second version
+# string to keep in sync.
+RUN JOBS=$JOBS MAKEFLAGS="-j$JOBS" npx prebuildify -t "$(node -p process.versions.node)" --napi --strip --arch x64
 
-# This will build rocksdb (deps/rocksdb/rocksdb.gyp)
-RUN yarn --ignore-scripts
-
-# This will build rocks-level bindings (binding.gyp).
-# rocksdb's translation units are memory-heavy; compiling them 32-wide (the
-# global MAKEFLAGS/JOBS above) exhausts memory under x86 emulation on arm64
-# hosts ("cannot allocate memory" — cc1plus killed). Cap parallelism for this
-# step to the project default (8, see package.json). Override on large x86
-# hosts via: docker build --build-arg JOBS=32 ...
-ARG JOBS=8
-RUN MAKEFLAGS="-j${JOBS}" JOBS="${JOBS}" CMAKE_BUILD_PARALLEL_LEVEL="${JOBS}" \
-  npx prebuildify -t 25.6.0 --napi --strip --arch x64
-
-RUN yarn test-prebuild
+# test-prebuild sets PREBUILDS_ONLY=1, which node-gyp-build's loader honors: it
+# skips build/Release and loads the addon from prebuilds/, so the tests exercise
+# the shipped binary.
+RUN npm run test-prebuild

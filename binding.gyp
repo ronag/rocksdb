@@ -4,6 +4,11 @@
         {
             "target_name": "leveldown",
             "defines": ["BOOST_REGEX_STANDALONE=yes"],
+            # Match rocksdb.gyp: binding.cc instantiates rocksdb inline code
+            # (including assert()s), so Release must compile with NDEBUG too.
+            "configurations": {
+                "Release": {"defines": ["NDEBUG"]},
+            },
             "conditions": [
                 [
                     "OS == 'linux'",
@@ -11,27 +16,43 @@
                         "direct_dependent_settings": {
                             "libraries": [],
                         },
+                        # resolve-lib.js is invoked with a path relative to
+                        # this gyp file's directory (gyp runs <!() commands
+                        # with cwd = the .gyp file's dir): interpolating
+                        # <(module_root_dir) into the command string breaks
+                        # under /bin/sh when the package path contains a
+                        # space or quote.
                         "include_dirs": [
+                            "<!(node scripts/resolve-lib.js --prefix-include)",
                             "/usr/lib/x86_64-linux-gnu/include",
                             "/usr/lib/include",
                         ],
                         "libraries": [
-                            "/usr/local/lib/libre2.a",
-                            "<!@(ls /usr/local/lib/libabsl_*.a)",
+                            "<!(node scripts/resolve-lib.js re2)",
+                            "<!@(node scripts/resolve-lib.js absl)",
                         ],
-                        "cflags": ["-march=znver3", "-mtune=znver3"],
                         "cflags_cc": [
                             "-flto",
                             "-std=c++23",
-                            "-march=znver3",
-                            "-mtune=znver3",
                         ],
                         "cflags!": ["-fno-exceptions"],
                         "cflags_cc!": ["-fno-exceptions"],
                         "ldflags": [
                             "-flto",
                             "-fuse-linker-plugin",
-                            "-Wl,--whole-archive,/usr/local/lib/libsnappy.a,--no-whole-archive",
+                        ],
+                        # Zen 3 tuning only where it can run: an x64-only
+                        # flag would hard-fail gcc on e.g. linux-arm64
+                        # from-source installs (Apple Silicon dev
+                        # containers).
+                        "conditions": [
+                            [
+                                "target_arch == 'x64'",
+                                {
+                                    "cflags": ["-march=znver3", "-mtune=znver3"],
+                                    "cflags_cc": ["-march=znver3", "-mtune=znver3"],
+                                },
+                            ],
                         ],
                     },
                 ],
@@ -41,11 +62,20 @@
                         "direct_dependent_settings": {
                             "libraries": [],
                         },
-                        "include_dirs": ["/opt/homebrew/include", "/usr/local/include"],
+                        "include_dirs": [
+                            "<!(node scripts/resolve-lib.js --prefix-include)",
+                            "/opt/homebrew/include",
+                            "/usr/local/include",
+                        ],
+                        # Link re2 + abseil by absolute path to the static
+                        # archives (resolve-lib.js prefers the from-source
+                        # prefix, else Homebrew). Using `-L<dir> -lre2` instead
+                        # would let the linker pick up Homebrew's libre2.dylib,
+                        # leaving the addon with a runtime dependency on a
+                        # Homebrew install that a shipped prebuild can't assume.
                         "libraries": [
-                            "-L/opt/homebrew/lib",
-                            "-L/usr/local/lib",
-                            "-lre2",
+                            "<!(node scripts/resolve-lib.js re2)",
+                            "<!@(node scripts/resolve-lib.js absl)",
                         ],
                         "xcode_settings": {
                             "WARNING_CFLAGS": [
@@ -54,17 +84,15 @@
                                 "-Wno-unused-function",
                                 "-Wno-ignored-qualifiers",
                             ],
+                            # Host arch only: the deps are built single-arch
+                            # (CMAKE_OSX_ARCHITECTURES), so a universal
+                            # compile just built every TU twice and threw the
+                            # foreign slice away at link.
                             "OTHER_CPLUSPLUSFLAGS": [
                                 "-mmacosx-version-min=13.4.0",
                                 "-std=c++23",
                                 "-fno-omit-frame-pointer",
                                 "-momit-leaf-frame-pointer",
-                                "-arch x86_64",
-                                "-arch arm64",
-                            ],
-                            "OTHER_LDFLAGS": [
-                                "-L/opt/homebrew/lib",
-                                "-L/usr/local/lib",
                             ],
                             "GCC_ENABLE_CPP_RTTI": "YES",
                             "GCC_ENABLE_CPP_EXCEPTIONS": "YES",

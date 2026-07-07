@@ -45,10 +45,18 @@ if [ -z "$NODE_TARGET" ]; then
   exit 1
 fi
 
+# Generate both platforms' prebuilds up front, before any version bump or
+# publish, so a build failure aborts the release with nothing changed.
+
 echo "Building linux prebuilds (docker)..."
+# build.sh runs the Docker image, which builds its deps (Zen 3-tuned) and the
+# prebuild inside the container, then extracts prebuilds/linux-x64.
 ./build.sh
 
 echo "Building darwin-arm64 prebuilds (node $NODE_TARGET)..."
+# The local mac prebuild links re2/abseil/zstd statically, so build them into
+# deps/.prefix/darwin-arm64 first (portable/native tuning — Zen 3 is x86-only).
+npm run build-deps
 JOBS=16 npx prebuildify -t "$NODE_TARGET" --napi --strip --arch arm64
 
 read -r -p "Version bump (patch/minor/major): " BUMP

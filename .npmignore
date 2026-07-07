@@ -38,6 +38,7 @@ TODO
 # Build artifacts
 deps/*/Release/
 deps/*/Debug/
+deps/.prefix/
 *.tar.gz
 *.tgz
 build/
