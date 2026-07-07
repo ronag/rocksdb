@@ -32,7 +32,8 @@ const SYSTEM_FALLBACKS = {
   },
   zstd: {
     linux: ['/usr/lib/x86_64-linux-gnu/libzstd.a'],
-    darwin: ['/opt/homebrew/Cellar/zstd/1.5.7/lib/libzstd.a']
+    // opt/ is Homebrew's stable symlink into the versioned Cellar
+    darwin: ['/opt/homebrew/opt/zstd/lib/libzstd.a']
   }
 }
 
@@ -75,8 +76,9 @@ function main () {
 
   const found = resolve(arg)
   if (!found.length) {
+    const wanted = arg === 'absl' ? 'libabsl_*.a' : `lib${arg}.a`
     console.error(
-      `rocks-level: could not find lib${arg}.a in ${prefixDir()} or the ` +
+      `rocks-level: could not find ${wanted} in ${prefixDir()} or the ` +
       `expected system path. Run \`npm run build-deps\` (or install ${arg} ` +
       'manually) and retry.'
     )

@@ -56,14 +56,22 @@ function rebuildWith (prefix) {
 // dev rebuilds) is reused as-is — it belongs to that workflow and skips the
 // multi-minute dep build. End users never have one, so they get the
 // throwaway temp prefix and keep a clean machine.
-const persistent = persistentPrefixDir()
-if (buildDeps.stampMatches(persistent)) {
-  rebuildWith(persistent)
-} else {
-  const tmp = fs.mkdtempSync(path.join(os.tmpdir(), 'rocks-level-deps-'))
-  try {
-    rebuildWith(tmp)
-  } finally {
-    fs.rmSync(tmp, { recursive: true, force: true })
+try {
+  const persistent = persistentPrefixDir()
+  if (buildDeps.stampMatches(persistent)) {
+    rebuildWith(persistent)
+  } else {
+    const tmp = fs.mkdtempSync(path.join(os.tmpdir(), 'rocks-level-deps-'))
+    try {
+      rebuildWith(tmp)
+    } finally {
+      fs.rmSync(tmp, { recursive: true, force: true })
+    }
   }
+} catch (err) {
+  // The message (unsupported platform, missing git/cmake/make, failed build
+  // step) is the useful part — a stack trace into this script is noise for
+  // someone whose `npm install` just failed.
+  console.error(err.message)
+  process.exit(1)
 }

@@ -222,7 +222,14 @@ function ensure (prefix) {
 
 // `npm run build-deps` → persistent prefix, for prebuild generation.
 if (require.main === module) {
-  ensure(persistentPrefixDir())
+  try {
+    ensure(persistentPrefixDir())
+  } catch (err) {
+    // The message is the useful part; a stack trace into this script is
+    // noise (same rationale as install.js).
+    console.error(err.message)
+    process.exit(1)
+  }
 }
 
 module.exports = { ensure, stampMatches }

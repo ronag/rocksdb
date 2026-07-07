@@ -150,7 +150,8 @@
             },
             "include_dirs": [
               "<!(node ../../scripts/resolve-lib.js --prefix-include)",
-              "/opt/homebrew/Cellar/zstd/1.5.7/include"
+              # opt/ is Homebrew's stable symlink into the versioned Cellar
+              "/opt/homebrew/opt/zstd/include"
             ],
             "xcode_settings": {
               # Host arch only: the from-source deps are single-arch, so a

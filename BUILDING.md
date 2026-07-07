@@ -25,7 +25,10 @@ Apple Silicon (`release.sh` does this by default).
 ## macOS
 
 - `npm run build-deps`
-- `JOBS=16 npx prebuildify -t 26.4.0 --napi --strip --arch arm64`
+- `JOBS=16 npx prebuildify -t "$(sed -n 's/^FROM node:\([0-9.]*\).*/\1/p' Dockerfile)" --napi --strip --arch arm64`
+
+The `-t` target is the node version from the Dockerfile's `FROM` line, so both
+platforms' prebuilds stay on the same ABI (release.sh derives it the same way).
 
 `build-deps` builds abseil/re2/zstd into `deps/.prefix/darwin-arm64` (portable
 tuning) so the prebuild can link them statically — the resulting addon has no
