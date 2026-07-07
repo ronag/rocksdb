@@ -4,8 +4,9 @@
 // Fetches and builds the native dependencies binding.gyp/rocksdb.gyp need
 // (abseil-cpp + re2 + zstd) from source, into a given prefix. Used two ways:
 //
-//   - by scripts/install.js when `yarn install` finds no matching prebuild,
-//     into a throwaway temp dir that install.js deletes afterward; and
+//   - by scripts/install.js (the package's `install` hook, under npm or
+//     yarn) when it finds no matching prebuild, into a throwaway temp dir
+//     that install.js deletes afterward; and
 //   - directly (`npm run build-deps`) to populate the persistent, gitignored
 //     deps/.prefix so a following `prebuildify` can link against it when
 //     generating a shippable prebuild.

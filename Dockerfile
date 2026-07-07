@@ -34,8 +34,8 @@ RUN ROCKS_LEVEL_MARCH=znver3 JOBS=$JOBS npm run build-deps
 
 COPY . .
 
-# prebuildify is a pinned devDependency, so npx resolves the local install
-# instead of fetching the latest version from the registry. The ABI target is
+# prebuildify is a dependency of this package, so npx resolves the locally
+# installed copy instead of fetching from the registry. The ABI target is
 # the container's own node (the FROM image), so there is no second version
 # string to keep in sync.
 RUN JOBS=$JOBS MAKEFLAGS="-j$JOBS" npx prebuildify -t "$(node -p process.versions.node)" --napi --strip --arch x64

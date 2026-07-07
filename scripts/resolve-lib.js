@@ -5,10 +5,10 @@
 // against, at gyp-configure time (`<!(node scripts/resolve-lib.js <name>)>` /
 // `<!@(node scripts/resolve-lib.js <name>)>` for the multi-file abseil case).
 //
-// Looks in the local deps/.prefix build first (populated by build-deps.js
-// when yarn install had no matching prebuild), then falls back to the
-// existing hardcoded system/Homebrew path that the Dockerfile/CI flow still
-// installs to. Multiple paths are printed one per line.
+// Looks in the local from-source prefix first (populated by build-deps.js
+// when the npm/yarn install hook had no matching prebuild), then falls back
+// to the existing hardcoded system/Homebrew path that the Dockerfile/CI flow
+// still installs to. Multiple paths are printed one per line.
 
 const fs = require('fs')
 const path = require('path')
