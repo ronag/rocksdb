@@ -615,7 +615,10 @@ class Iterator final : public BaseIterator {
     readOptions.fill_cache = false;
     NAPI_STATUS_THROWS(GetProperty(env, options, "fillCache", readOptions.fill_cache));
 
-    readOptions.async_io = true;
+    // Local NVMe/SSD gains nothing from RocksDB async I/O (io_uring): it only adds
+    // CPU + ring overhead (async-io wins need high-latency/remote storage). Default
+    // OFF; callers opt in per-request via `asyncIO`.
+    readOptions.async_io = false;
     NAPI_STATUS_THROWS(GetProperty(env, options, "asyncIO", readOptions.async_io));
 
     readOptions.adaptive_readahead = true;
@@ -1671,7 +1674,10 @@ NAPI_METHOD(db_get_many_sync) {
   readOptions.fill_cache = false;
   NAPI_STATUS_THROWS(GetProperty(env, argv[2], "fillCache", readOptions.fill_cache));
 
-  readOptions.async_io = true;
+  // Local NVMe/SSD gains nothing from RocksDB async I/O (io_uring): it only adds
+  // CPU + ring overhead (async-io wins need high-latency/remote storage). Default
+  // OFF; callers opt in per-request via `asyncIO`.
+  readOptions.async_io = false;
   NAPI_STATUS_THROWS(GetProperty(env, argv[2], "asyncIO", readOptions.async_io));
 
   readOptions.optimize_multiget_for_io = true;
@@ -1734,7 +1740,10 @@ NAPI_METHOD(db_get_many) {
   readOptions.fill_cache = false;
   NAPI_STATUS_THROWS(GetProperty(env, argv[2], "fillCache", readOptions.fill_cache));
 
-  readOptions.async_io = true;
+  // Local NVMe/SSD gains nothing from RocksDB async I/O (io_uring): it only adds
+  // CPU + ring overhead (async-io wins need high-latency/remote storage). Default
+  // OFF; callers opt in per-request via `asyncIO`.
+  readOptions.async_io = false;
   NAPI_STATUS_THROWS(GetProperty(env, argv[2], "asyncIO", readOptions.async_io));
 
   readOptions.optimize_multiget_for_io = true;
