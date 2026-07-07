@@ -45,6 +45,7 @@ function globAbsl (dir) {
   }
   return entries
     .filter((name) => name.startsWith('libabsl_') && name.endsWith('.a'))
+    .sort() // readdir order is fs-dependent; keep link order deterministic
     .map((name) => path.join(dir, name))
 }
 

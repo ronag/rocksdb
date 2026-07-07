@@ -210,6 +210,7 @@ function ensure (prefix) {
 
   fs.mkdirSync(path.join(prefix, 'lib'), { recursive: true })
   fs.mkdirSync(path.join(prefix, 'include'), { recursive: true })
+  fs.mkdirSync(path.join(prefix, '_src'), { recursive: true })
 
   buildAbseil(prefix, path.join(prefix, '_src', 'abseil-cpp'))
   buildRe2(prefix, path.join(prefix, '_src', 're2'))
