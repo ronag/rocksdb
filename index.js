@@ -30,8 +30,10 @@ class RocksLevel extends AbstractLevel {
       },
       seek: true,
       additionalMethods: {
-        updates: true,
-        query: true
+        getStatistics: true,
+        query: true,
+        setStatisticsEnabled: true,
+        updates: true
       }
     }, options)
 
@@ -308,6 +310,34 @@ class RocksLevel extends AbstractLevel {
     }
 
     return binding.db_get_property(this[kContext], property, options ?? kEmpty)
+  }
+
+  // Toggle ticker collection at runtime. Only effective when the DB was opened
+  // with `statistics: true`; returns true if the toggle was applied, false if
+  // no statistics object is attached. Collection is off by default and can be
+  // enabled on demand.
+  setStatisticsEnabled (enabled) {
+    if (this.status !== 'open') {
+      throw new ModuleError('Database is not open', {
+        code: 'LEVEL_DATABASE_NOT_OPEN'
+      })
+    }
+
+    return binding.db_set_stats_level(this[kContext], Boolean(enabled))
+  }
+
+  // Curated RocksDB ticker counts accumulated while collection is enabled, or
+  // null when the DB was opened without `statistics: true`. Toggling does not
+  // reset existing counts. Values above Number.MAX_SAFE_INTEGER may lose
+  // integer precision.
+  getStatistics () {
+    if (this.status !== 'open') {
+      throw new ModuleError('Database is not open', {
+        code: 'LEVEL_DATABASE_NOT_OPEN'
+      })
+    }
+
+    return binding.db_get_statistics(this[kContext])
   }
 
   query (options, callback) {
