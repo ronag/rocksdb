@@ -300,6 +300,6 @@ test('GC cannot deadlock a raw native operation finalizer', function (t) {
     timeout: 30000
   })
   t.equal(result.status, 0, result.error ? result.error.message : result.stderr)
-  t.match(result.stdout, /completed/, 'the operation completed after its JS context was collected')
+  t.match(result.stdout, /completed/, 'the operation completed after its JS context reference was dropped and GC ran')
   t.end()
 })

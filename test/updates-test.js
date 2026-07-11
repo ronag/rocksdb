@@ -119,7 +119,7 @@ make('updates since:0 returns all updates', async function (db, t, done) {
   done()
 })
 
-make('updates surfaces clear range tombstones', async function (db, t, done) {
+make('updates surface clear range tombstones', async function (db, t, done) {
   const since = db.sequence + 1
   await db.clear({ gte: 'one', lt: 'three' })
 
