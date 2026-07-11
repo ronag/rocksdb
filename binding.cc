@@ -22,10 +22,12 @@
 
 #include <re2/re2.h>
 
+#include <algorithm>
 #include <atomic>
 #include <cmath>
 #include <condition_variable>
 #include <iostream>
+#include <map>
 #include <memory>
 #include <mutex>
 #include <optional>
