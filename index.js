@@ -7,6 +7,7 @@ const binding = require('./binding')
 const { ChainedBatch } = require('./chained-batch')
 const { RocksCache } = require('./cache')
 const { RocksWriteBufferManager } = require('./write-buffer-manager')
+const { RocksStatistics, getStatisticsContext } = require('./statistics')
 const { Iterator } = require('./iterator')
 const fs = require('node:fs')
 const assert = require('node:assert')
@@ -80,6 +81,10 @@ class RocksLevel extends AbstractLevel {
   }
 
   _open (options, callback) {
+    if (options.statistics instanceof RocksStatistics) {
+      options = { ...options, statistics: getStatisticsContext(options.statistics) }
+    }
+
     const doOpen = () => {
       let columns
       try {
@@ -312,10 +317,9 @@ class RocksLevel extends AbstractLevel {
     return binding.db_get_property(this[kContext], property, options ?? kEmpty)
   }
 
-  // Toggle ticker collection at runtime. Only effective when the DB was opened
-  // with `statistics: true`; returns true if the toggle was applied, false if
-  // no statistics object is attached. Collection is off by default and can be
-  // enabled on demand.
+  // Toggle ticker collection at runtime. Returns true when a collector is
+  // attached and false otherwise. On a RocksStatistics resource this changes
+  // collection globally for every DB sharing that resource.
   setStatisticsEnabled (enabled) {
     if (this.status !== 'open') {
       throw new ModuleError('Database is not open', {
@@ -323,13 +327,16 @@ class RocksLevel extends AbstractLevel {
       })
     }
 
-    return binding.db_set_stats_level(this[kContext], Boolean(enabled))
+    if (typeof enabled !== 'boolean') {
+      throw new TypeError("The 'enabled' argument must be a boolean")
+    }
+
+    return binding.db_set_stats_level(this[kContext], enabled)
   }
 
-  // Curated RocksDB ticker counts accumulated while collection is enabled, or
-  // null when the DB was opened without `statistics: true`. Toggling does not
-  // reset existing counts. Values above Number.MAX_SAFE_INTEGER may lose
-  // integer precision.
+  // Curated cumulative ticker counts, or null without `statistics: true` or a
+  // RocksStatistics resource. Shared snapshots cover all attached DBs. Values
+  // above Number.MAX_SAFE_INTEGER may lose integer precision.
   getStatistics () {
     if (this.status !== 'open') {
       throw new ModuleError('Database is not open', {
@@ -446,6 +453,7 @@ class RocksLevel extends AbstractLevel {
 exports.RocksLevel = RocksLevel
 exports.RocksCache = RocksCache
 exports.RocksWriteBufferManager = RocksWriteBufferManager
+exports.RocksStatistics = RocksStatistics
 
 // null on platforms where io_uring does not apply (non-Linux); boolean on
 // Linux, where `false` means RocksDB's async_io silently degrades to serial
