@@ -2711,6 +2711,10 @@ NAPI_METHOD(statistics_set_stats_level) {
 
   std::shared_ptr<rocksdb::Statistics>* statistics;
   NAPI_STATUS_THROWS(napi_get_value_external(env, argv[0], reinterpret_cast<void**>(&statistics)));
+  if (!statistics || !*statistics) {
+    napi_throw_type_error(env, nullptr, "invalid statistics resource");
+    return NULL;
+  }
 
   bool enabled = false;
   NAPI_STATUS_THROWS(napi_get_value_bool(env, argv[1], &enabled));
@@ -2734,6 +2738,10 @@ NAPI_METHOD(statistics_get_statistics) {
 
   std::shared_ptr<rocksdb::Statistics>* statistics;
   NAPI_STATUS_THROWS(napi_get_value_external(env, argv[0], reinterpret_cast<void**>(&statistics)));
+  if (!statistics || !*statistics) {
+    napi_throw_type_error(env, nullptr, "invalid statistics resource");
+    return NULL;
+  }
 
   napi_value result;
   NAPI_STATUS_THROWS(CreateStatisticsSnapshot(env, *statistics, &result));
