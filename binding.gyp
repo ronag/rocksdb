@@ -1,5 +1,8 @@
 {
-    "variables": {"openssl_fips": "0"},
+    "variables": {
+        "openssl_fips": "0",
+        "rocks_level_march%": "<!(node -p \"process.env.ROCKS_LEVEL_MARCH || ''\")",
+    },
     "targets": [
         {
             "target_name": "leveldown",
@@ -41,16 +44,15 @@
                             "-flto",
                             "-fuse-linker-plugin",
                         ],
-                        # Zen 3 tuning only where it can run: an x64-only
-                        # flag would hard-fail gcc on e.g. linux-arm64
-                        # from-source installs (Apple Silicon dev
-                        # containers).
+                        # CPU tuning is opt-in for deployment prebuilds. Local
+                        # source builds stay portable, and the flag is only
+                        # valid on x64.
                         "conditions": [
                             [
-                                "target_arch == 'x64'",
+                                "target_arch == 'x64' and rocks_level_march != ''",
                                 {
-                                    "cflags": ["-march=znver3", "-mtune=znver3"],
-                                    "cflags_cc": ["-march=znver3", "-mtune=znver3"],
+                                    "cflags": ["-march=<(rocks_level_march)", "-mtune=<(rocks_level_march)"],
+                                    "cflags_cc": ["-march=<(rocks_level_march)", "-mtune=<(rocks_level_march)"],
                                 },
                             ],
                         ],

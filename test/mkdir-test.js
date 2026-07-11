@@ -13,6 +13,7 @@ test('creates location directory recursively', async function (t) {
   t.is(fs.existsSync(location), false)
   await db.open()
   t.is(fs.existsSync(location), true)
+  await db.close()
 })
 
 test('does not create location directory recursively if createIfMissing is false', async function (t) {

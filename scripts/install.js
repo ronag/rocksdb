@@ -18,7 +18,7 @@ const { persistentPrefixDir } = require('./deps-prefix.js')
 const packageRoot = path.join(__dirname, '..')
 
 // Mirrors node-gyp-build/bin.js's own --build-from-source handling, so
-// `npm run rebuild` (JOBS=8 npm run install --build-from-source) still forces
+// `npm run rebuild` (npm run install --build-from-source) still forces
 // a real rebuild instead of short-circuiting on an existing binary. npm also
 // supports the scoped form `--build-from-source=<pkg>`, which exports the
 // package name (not 'true') into the env.
@@ -50,7 +50,11 @@ function rebuildWith (prefix) {
   execFileSync(process.execPath, [require.resolve('node-gyp-build/bin.js')], {
     stdio: 'inherit',
     cwd: packageRoot,
-    env: { ...process.env, ROCKS_LEVEL_DEPS_PREFIX: prefix }
+    env: {
+      ...process.env,
+      JOBS: buildDeps.jobs(),
+      ROCKS_LEVEL_DEPS_PREFIX: prefix
+    }
   })
 }
 
