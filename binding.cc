@@ -87,6 +87,7 @@ struct Database final {
 
   rocksdb::Status Close() {
     if (!db) {
+      statistics.reset();
       return rocksdb::Status::OK();
     }
 
@@ -108,7 +109,9 @@ struct Database final {
     columns.clear();
 
     auto db2 = std::move(db);
-    return db2->Close();
+    const auto status = db2->Close();
+    statistics.reset();
+    return status;
   }
 
   void Attach(Closable* closable) {
@@ -129,7 +132,7 @@ struct Database final {
   std::map<int32_t, ColumnFamily> columns;
   // Optional DB-wide statistics, attached at open when `statistics: true`. The
   // object is immutable after open, but its collection level is togglable at
-  // runtime (db_set_stats_level) — off by default, ~free until enabled.
+  // runtime (db_set_stats_level). Collection starts disabled by default.
   std::shared_ptr<rocksdb::Statistics> statistics;
   napi_ref resourceNamesRef = nullptr;
 
@@ -1556,15 +1559,14 @@ NAPI_METHOD(db_open) {
       if (enableStatistics) {
         auto statistics = rocksdb::CreateDBStatistics();
         // Default collection OFF (kExceptTickers): the object is attached so it
-        // can be toggled at runtime, but recordTick early-returns until then, so
-        // it costs nothing until db_set_stats_level(true) turns it on.
+        // can be toggled at runtime; recordTick exits after checking the level
+        // until db_set_stats_level(true) turns collection on.
         bool statisticsEnabled = false;
         NAPI_STATUS_THROWS(GetProperty(env, options, "statisticsEnabled", statisticsEnabled));
         statistics->set_stats_level(statisticsEnabled
                                         ? rocksdb::StatsLevel::kExceptHistogramOrTimers
                                         : rocksdb::StatsLevel::kExceptTickers);
         dbOptions.statistics = statistics;
-        database->statistics = statistics;
       }
     }
 
@@ -1604,6 +1606,8 @@ NAPI_METHOD(db_open) {
     napi_value resourceName;
     NAPI_STATUS_THROWS(database->GetResourceName(env, ResourceLeveldownOpen, resourceName));
 
+    const auto statistics = dbOptions.statistics;
+
     NAPI_STATUS_THROWS(runAsync<std::vector<rocksdb::ColumnFamilyHandle*>>(
         resourceName, env, callback,
         [=](auto& handles) {
@@ -1632,6 +1636,10 @@ NAPI_METHOD(db_open) {
             NAPI_STATUS_RETURN(napi_create_external(env, column.handle, nullptr, nullptr, &val));
             NAPI_STATUS_RETURN(napi_set_named_property(env, columns, column.descriptor.name.c_str(), val));
           }
+
+          // Publish only the Statistics object belonging to this successfully
+          // opened DB. Failed opens must not leave an unattached stale object.
+          database->statistics = statistics;
 
           return napi_ok;
         }));
@@ -1978,9 +1986,11 @@ NAPI_METHOD(db_set_stats_level) {
   return result;
 }
 
-// Block-cache ticker counts (cumulative since open), or null when the DB was
-// opened without `statistics: true`. Counts are DB-wide across all column
-// families and exposed as doubles (they can exceed 2^53 on a long-lived DB).
+// Block-cache ticker counts accumulated while collection is enabled, or null
+// when the DB was opened without `statistics: true`. Toggling collection does
+// not reset counts. Values are DB-wide across all column families and exposed
+// as JavaScript Numbers, so values above Number.MAX_SAFE_INTEGER may lose
+// integer precision.
 NAPI_METHOD(db_get_statistics) {
   NAPI_ARGV(1);
 
