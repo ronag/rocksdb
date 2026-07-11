@@ -27,8 +27,8 @@ RUN npm install --ignore-scripts
 
 # Build abseil/re2/zstd once into the persistent deps/.prefix so the following
 # prebuildify step (a separate node-gyp build) can link against them. Tuned for
-# Zen 3 to match the -march=znver3 the gyp files apply to rocksdb + binding.cc,
-# so the shipped Linux prebuild is optimized for the deployment servers.
+# Zen 3 for the deployment prebuild. Local/source builds leave this unset and
+# remain portable across x64 CPUs.
 COPY scripts/ scripts/
 RUN ROCKS_LEVEL_MARCH=znver3 JOBS=$JOBS npm run build-deps
 
@@ -38,7 +38,7 @@ COPY . .
 # installed copy instead of fetching from the registry. The ABI target is
 # the container's own node (the FROM image), so there is no second version
 # string to keep in sync.
-RUN JOBS=$JOBS MAKEFLAGS="-j$JOBS" npx prebuildify -t "$(node -p process.versions.node)" --napi --strip --arch x64
+RUN ROCKS_LEVEL_MARCH=znver3 JOBS=$JOBS MAKEFLAGS="-j$JOBS" npx prebuildify -t "$(node -p process.versions.node)" --napi --strip --arch x64
 
 # test-prebuild sets PREBUILDS_ONLY=1, which node-gyp-build's loader honors: it
 # skips build/Release and loads the addon from prebuilds/, so the tests exercise

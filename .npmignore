@@ -28,6 +28,7 @@ deps/rocksdb/rocksdb/defs.bzl
 deps/snappy/snappy*/testdata/
 deps/snappy/snappy*/*.txt
 deps/snappy/snappy*/README.md
+deps/rocksdb/rocksdb/**/*_test.cc
 
 README
 INSTALL
@@ -62,6 +63,7 @@ benchmarks/
 .tap/
 .vscode/
 .nyc_output/
+.cache/
 .github/
 yarn.lock
 .gitmodules

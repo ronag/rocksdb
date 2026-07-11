@@ -1,5 +1,8 @@
 {
-  "variables": { "openssl_fips": "0" },
+  "variables": {
+    "openssl_fips": "0",
+    "rocks_level_march%": "<!(node -p \"process.env.ROCKS_LEVEL_MARCH || ''\")"
+  },
   "targets": [
     {
       "target_name": "rocksdb",
@@ -89,10 +92,10 @@
             # flags from xcode_settings, so this block never applied on mac.)
             "conditions": [
               [
-                "target_arch == 'x64'",
+                "target_arch == 'x64' and rocks_level_march != ''",
                 {
-                  "cflags": ["-march=znver1"],
-                  "cflags_cc+": ["-march=znver1"],
+                  "cflags": ["-march=<(rocks_level_march)", "-mtune=<(rocks_level_march)"],
+                  "cflags_cc+": ["-march=<(rocks_level_march)", "-mtune=<(rocks_level_march)"],
                 }
               ]
             ]
@@ -129,7 +132,7 @@
             "cflags!": ["-fno-exceptions"],
             "cflags_cc!": ["-fno-exceptions"],
             "ldflags": ["-flto", "-fuse-linker-plugin"],
-            # -march=znver1 comes from the posix block's x64 condition above;
+            # Optional -march/-mtune flags come from the posix x64 condition above;
             # repeating it here would apply the flag twice on linux-x64.
           },
         ],

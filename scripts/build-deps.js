@@ -35,6 +35,7 @@ const { persistentPrefixDir } = require('./deps-prefix.js')
 const ABSEIL_TAG = '20240722.0'
 const RE2_TAG = '2025-11-05'
 const ZSTD_TAG = 'v1.5.7'
+const MACOS_DEPLOYMENT_TARGET = '13.4.0'
 
 function sh (cmd, args, opts = {}) {
   execFileSync(cmd, args, { stdio: 'inherit', ...opts })
@@ -58,12 +59,18 @@ function ensureTool (bin, hint) {
 // scripts in package.json), so one JOBS value caps the whole build.
 function jobs () {
   const j = parseInt(process.env.JOBS, 10)
-  return Number.isFinite(j) && j > 0 ? String(j) : String(os.cpus().length)
+  return Number.isFinite(j) && j > 0 ? String(j) : String(os.availableParallelism())
 }
 
 function macOsArchFlags () {
   if (process.platform !== 'darwin') return []
   return [`-DCMAKE_OSX_ARCHITECTURES=${process.arch === 'arm64' ? 'arm64' : 'x86_64'}`]
+}
+
+function macOsDeploymentFlags () {
+  return process.platform === 'darwin'
+    ? [`-DCMAKE_OSX_DEPLOYMENT_TARGET=${MACOS_DEPLOYMENT_TARGET}`]
+    : []
 }
 
 // Opt-in CPU tuning, off by default. The end-user from-source path leaves it
@@ -91,7 +98,13 @@ function stampPath (prefix) {
 }
 
 function currentStamp () {
-  return { march: marchValue(), abseil: ABSEIL_TAG, re2: RE2_TAG, zstd: ZSTD_TAG }
+  return {
+    march: marchValue(),
+    macosDeploymentTarget: process.platform === 'darwin' ? MACOS_DEPLOYMENT_TARGET : null,
+    abseil: ABSEIL_TAG,
+    re2: RE2_TAG,
+    zstd: ZSTD_TAG
+  }
 }
 
 function stampMatches (prefix) {
@@ -145,6 +158,7 @@ function buildAbseil (prefix, src) {
     '-DABSL_PROPAGATE_CXX_STD=ON',
     ...CMAKE_COMMON_FLAGS,
     ...cmakeMarchFlags(),
+    ...macOsDeploymentFlags(),
     ...macOsArchFlags()
   ])
   sh('cmake', ['--build', build, '--parallel', jobs()])
@@ -166,6 +180,7 @@ function buildRe2 (prefix, src) {
     '-DRE2_BUILD_TESTING=OFF',
     ...CMAKE_COMMON_FLAGS,
     ...cmakeMarchFlags(),
+    ...macOsDeploymentFlags(),
     ...macOsArchFlags()
   ])
   sh('cmake', ['--build', build, '--parallel', jobs()])
@@ -183,7 +198,9 @@ function buildZstd (prefix, src) {
 
   sh('git', ['clone', '--depth', '1', '--branch', ZSTD_TAG, 'https://github.com/facebook/zstd.git', src])
   const lib = path.join(src, 'lib')
-  sh('make', ['-C', lib, '-j', jobs(), `CFLAGS=-fPIC -O2 ${marchFlags()}`.trim(), 'libzstd.a'])
+  const deploymentFlag = process.platform === 'darwin' ? `-mmacosx-version-min=${MACOS_DEPLOYMENT_TARGET}` : ''
+  const cflags = ['-fPIC', '-O2', marchFlags(), deploymentFlag].filter(Boolean).join(' ')
+  sh('make', ['-C', lib, '-j', jobs(), `CFLAGS=${cflags}`, 'libzstd.a'])
 
   fs.copyFileSync(path.join(lib, 'libzstd.a'), path.join(prefix, 'lib', 'libzstd.a'))
   for (const header of ['zstd.h', 'zstd_errors.h', 'zdict.h']) {
@@ -236,4 +253,4 @@ if (require.main === module) {
   }
 }
 
-module.exports = { ensure, stampMatches }
+module.exports = { ensure, jobs, stampMatches }

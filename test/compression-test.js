@@ -1,87 +1,60 @@
 'use strict'
 
-const each = require('async-each')
-const du = require('du')
-const delayed = require('delayed')
+const { promisify } = require('node:util')
+const { setTimeout: delay } = require('node:timers/promises')
+const du = promisify(require('du'))
 const testCommon = require('./common')
 const { RocksLevel } = require('..')
 const test = require('tape')
 
-const compressableData = Buffer.from(Array.apply(null, Array(1024 * 100)).map(function () {
-  return 'aaaaaaaaaa'
-}).join(''))
-
+const compressibleData = Buffer.alloc(1024 * 100 * 10, 'a')
 const multiples = 10
-const dataSize = compressableData.length * multiples
+const dataSize = compressibleData.length * multiples
 
-const verify = function (location, compression, t) {
-  du(location, function (err, size) {
-    t.error(err)
-    if (compression) {
-      t.ok(size < dataSize, 'on-disk size (' + size + ') is less than data size (' + dataSize + ')')
-    } else {
-      t.ok(size >= dataSize, 'on-disk size (' + size + ') is greater than data size (' + dataSize + ')')
-    }
-    t.end()
-  })
-}
-
-// close, open, close again.. 'compaction' is also performed on open()s
-const cycle = function (db, compression, t, callback) {
+async function cycle (db, compression) {
   const location = db.location
-  db.close(function (err) {
-    t.error(err)
-    db = new RocksLevel(location)
-    db.open({ errorIfExists: false, compression }, function () {
-      t.error(err)
-      db.close(function (err) {
-        t.error(err)
-        callback()
-      })
-    })
-  })
+  await db.close()
+
+  const reopened = new RocksLevel(location)
+  await reopened.open({ errorIfExists: false, compression })
+  await reopened.close()
+  await delay(10)
+  return location
 }
 
-test('compression', function (t) {
-  t.plan(3)
+async function verify (location, compression, t) {
+  const size = await du(location)
+  if (compression) {
+    t.ok(size < dataSize, `on-disk size (${size}) is less than data size (${dataSize})`)
+  } else {
+    t.ok(size >= dataSize, `on-disk size (${size}) is greater than data size (${dataSize})`)
+  }
+}
 
-  t.test('test data is compressed by default (db.put())', function (t) {
-    const db = testCommon.factory()
-    db.open(function (err) {
-      t.error(err)
-      each(
-        Array.apply(null, Array(multiples)).map(function (e, i) {
-          return [i, compressableData]
-        }), function (args, callback) {
-          db.put.apply(db, args.concat([callback]))
-        }, cycle.bind(null, db, true, t, delayed.delayed(verify.bind(null, db.location, true, t), 0.01))
-      )
-    })
-  })
+test('data is compressed by default (db.put())', async function (t) {
+  const db = testCommon.factory()
+  await db.open()
+  await Promise.all(Array.from({ length: multiples }, (_, i) => db.put(i, compressibleData)))
+  await verify(await cycle(db, true), true, t)
+  t.end()
+})
 
-  t.test('test data is not compressed with compression=false on open() (db.put())', function (t) {
-    const db = testCommon.factory()
-    db.open({ compression: false }, function (err) {
-      t.error(err)
-      each(
-        Array.apply(null, Array(multiples)).map(function (e, i) {
-          return [i, compressableData]
-        }), function (args, callback) {
-          db.put.apply(db, args.concat([callback]))
-        }, cycle.bind(null, db, false, t, delayed.delayed(verify.bind(null, db.location, false, t), 0.01))
-      )
-    })
-  })
+test('data is not compressed with compression=false (db.put())', async function (t) {
+  const db = testCommon.factory()
+  await db.open({ compression: false })
+  await Promise.all(Array.from({ length: multiples }, (_, i) => db.put(i, compressibleData)))
+  await verify(await cycle(db, false), false, t)
+  t.end()
+})
 
-  t.test('test data is compressed by default (db.batch())', function (t) {
-    const db = testCommon.factory()
-    db.open(function (err) {
-      t.error(err)
-      db.batch(
-        Array.apply(null, Array(multiples)).map(function (e, i) {
-          return { type: 'put', key: i, value: compressableData }
-        }), cycle.bind(null, db, true, t, delayed.delayed(verify.bind(null, db.location, true, t), 0.01))
-      )
-    })
-  })
+test('data is compressed by default (db.batch())', async function (t) {
+  const db = testCommon.factory()
+  await db.open()
+  await db.batch(Array.from({ length: multiples }, (_, i) => ({
+    type: 'put',
+    key: i,
+    value: compressibleData
+  })))
+  await verify(await cycle(db, true), true, t)
+  t.end()
 })

@@ -1,4 +1,4 @@
-#define NAPI_VERSION 8
+#define NAPI_VERSION 10
 
 #include <assert.h>
 #include <napi-macros.h>

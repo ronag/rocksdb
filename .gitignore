@@ -21,6 +21,7 @@ prebuilds/
 yarn.lock
 package-lock.json
 .nyc_output/
+.cache/
 .benchmarks/
 .vscode/
 .tap/
