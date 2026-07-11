@@ -47,6 +47,8 @@
 #include "max_rev_operator.h"
 #include "util.h"
 
+static const napi_type_tag kStatisticsTypeTag = {0x0d186ac9202c4fe5, 0xa6c8045ce0bb653d};
+
 enum ResourceName {
   ResourceIteratorNextv = 0,
   ResourceLeveldownOpen,
@@ -130,9 +132,9 @@ struct Database final {
 
   std::unique_ptr<rocksdb::DB> db;
   std::map<int32_t, ColumnFamily> columns;
-  // Optional DB-wide statistics, attached at open when `statistics: true`. The
-  // object is immutable after open, but its collection level is togglable at
-  // runtime (db_set_stats_level). Collection starts disabled by default.
+  // Optional DB-wide statistics, either created for legacy `statistics: true`
+  // or shared with other DBs through a RocksStatistics resource. Each DB keeps
+  // its own shared_ptr copy so the native collector outlives the JS resource.
   std::shared_ptr<rocksdb::Statistics> statistics;
   napi_ref resourceNamesRef = nullptr;
 
@@ -1554,19 +1556,49 @@ NAPI_METHOD(db_open) {
     }
 
     {
-      bool enableStatistics = false;
-      NAPI_STATUS_THROWS(GetProperty(env, options, "statistics", enableStatistics));
-      if (enableStatistics) {
-        auto statistics = rocksdb::CreateDBStatistics();
-        // Default collection OFF (kExceptTickers): the object is attached so it
-        // can be toggled at runtime; recordTick exits after checking the level
-        // until db_set_stats_level(true) turns collection on.
-        bool statisticsEnabled = false;
-        NAPI_STATUS_THROWS(GetProperty(env, options, "statisticsEnabled", statisticsEnabled));
-        statistics->set_stats_level(statisticsEnabled
-                                        ? rocksdb::StatsLevel::kExceptHistogramOrTimers
-                                        : rocksdb::StatsLevel::kExceptTickers);
-        dbOptions.statistics = statistics;
+      napi_value statisticsValue;
+      NAPI_STATUS_THROWS(napi_get_named_property(env, options, "statistics", &statisticsValue));
+
+      napi_valuetype statisticsType;
+      NAPI_STATUS_THROWS(napi_typeof(env, statisticsValue, &statisticsType));
+
+      if (statisticsType == napi_boolean) {
+        bool enableStatistics = false;
+        NAPI_STATUS_THROWS(napi_get_value_bool(env, statisticsValue, &enableStatistics));
+        if (enableStatistics) {
+          auto statistics = rocksdb::CreateDBStatistics();
+          // The legacy per-DB collector starts disabled unless explicitly
+          // enabled. A shared resource owns its level independently below.
+          bool statisticsEnabled = false;
+          NAPI_STATUS_THROWS(GetProperty(env, options, "statisticsEnabled", statisticsEnabled));
+          statistics->set_stats_level(statisticsEnabled
+                                          ? rocksdb::StatsLevel::kExceptHistogramOrTimers
+                                          : rocksdb::StatsLevel::kExceptTickers);
+          dbOptions.statistics = std::move(statistics);
+        }
+      } else if (statisticsType == napi_external) {
+        bool isStatistics = false;
+        NAPI_STATUS_THROWS(
+            napi_check_object_type_tag(env, statisticsValue, &kStatisticsTypeTag, &isStatistics));
+        if (!isStatistics) {
+          napi_throw_type_error(env, nullptr, "invalid statistics resource");
+          return NULL;
+        }
+
+        std::shared_ptr<rocksdb::Statistics>* statistics;
+        NAPI_STATUS_THROWS(
+            napi_get_value_external(env, statisticsValue, reinterpret_cast<void**>(&statistics)));
+        if (!statistics || !*statistics) {
+          napi_throw_type_error(env, nullptr, "invalid statistics resource");
+          return NULL;
+        }
+
+        // Copy the shared_ptr while the external is alive. DBOptions and the
+        // Database retain the collector even if the JS resource is collected.
+        dbOptions.statistics = *statistics;
+      } else if (statisticsType != napi_undefined && statisticsType != napi_null) {
+        napi_throw_type_error(env, nullptr, "statistics must be a boolean or RocksStatistics resource");
+        return NULL;
       }
     }
 
@@ -1960,10 +1992,72 @@ NAPI_METHOD(db_get_property) {
   return result;
 }
 
-// Toggle ticker collection at runtime on a DB opened with `statistics: true`.
-// Returns true if a statistics object is attached (toggle applied), false if
-// not — collection is either kExceptHistogramOrTimers (tickers on) or
-// kExceptTickers (ticker collection disabled).
+static napi_status CreateStatisticsSnapshot(napi_env env,
+                                            const std::shared_ptr<rocksdb::Statistics>& statistics,
+                                            napi_value* result) {
+  NAPI_STATUS_RETURN(napi_create_object(env, result));
+
+  auto setTicker = [&](const char* name, uint32_t ticker) -> napi_status {
+    napi_value value;
+    NAPI_STATUS_RETURN(
+        napi_create_double(env, static_cast<double>(statistics->getTickerCount(ticker)), &value));
+    return napi_set_named_property(env, *result, name, value);
+  };
+
+  NAPI_STATUS_RETURN(setTicker("blockCacheHit", rocksdb::BLOCK_CACHE_HIT));
+  NAPI_STATUS_RETURN(setTicker("blockCacheMiss", rocksdb::BLOCK_CACHE_MISS));
+  NAPI_STATUS_RETURN(setTicker("blockCacheDataHit", rocksdb::BLOCK_CACHE_DATA_HIT));
+  NAPI_STATUS_RETURN(setTicker("blockCacheDataMiss", rocksdb::BLOCK_CACHE_DATA_MISS));
+  NAPI_STATUS_RETURN(setTicker("blockCacheIndexHit", rocksdb::BLOCK_CACHE_INDEX_HIT));
+  NAPI_STATUS_RETURN(setTicker("blockCacheIndexMiss", rocksdb::BLOCK_CACHE_INDEX_MISS));
+  NAPI_STATUS_RETURN(setTicker("blockCacheFilterHit", rocksdb::BLOCK_CACHE_FILTER_HIT));
+  NAPI_STATUS_RETURN(setTicker("blockCacheFilterMiss", rocksdb::BLOCK_CACHE_FILTER_MISS));
+  NAPI_STATUS_RETURN(setTicker("blockCacheBytesRead", rocksdb::BLOCK_CACHE_BYTES_READ));
+  NAPI_STATUS_RETURN(setTicker("blockCacheBytesWrite", rocksdb::BLOCK_CACHE_BYTES_WRITE));
+
+  NAPI_STATUS_RETURN(setTicker("blobCacheHit", rocksdb::BLOB_DB_CACHE_HIT));
+  NAPI_STATUS_RETURN(setTicker("blobCacheMiss", rocksdb::BLOB_DB_CACHE_MISS));
+  NAPI_STATUS_RETURN(setTicker("blobCacheAdd", rocksdb::BLOB_DB_CACHE_ADD));
+  NAPI_STATUS_RETURN(setTicker("blobCacheAddFailures", rocksdb::BLOB_DB_CACHE_ADD_FAILURES));
+  NAPI_STATUS_RETURN(setTicker("blobCacheBytesRead", rocksdb::BLOB_DB_CACHE_BYTES_READ));
+  NAPI_STATUS_RETURN(setTicker("blobCacheBytesWrite", rocksdb::BLOB_DB_CACHE_BYTES_WRITE));
+
+  NAPI_STATUS_RETURN(setTicker("bloomFilterUseful", rocksdb::BLOOM_FILTER_USEFUL));
+  NAPI_STATUS_RETURN(setTicker("bloomFilterFullPositive", rocksdb::BLOOM_FILTER_FULL_POSITIVE));
+  NAPI_STATUS_RETURN(
+      setTicker("bloomFilterFullTruePositive", rocksdb::BLOOM_FILTER_FULL_TRUE_POSITIVE));
+
+  NAPI_STATUS_RETURN(setTicker("memtableHit", rocksdb::MEMTABLE_HIT));
+  NAPI_STATUS_RETURN(setTicker("memtableMiss", rocksdb::MEMTABLE_MISS));
+  NAPI_STATUS_RETURN(setTicker("getHitL0", rocksdb::GET_HIT_L0));
+  NAPI_STATUS_RETURN(setTicker("getHitL1", rocksdb::GET_HIT_L1));
+  NAPI_STATUS_RETURN(setTicker("getHitL2AndUp", rocksdb::GET_HIT_L2_AND_UP));
+
+  // RocksLevel implements point reads with MultiGet, so the MultiGet tickers
+  // are its user-visible read volume rather than DB::Get-only counters.
+  NAPI_STATUS_RETURN(setTicker("bytesRead", rocksdb::NUMBER_MULTIGET_BYTES_READ));
+  NAPI_STATUS_RETURN(setTicker("bytesWritten", rocksdb::BYTES_WRITTEN));
+  NAPI_STATUS_RETURN(setTicker("numberKeysRead", rocksdb::NUMBER_MULTIGET_KEYS_READ));
+  NAPI_STATUS_RETURN(setTicker("numberKeysWritten", rocksdb::NUMBER_KEYS_WRITTEN));
+  NAPI_STATUS_RETURN(setTicker("numberDbSeek", rocksdb::NUMBER_DB_SEEK));
+  NAPI_STATUS_RETURN(setTicker("numberDbNext", rocksdb::NUMBER_DB_NEXT));
+  NAPI_STATUS_RETURN(setTicker("iterBytesRead", rocksdb::ITER_BYTES_READ));
+
+  NAPI_STATUS_RETURN(setTicker("compactReadBytes", rocksdb::COMPACT_READ_BYTES));
+  NAPI_STATUS_RETURN(setTicker("compactWriteBytes", rocksdb::COMPACT_WRITE_BYTES));
+  NAPI_STATUS_RETURN(setTicker("flushWriteBytes", rocksdb::FLUSH_WRITE_BYTES));
+
+  NAPI_STATUS_RETURN(setTicker("walFileBytes", rocksdb::WAL_FILE_BYTES));
+  NAPI_STATUS_RETURN(setTicker("walFileSynced", rocksdb::WAL_FILE_SYNCED));
+  NAPI_STATUS_RETURN(setTicker("stallMicros", rocksdb::STALL_MICROS));
+  NAPI_STATUS_RETURN(setTicker("numberBlockCompressed", rocksdb::NUMBER_BLOCK_COMPRESSED));
+  NAPI_STATUS_RETURN(setTicker("numberBlockDecompressed", rocksdb::NUMBER_BLOCK_DECOMPRESSED));
+
+  return napi_ok;
+}
+
+// Toggle ticker collection at runtime on a DB with an attached collector.
+// A shared collector changes globally for every DB that uses the resource.
 NAPI_METHOD(db_set_stats_level) {
   NAPI_ARGV(2);
 
@@ -1987,10 +2081,8 @@ NAPI_METHOD(db_set_stats_level) {
 }
 
 // Curated RocksDB ticker counts accumulated while collection is enabled, or
-// null when the DB was opened without `statistics: true`. Toggling collection
-// does not reset counts. Values are DB-wide across all column families and
-// exposed as JavaScript Numbers, so values above Number.MAX_SAFE_INTEGER may
-// lose integer precision.
+// null when no collector is attached. A resource snapshot spans every DB that
+// shares it. Values above Number.MAX_SAFE_INTEGER may lose integer precision.
 NAPI_METHOD(db_get_statistics) {
   NAPI_ARGV(1);
 
@@ -2003,63 +2095,8 @@ NAPI_METHOD(db_get_statistics) {
     return nullResult;
   }
 
-  const auto& statistics = database->statistics;
-
   napi_value result;
-  NAPI_STATUS_THROWS(napi_create_object(env, &result));
-
-  auto setTicker = [&](const char* name, uint32_t ticker) -> napi_status {
-    napi_value value;
-    NAPI_STATUS_RETURN(
-        napi_create_double(env, static_cast<double>(statistics->getTickerCount(ticker)), &value));
-    return napi_set_named_property(env, result, name, value);
-  };
-
-  NAPI_STATUS_THROWS(setTicker("blockCacheHit", rocksdb::BLOCK_CACHE_HIT));
-  NAPI_STATUS_THROWS(setTicker("blockCacheMiss", rocksdb::BLOCK_CACHE_MISS));
-  NAPI_STATUS_THROWS(setTicker("blockCacheDataHit", rocksdb::BLOCK_CACHE_DATA_HIT));
-  NAPI_STATUS_THROWS(setTicker("blockCacheDataMiss", rocksdb::BLOCK_CACHE_DATA_MISS));
-  NAPI_STATUS_THROWS(setTicker("blockCacheIndexHit", rocksdb::BLOCK_CACHE_INDEX_HIT));
-  NAPI_STATUS_THROWS(setTicker("blockCacheIndexMiss", rocksdb::BLOCK_CACHE_INDEX_MISS));
-  NAPI_STATUS_THROWS(setTicker("blockCacheFilterHit", rocksdb::BLOCK_CACHE_FILTER_HIT));
-  NAPI_STATUS_THROWS(setTicker("blockCacheFilterMiss", rocksdb::BLOCK_CACHE_FILTER_MISS));
-  NAPI_STATUS_THROWS(setTicker("blockCacheBytesRead", rocksdb::BLOCK_CACHE_BYTES_READ));
-  NAPI_STATUS_THROWS(setTicker("blockCacheBytesWrite", rocksdb::BLOCK_CACHE_BYTES_WRITE));
-
-  // Bloom/filter effectiveness.
-  NAPI_STATUS_THROWS(setTicker("bloomFilterUseful", rocksdb::BLOOM_FILTER_USEFUL));
-  NAPI_STATUS_THROWS(setTicker("bloomFilterFullPositive", rocksdb::BLOOM_FILTER_FULL_POSITIVE));
-  NAPI_STATUS_THROWS(
-      setTicker("bloomFilterFullTruePositive", rocksdb::BLOOM_FILTER_FULL_TRUE_POSITIVE));
-
-  // Where reads are served from: memtable vs the LSM levels.
-  NAPI_STATUS_THROWS(setTicker("memtableHit", rocksdb::MEMTABLE_HIT));
-  NAPI_STATUS_THROWS(setTicker("memtableMiss", rocksdb::MEMTABLE_MISS));
-  NAPI_STATUS_THROWS(setTicker("getHitL0", rocksdb::GET_HIT_L0));
-  NAPI_STATUS_THROWS(setTicker("getHitL1", rocksdb::GET_HIT_L1));
-  NAPI_STATUS_THROWS(setTicker("getHitL2AndUp", rocksdb::GET_HIT_L2_AND_UP));
-
-  // User-visible point-read/write volume. RocksLevel implements get() and
-  // getMany() with RocksDB MultiGet, so use the MultiGet read tickers rather
-  // than the DB::Get-only BYTES_READ and NUMBER_KEYS_READ tickers.
-  NAPI_STATUS_THROWS(setTicker("bytesRead", rocksdb::NUMBER_MULTIGET_BYTES_READ));
-  NAPI_STATUS_THROWS(setTicker("bytesWritten", rocksdb::BYTES_WRITTEN));
-  NAPI_STATUS_THROWS(setTicker("numberKeysRead", rocksdb::NUMBER_MULTIGET_KEYS_READ));
-  NAPI_STATUS_THROWS(setTicker("numberKeysWritten", rocksdb::NUMBER_KEYS_WRITTEN));
-  NAPI_STATUS_THROWS(setTicker("numberDbSeek", rocksdb::NUMBER_DB_SEEK));
-  NAPI_STATUS_THROWS(setTicker("numberDbNext", rocksdb::NUMBER_DB_NEXT));
-
-  // Background write amplification: compaction + flush I/O.
-  NAPI_STATUS_THROWS(setTicker("compactReadBytes", rocksdb::COMPACT_READ_BYTES));
-  NAPI_STATUS_THROWS(setTicker("compactWriteBytes", rocksdb::COMPACT_WRITE_BYTES));
-  NAPI_STATUS_THROWS(setTicker("flushWriteBytes", rocksdb::FLUSH_WRITE_BYTES));
-
-  // WAL + write-stall pressure + compression.
-  NAPI_STATUS_THROWS(setTicker("walFileBytes", rocksdb::WAL_FILE_BYTES));
-  NAPI_STATUS_THROWS(setTicker("walFileSynced", rocksdb::WAL_FILE_SYNCED));
-  NAPI_STATUS_THROWS(setTicker("stallMicros", rocksdb::STALL_MICROS));
-  NAPI_STATUS_THROWS(setTicker("numberBlockCompressed", rocksdb::NUMBER_BLOCK_COMPRESSED));
-  NAPI_STATUS_THROWS(setTicker("numberBlockDecompressed", rocksdb::NUMBER_BLOCK_DECOMPRESSED));
+  NAPI_STATUS_THROWS(CreateStatisticsSnapshot(env, database->statistics, &result));
 
   return result;
 }
@@ -2644,6 +2681,65 @@ NAPI_METHOD(db_compact_range) {
   return 0;
 }
 
+NAPI_METHOD(statistics_init) {
+  NAPI_ARGV(1);
+
+  bool enabled = false;
+  NAPI_STATUS_THROWS(GetProperty(env, argv[0], "enabled", enabled));
+
+  auto statistics = new std::shared_ptr<rocksdb::Statistics>(rocksdb::CreateDBStatistics());
+  (*statistics)->set_stats_level(enabled ? rocksdb::StatsLevel::kExceptHistogramOrTimers
+                                        : rocksdb::StatsLevel::kExceptTickers);
+
+  napi_value result;
+  NAPI_STATUS_THROWS(napi_create_external(
+      env, statistics, Finalize<std::shared_ptr<rocksdb::Statistics>>, statistics, &result));
+  NAPI_STATUS_THROWS(napi_type_tag_object(env, result, &kStatisticsTypeTag));
+
+  return result;
+}
+
+NAPI_METHOD(statistics_set_stats_level) {
+  NAPI_ARGV(2);
+
+  bool isStatistics = false;
+  NAPI_STATUS_THROWS(napi_check_object_type_tag(env, argv[0], &kStatisticsTypeTag, &isStatistics));
+  if (!isStatistics) {
+    napi_throw_type_error(env, nullptr, "invalid statistics resource");
+    return NULL;
+  }
+
+  std::shared_ptr<rocksdb::Statistics>* statistics;
+  NAPI_STATUS_THROWS(napi_get_value_external(env, argv[0], reinterpret_cast<void**>(&statistics)));
+
+  bool enabled = false;
+  NAPI_STATUS_THROWS(napi_get_value_bool(env, argv[1], &enabled));
+  (*statistics)->set_stats_level(enabled ? rocksdb::StatsLevel::kExceptHistogramOrTimers
+                                        : rocksdb::StatsLevel::kExceptTickers);
+
+  napi_value result;
+  NAPI_STATUS_THROWS(napi_get_boolean(env, true, &result));
+  return result;
+}
+
+NAPI_METHOD(statistics_get_statistics) {
+  NAPI_ARGV(1);
+
+  bool isStatistics = false;
+  NAPI_STATUS_THROWS(napi_check_object_type_tag(env, argv[0], &kStatisticsTypeTag, &isStatistics));
+  if (!isStatistics) {
+    napi_throw_type_error(env, nullptr, "invalid statistics resource");
+    return NULL;
+  }
+
+  std::shared_ptr<rocksdb::Statistics>* statistics;
+  NAPI_STATUS_THROWS(napi_get_value_external(env, argv[0], reinterpret_cast<void**>(&statistics)));
+
+  napi_value result;
+  NAPI_STATUS_THROWS(CreateStatisticsSnapshot(env, *statistics, &result));
+  return result;
+}
+
 NAPI_METHOD(cache_init) {
   NAPI_ARGV(1);
 
@@ -2810,6 +2906,10 @@ NAPI_INIT() {
   NAPI_EXPORT_FUNCTION(db_compact_range_sync);
   NAPI_EXPORT_FUNCTION(db_compact_range);
   NAPI_EXPORT_FUNCTION(db_flush_wal);
+
+  NAPI_EXPORT_FUNCTION(statistics_init);
+  NAPI_EXPORT_FUNCTION(statistics_set_stats_level);
+  NAPI_EXPORT_FUNCTION(statistics_get_statistics);
 
   NAPI_EXPORT_FUNCTION(iterator_init_sync);
   NAPI_EXPORT_FUNCTION(iterator_refresh_sync);
