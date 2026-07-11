@@ -30,16 +30,16 @@ test('statistics resource: DB retains collector after resource is finalized', as
     await db.put('before-gc', 'value')
   })()
 
-  for (let i = 0; i < 100; i++) {
+  for (let i = 0; i < 20; i++) {
     if (finalized) break
-    global.gc()
+    await global.gc({ type: 'major', execution: 'async' })
     await new Promise(resolve => setImmediate(resolve))
   }
   t.equal(finalized, true, 'the JS resource wrapper was finalized')
 
   // Force another collection cycle so the wrapper's native external finalizer
   // has also run; only Database's copied shared_ptr can keep the collector live.
-  global.gc()
+  await global.gc({ type: 'major', execution: 'async' })
   await new Promise(resolve => setImmediate(resolve))
 
   const before = db.getStatistics().numberKeysWritten
