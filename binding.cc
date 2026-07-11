@@ -1963,7 +1963,7 @@ NAPI_METHOD(db_get_property) {
 // Toggle ticker collection at runtime on a DB opened with `statistics: true`.
 // Returns true if a statistics object is attached (toggle applied), false if
 // not — collection is either kExceptHistogramOrTimers (tickers on) or
-// kExceptTickers (recordTick early-returns, ~free).
+// kExceptTickers (ticker collection disabled).
 NAPI_METHOD(db_set_stats_level) {
   NAPI_ARGV(2);
 
@@ -1986,11 +1986,11 @@ NAPI_METHOD(db_set_stats_level) {
   return result;
 }
 
-// Block-cache ticker counts accumulated while collection is enabled, or null
-// when the DB was opened without `statistics: true`. Toggling collection does
-// not reset counts. Values are DB-wide across all column families and exposed
-// as JavaScript Numbers, so values above Number.MAX_SAFE_INTEGER may lose
-// integer precision.
+// Curated RocksDB ticker counts accumulated while collection is enabled, or
+// null when the DB was opened without `statistics: true`. Toggling collection
+// does not reset counts. Values are DB-wide across all column families and
+// exposed as JavaScript Numbers, so values above Number.MAX_SAFE_INTEGER may
+// lose integer precision.
 NAPI_METHOD(db_get_statistics) {
   NAPI_ARGV(1);
 
@@ -2039,10 +2039,12 @@ NAPI_METHOD(db_get_statistics) {
   NAPI_STATUS_THROWS(setTicker("getHitL1", rocksdb::GET_HIT_L1));
   NAPI_STATUS_THROWS(setTicker("getHitL2AndUp", rocksdb::GET_HIT_L2_AND_UP));
 
-  // User-visible read/write volume.
-  NAPI_STATUS_THROWS(setTicker("bytesRead", rocksdb::BYTES_READ));
+  // User-visible point-read/write volume. RocksLevel implements get() and
+  // getMany() with RocksDB MultiGet, so use the MultiGet read tickers rather
+  // than the DB::Get-only BYTES_READ and NUMBER_KEYS_READ tickers.
+  NAPI_STATUS_THROWS(setTicker("bytesRead", rocksdb::NUMBER_MULTIGET_BYTES_READ));
   NAPI_STATUS_THROWS(setTicker("bytesWritten", rocksdb::BYTES_WRITTEN));
-  NAPI_STATUS_THROWS(setTicker("numberKeysRead", rocksdb::NUMBER_KEYS_READ));
+  NAPI_STATUS_THROWS(setTicker("numberKeysRead", rocksdb::NUMBER_MULTIGET_KEYS_READ));
   NAPI_STATUS_THROWS(setTicker("numberKeysWritten", rocksdb::NUMBER_KEYS_WRITTEN));
   NAPI_STATUS_THROWS(setTicker("numberDbSeek", rocksdb::NUMBER_DB_SEEK));
   NAPI_STATUS_THROWS(setTicker("numberDbNext", rocksdb::NUMBER_DB_NEXT));

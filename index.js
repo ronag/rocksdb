@@ -326,10 +326,10 @@ class RocksLevel extends AbstractLevel {
     return binding.db_set_stats_level(this[kContext], Boolean(enabled))
   }
 
-  // Block-cache ticker counts accumulated while collection is enabled, or null
-  // when the DB was opened without `statistics: true`. Toggling does not reset
-  // existing counts. Values above Number.MAX_SAFE_INTEGER may lose integer
-  // precision.
+  // Curated RocksDB ticker counts accumulated while collection is enabled, or
+  // null when the DB was opened without `statistics: true`. Toggling does not
+  // reset existing counts. Values above Number.MAX_SAFE_INTEGER may lose
+  // integer precision.
   getStatistics () {
     if (this.status !== 'open') {
       throw new ModuleError('Database is not open', {

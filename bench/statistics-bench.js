@@ -1,9 +1,8 @@
 'use strict'
 
-// Relative micro-benchmark: the same read/write workload with statistics
-// collection ON vs OFF, to confirm always-on statistics
-// (kExceptHistogramOrTimers — per-core relaxed atomic tickers, no timers or
-// histograms) has negligible overhead. Only the DELTA matters, not absolutes.
+// Relative micro-benchmark comparing enabled and disabled ticker collection.
+// kExceptHistogramOrTimers enables tickers without timers or histograms.
+// Only the DELTA matters here, not the absolute host numbers.
 
 const { bench, run } = require('mitata')
 const { RocksLevel, RocksCache } = require('..')

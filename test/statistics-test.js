@@ -18,7 +18,17 @@ const TICKER_KEYS = [
   'blockCacheDataHit', 'blockCacheDataMiss',
   'blockCacheIndexHit', 'blockCacheIndexMiss',
   'blockCacheFilterHit', 'blockCacheFilterMiss',
-  'blockCacheBytesRead', 'blockCacheBytesWrite'
+  'blockCacheBytesRead', 'blockCacheBytesWrite',
+  'bloomFilterUseful', 'bloomFilterFullPositive',
+  'bloomFilterFullTruePositive',
+  'memtableHit', 'memtableMiss',
+  'getHitL0', 'getHitL1', 'getHitL2AndUp',
+  'bytesRead', 'bytesWritten',
+  'numberKeysRead', 'numberKeysWritten',
+  'numberDbSeek', 'numberDbNext',
+  'compactReadBytes', 'compactWriteBytes', 'flushWriteBytes',
+  'walFileBytes', 'walFileSynced', 'stallMicros',
+  'numberBlockCompressed', 'numberBlockDecompressed'
 ]
 
 async function seedOnDisk (db, keys) {
@@ -42,7 +52,7 @@ test('statistics: null when not opened with statistics', async (t) => {
   t.end()
 })
 
-test('statistics: object with all block-cache tickers when attached', async (t) => {
+test('statistics: object with all exposed tickers when attached', async (t) => {
   const p = dbPath('shape')
   cleanup(p)
 
@@ -57,6 +67,7 @@ test('statistics: object with all block-cache tickers when attached', async (t) 
   t.ok(stats && typeof stats === 'object', 'returns an object')
   t.equal(db.supports.additionalMethods.getStatistics, true, 'getStatistics is advertised')
   t.equal(db.supports.additionalMethods.setStatisticsEnabled, true, 'setStatisticsEnabled is advertised')
+  t.deepEqual(Object.keys(stats).sort(), [...TICKER_KEYS].sort(), 'returns exactly the documented tickers')
   for (const k of TICKER_KEYS) {
     t.equal(typeof stats[k], 'number', `${k} is a number`)
   }
@@ -66,7 +77,7 @@ test('statistics: object with all block-cache tickers when attached', async (t) 
   t.end()
 })
 
-test('statistics: tickers increment on block-cache reads', async (t) => {
+test('statistics: read, write and cache tickers increment', async (t) => {
   const p = dbPath('increment')
   cleanup(p)
 
@@ -86,6 +97,10 @@ test('statistics: tickers increment on block-cache reads', async (t) => {
   for (const k of keys) await db.get(k, { fillCache: true })
   const warm = db.getStatistics()
 
+  t.ok(before.bytesWritten > 0, 'writes increment bytesWritten')
+  t.ok(before.numberKeysWritten >= keys.length, 'writes increment numberKeysWritten')
+  t.ok(cold.bytesRead > before.bytesRead, 'reads increment bytesRead')
+  t.ok(cold.numberKeysRead >= before.numberKeysRead + keys.length, 'reads increment numberKeysRead')
   t.ok(cold.blockCacheMiss > before.blockCacheMiss, 'cold reads increment misses')
   t.ok(warm.blockCacheHit > cold.blockCacheHit, 'warm reads increment hits')
 
