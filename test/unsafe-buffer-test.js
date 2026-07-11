@@ -17,7 +17,7 @@ test('unsafe getMany returns correct values', async function (t) {
   const expected = []
   for (let i = 0; i < n; i++) {
     const key = Buffer.from('key' + String(i).padStart(4, '0'))
-    const val = Buffer.allocUnsafe(64).fill(i & 0xff)
+    const val = Buffer.allocUnsafe(2048).fill(i & 0xff)
     expected.push(val)
     batch.put(key, val)
   }
@@ -26,11 +26,13 @@ test('unsafe getMany returns correct values', async function (t) {
   const keys = expected.map((_, i) => Buffer.from('key' + String(i).padStart(4, '0')))
   const safe = db._getManySync(keys, { valueEncoding: 'buffer' })
   const unsafe = db._getManySync(keys, { valueEncoding: 'buffer', unsafe: true })
+  const asyncUnsafe = await db._getMany(keys, { valueEncoding: 'buffer', unsafe: true })
 
   t.equal(unsafe.length, n, 'returns all values')
   let ok = true
   for (let i = 0; i < n; i++) {
-    if (!unsafe[i].equals(expected[i]) || !unsafe[i].equals(safe[i])) ok = false
+    if (!unsafe[i].equals(expected[i]) || !unsafe[i].equals(safe[i]) ||
+        !asyncUnsafe[i].equals(expected[i])) ok = false
   }
   t.ok(ok, 'unsafe values match safe values and source bytes')
 
@@ -55,7 +57,7 @@ test('unsafe iterator nextv returns correct values', async function (t) {
   const expected = new Map()
   for (let i = 0; i < 100; i++) {
     const key = Buffer.from('k' + String(i).padStart(3, '0'))
-    const val = Buffer.allocUnsafe(32).fill(i & 0xff)
+    const val = Buffer.allocUnsafe(2048).fill(i & 0xff)
     expected.set(key.toString(), val)
     batch.put(key, val)
   }
@@ -69,6 +71,37 @@ test('unsafe iterator nextv returns correct values', async function (t) {
   }
   t.ok(ok, 'unsafe iterator values are correct')
 
+  const retained = entries[50][1]
+  await db.close()
+  if (global.gc) global.gc()
+  t.ok(retained.equals(expected.get('k050')), 'external iterator buffer remains valid after close and GC')
+  t.end()
+})
+
+test('async getMany retains borrowed key buffers through forced GC', async function (t) {
+  if (!global.gc) {
+    t.pass('forced-GC variant runs through test/gc.js')
+    t.end()
+    return
+  }
+
+  const db = testCommon.factory({ keyEncoding: 'buffer', valueEncoding: 'buffer' })
+  await db.open()
+  await db.batch(Array.from({ length: 1000 }, (_, i) => ({
+    type: 'put',
+    key: Buffer.from('borrowed-' + String(i).padStart(4, '0')),
+    value: Buffer.from('value-' + i)
+  })))
+
+  let keys = Array.from({ length: 1000 }, (_, i) =>
+    Buffer.from('borrowed-' + String(i).padStart(4, '0')))
+  const pending = db._getMany(keys, { valueEncoding: 'buffer' })
+  keys = null
+  for (let i = 0; i < 4; i++) global.gc()
+
+  const values = await pending
+  t.equal(values.length, 1000, 'all borrowed keys remained alive')
+  t.equal(values[999].toString(), 'value-999', 'the final borrowed key read the correct value')
   await db.close()
   t.end()
 })
@@ -81,5 +114,41 @@ test('unsafe with empty values', async function (t) {
   t.ok(Buffer.isBuffer(val), 'empty value returns a buffer')
   t.equal(val.length, 0, 'empty value has length 0')
   await db.close()
+  t.end()
+})
+
+test('unsafe cache-backed buffers can be collected after db close', async function (t) {
+  if (!global.gc) {
+    t.pass('forced-GC variant runs through test/gc.js')
+    t.end()
+    return
+  }
+
+  let db = testCommon.factory({ keyEncoding: 'buffer', valueEncoding: 'buffer' })
+  await db.open()
+  const location = db.location
+  const expected = Buffer.alloc(128 * 1024, 0x5a)
+  await db.put(Buffer.from('cached'), expected)
+  await db.compactRange()
+  await db.close()
+
+  // Reopen so the value comes from an SST/block-cache pin rather than the
+  // memtable. The old external-buffer finalizer dereferenced the dead cache.
+  db = new (require('..').RocksLevel)(location, {
+    keyEncoding: 'buffer',
+    valueEncoding: 'buffer'
+  })
+  await db.open()
+  let value = db._getManySync([Buffer.from('cached')], {
+    valueEncoding: 'buffer',
+    unsafe: true,
+    fillCache: true
+  })[0]
+  t.ok(value.equals(expected), 'read the expected cache-backed value')
+  await db.close()
+
+  value = null
+  for (let i = 0; i < 4; i++) global.gc()
+  t.pass('external buffer finalized after the cache was closed without crashing')
   t.end()
 })

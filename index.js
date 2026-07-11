@@ -24,21 +24,40 @@ const kEmpty = Object.freeze({})
 
 class RocksLevel extends AbstractLevel {
   constructor (locationOrHandle, { ...options } = {}) {
-    super({
-      encodings: {
-        buffer: true,
-        utf8: true
-      },
-      seek: true,
-      additionalMethods: {
-        getStatistics: true,
-        query: true,
-        setStatisticsEnabled: true,
-        updates: true
-      }
-    }, options)
+    // Validate and acquire native handles before AbstractLevel schedules its
+    // automatic open. If native construction throws, no half-constructed DB is
+    // left behind to auto-open with an undefined context on the next tick.
+    let context
+    try {
+      context = binding.db_init(locationOrHandle)
 
-    this[kContext] = binding.db_init(locationOrHandle)
+      super({
+        encodings: {
+          buffer: true,
+          utf8: true
+        },
+        seek: true,
+        additionalMethods: {
+          getStatistics: true,
+          query: true,
+          setStatisticsEnabled: true,
+          updates: true
+        }
+      }, options)
+    } catch (err) {
+      // A BigInt handle reserves a native lease in db_init(). If AbstractLevel
+      // rejects constructor options, release it synchronously because no JS
+      // instance exists whose cleanup hook we can rely on.
+      try {
+        if (context) binding.db_dispose(context)
+      } catch {
+        // Preserve the constructor error that prevented the instance from
+        // being created. The native cleanup hook is still a final fallback.
+      }
+      throw err
+    }
+
+    this[kContext] = context
     this[kColumns] = {}
 
     this[kRefs] = 0
@@ -70,8 +89,11 @@ class RocksLevel extends AbstractLevel {
   }
 
   get handle () {
-    // TODO (fix): Support returning handle even if not open yet...
-    assert(this.status === 'open', 'Database is not open')
+    if (this.status !== 'open') {
+      throw new ModuleError('Database is not open', {
+        code: 'LEVEL_DATABASE_NOT_OPEN'
+      })
+    }
 
     return binding.db_get_handle(this[kContext])
   }
@@ -85,31 +107,36 @@ class RocksLevel extends AbstractLevel {
       options = { ...options, statistics: getStatisticsContext(options.statistics) }
     }
 
-    const doOpen = () => {
-      let columns
+    const failOpen = (err) => {
+      // db_init reserves imported handles immediately. Release that reservation
+      // on every open failure, including synchronous option-validation errors
+      // that occur before native Database::Open runs.
       try {
-        columns = binding.db_open(this[kContext], options, (err, columns) => {
+        binding.db_close(this[kContext], () => callback(err))
+      } catch {
+        process.nextTick(callback, err)
+      }
+    }
+
+    const doOpen = () => {
+      try {
+        binding.db_open(this[kContext], options, (err, columns) => {
           if (err) {
-            callback(err)
+            failOpen(err)
           } else {
             this[kColumns] = columns
             callback(null)
           }
         })
       } catch (err) {
-        callback(err)
-      }
-
-      if (columns) {
-        this[kColumns] = columns
-        callback(null)
+        failOpen(err)
       }
     }
 
     if (options.createIfMissing) {
       fs.mkdir(this.location, { recursive: true }, (err) => {
         if (err && err.code !== 'EEXIST') {
-          callback(err)
+          failOpen(err)
         } else {
           doOpen()
         }
@@ -253,35 +280,37 @@ class RocksLevel extends AbstractLevel {
   _batch (operations, options, callback) {
     callback = fromCallback(callback, kPromise)
 
-    const batch = binding.batch_init()
-
-    for (let { type, key, value, ...rest } of operations) {
-      if (type === 'del') {
-        key = typeof key === 'string' ? Buffer.from(key) : key
-        binding.batch_del(batch, key, rest)
-      } else if (type === 'put') {
-        key = typeof key === 'string' ? Buffer.from(key) : key
-        value = typeof value === 'string' ? Buffer.from(value) : value
-        binding.batch_put(batch, key, value, rest)
-      } else {
-        assert(false)
-      }
-    }
-
-    // Hold a db ref for the duration of the write so close() defers db_close
-    // (which frees the native db on a worker thread) until it completes. The
-    // array-form batch uses a transient WriteBatch that is not an abstract-level
-    // resource, so it is not otherwise tracked across close.
-    this[kRef]()
+    let batch
+    let referenced = false
     try {
+      batch = binding.batch_init(this[kContext])
+
+      for (let { type, key, value, ...rest } of operations) {
+        if (type === 'del') {
+          key = typeof key === 'string' ? Buffer.from(key) : key
+          binding.batch_del(batch, key, rest)
+        } else if (type === 'put') {
+          key = typeof key === 'string' ? Buffer.from(key) : key
+          value = typeof value === 'string' ? Buffer.from(value) : value
+          binding.batch_put(batch, key, value, rest)
+        } else {
+          assert(false)
+        }
+      }
+
+      // Hold a db ref for the duration of the write so close() defers db_close
+      // until it completes. Array-form batches are not tracked as abstract-level
+      // resources, so they need this explicit lease.
+      this[kRef]()
+      referenced = true
       binding.batch_write(this[kContext], batch, options ?? {}, (err, val) => {
         this[kUnref]()
         binding.batch_clear(batch)
         callback(err, val)
       })
     } catch (err) {
-      this[kUnref]()
-      binding.batch_clear(batch)
+      if (referenced) this[kUnref]()
+      if (batch) binding.batch_clear(batch)
       process.nextTick(callback, err)
     }
 

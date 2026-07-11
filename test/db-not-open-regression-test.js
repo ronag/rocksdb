@@ -12,14 +12,17 @@ test('sequence/identity throw (not crash) when the db is not open', async functi
   // Right after construction the db is still opening (not yet 'open').
   t.throws(() => db.sequence, /not open/i, 'sequence throws before open')
   t.throws(() => db.identity, /not open/i, 'identity throws before open')
+  t.throws(() => db.handle, /not open/i, 'handle throws before open')
 
   await db.open()
   t.equal(typeof db.sequence, 'number', 'sequence returns a number when open')
   t.equal(typeof db.identity, 'string', 'identity returns a string when open')
+  t.equal(typeof db.handle, 'bigint', 'handle returns a bigint when open')
 
   await db.close()
   t.throws(() => db.sequence, /not open/i, 'sequence throws after close')
   t.throws(() => db.identity, /not open/i, 'identity throws after close')
+  t.throws(() => db.handle, /not open/i, 'handle throws after close')
 
   t.end()
 })
@@ -33,11 +36,13 @@ function grabError (fn) {
   }
 }
 
-test('sequence/identity report the LEVEL_DATABASE_NOT_OPEN code', function (t) {
+test('closed getters report the LEVEL_DATABASE_NOT_OPEN code', async function (t) {
   const db = testCommon.factory()
 
   t.equal(grabError(() => db.sequence).code, 'LEVEL_DATABASE_NOT_OPEN', 'sequence error code')
   t.equal(grabError(() => db.identity).code, 'LEVEL_DATABASE_NOT_OPEN', 'identity error code')
+  t.equal(grabError(() => db.handle).code, 'LEVEL_DATABASE_NOT_OPEN', 'handle error code')
 
+  await db.close()
   t.end()
 })

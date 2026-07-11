@@ -22,13 +22,17 @@
 
 #include <re2/re2.h>
 
+#include <atomic>
 #include <cmath>
+#include <condition_variable>
 #include <iostream>
 #include <memory>
+#include <mutex>
 #include <optional>
 #include <set>
 #include <string>
 #include <thread>
+#include <unordered_map>
 #include <vector>
 
 #ifdef __linux__
@@ -70,8 +74,96 @@ class NullLogger : public rocksdb::Logger {
 };
 
 struct Database;
+struct DatabaseReference;
+struct DatabaseOperation;
+struct ColumnReference;
 class Iterator;
 struct Updates;
+
+class HandleIds final {
+ public:
+  static HandleIds& Instance() {
+    // Process lifetime is intentional for the same reason as HandleRegistry:
+    // addon statics can be torn down before worker environments finish.
+    static auto* ids = new HandleIds();
+    return *ids;
+  }
+
+  uint64_t Acquire() {
+    std::lock_guard lock(mutex_);
+    while (next_ == 0 || live_.contains(next_)) {
+      ++next_;
+    }
+    const auto id = next_++;
+    live_.insert(id);
+    return id;
+  }
+
+  void Release(uint64_t id) {
+    if (id == 0) return;
+    std::lock_guard lock(mutex_);
+    live_.erase(id);
+  }
+
+ private:
+  std::mutex mutex_;
+  uint64_t next_ = 1;
+  std::set<uint64_t> live_;
+};
+
+template <typename T>
+class HandleRegistry final {
+ public:
+  static HandleRegistry& Instance() {
+    // Process lifetime is intentional: addon statics can otherwise be torn down
+    // before the last worker environment releases its native references.
+    static auto* registry = new HandleRegistry();
+    return *registry;
+  }
+
+  uint64_t Insert(const std::shared_ptr<T>& value) {
+    std::lock_guard lock(mutex_);
+    // IDs share one process-wide namespace. A DB handle must never alias a
+    // cache or write-buffer-manager handle merely because each resource type
+    // happened to allocate its first entry.
+    const auto id = HandleIds::Instance().Acquire();
+    values_.emplace(id, value);
+    return id;
+  }
+
+  std::shared_ptr<T> Lookup(uint64_t id) {
+    std::lock_guard lock(mutex_);
+    const auto found = values_.find(id);
+    if (found == values_.end()) {
+      return {};
+    }
+
+    auto value = found->second.lock();
+    if (!value) {
+      values_.erase(found);
+      HandleIds::Instance().Release(id);
+    }
+    return value;
+  }
+
+  void Erase(uint64_t id, const T* expected) {
+    std::lock_guard lock(mutex_);
+    const auto found = values_.find(id);
+    if (found == values_.end()) {
+      return;
+    }
+
+    const auto value = found->second.lock();
+    if (!value || value.get() == expected) {
+      values_.erase(found);
+      HandleIds::Instance().Release(id);
+    }
+  }
+
+ private:
+  std::mutex mutex_;
+  std::unordered_map<uint64_t, std::weak_ptr<T>> values_;
+};
 
 struct ColumnFamily {
   rocksdb::ColumnFamilyHandle* handle;
@@ -80,55 +172,56 @@ struct ColumnFamily {
 
 struct Closable {
   virtual ~Closable() {}
-  virtual rocksdb::Status Close() = 0;
+  // Called with the owning reference's resources mutex held. Implementations must only
+  // release their RocksDB resources and must not call back into Database.
+  virtual rocksdb::Status CloseResources() = 0;
+  std::atomic<bool> closed{false};
+};
+
+struct ColumnSnapshot final {
+  std::string name;
+  int32_t id;
+};
+
+struct OpenSnapshot final {
+  uint64_t generation = 0;
+  std::vector<ColumnSnapshot> columns;
 };
 
 struct Database final {
+  enum class State { Closed, Opening, Open, Closing };
+
   Database(std::string location) : location(std::move(location)) {}
-  ~Database() { assert(!db); }
-
-  rocksdb::Status Close() {
-    if (!db) {
-      statistics.reset();
-      return rocksdb::Status::OK();
-    }
-
-    std::set<Closable*> closables;
-    {
-      std::lock_guard<std::mutex> lock(mutex_);
-      closables = std::move(closables_);
-    }
-
-    for (auto closable : closables) {
-      closable->Close();
-    }
-
-    db->FlushWAL(true);
-
-    for (auto& [id, column] : columns) {
-      db->DestroyColumnFamilyHandle(column.handle);
-    }
-    columns.clear();
-
-    auto db2 = std::move(db);
-    const auto status = db2->Close();
-    statistics.reset();
-    return status;
+  ~Database() {
+    HandleRegistry<Database>::Instance().Erase(handle, this);
+    assert(!db);
   }
 
-  void Attach(Closable* closable) {
-    std::lock_guard<std::mutex> lock(mutex_);
+  rocksdb::Status Reserve(const std::shared_ptr<DatabaseReference>& reference);
+  rocksdb::Status Open(const std::shared_ptr<DatabaseReference>& reference,
+                       const rocksdb::Options& options,
+                       const std::vector<rocksdb::ColumnFamilyDescriptor>& descriptors,
+                       OpenSnapshot& snapshot);
+  rocksdb::Status Dispose(const std::shared_ptr<DatabaseReference>& reference);
+  rocksdb::Status Close(const std::shared_ptr<DatabaseReference>& reference);
+  rocksdb::Status Attach(const std::shared_ptr<DatabaseReference>& reference, Closable* closable);
+  rocksdb::Status Close(const std::shared_ptr<DatabaseReference>& reference, Closable* closable);
+  std::shared_ptr<DatabaseOperation> BeginOperation(const std::shared_ptr<DatabaseReference>& reference);
+  void EndOperation(const std::shared_ptr<DatabaseReference>& reference);
+  bool IsOpen(const std::shared_ptr<DatabaseReference>& reference) const;
 
-    closables_.insert(closable);
-  }
+  rocksdb::ColumnFamilyHandle* ResolveColumn(uint64_t generation, int32_t id) const {
+    std::lock_guard lock(stateMutex_);
+    if (state_ != State::Open || generation != generation_) {
+      return nullptr;
+    }
 
-  void Detach(Closable* closable) {
-    std::lock_guard<std::mutex> lock(mutex_);
-
-    closables_.erase(closable);
+    const auto found = columns.find(id);
+    return found == columns.end() ? nullptr : found->second.handle;
   }
 
   const std::string location;
+  uint64_t handle = 0;
 
   std::unique_ptr<rocksdb::DB> db;
   std::map<int32_t, ColumnFamily> columns;
@@ -136,43 +229,590 @@ struct Database final {
   // or shared with other DBs through a RocksStatistics resource. Each DB keeps
   // its own shared_ptr copy so the native collector outlives the JS resource.
   std::shared_ptr<rocksdb::Statistics> statistics;
-  napi_ref resourceNamesRef = nullptr;
-
-  static napi_status InitResourceNames(napi_env env, Database* db) {
-    napi_value array;
-    NAPI_STATUS_RETURN(napi_create_array_with_length(env, ResourceNameCount, &array));
-
-    auto set = [&](uint32_t idx, const char* name) -> napi_status {
-      napi_value value;
-      NAPI_STATUS_RETURN(napi_create_string_utf8(env, name, NAPI_AUTO_LENGTH, &value));
-      NAPI_STATUS_RETURN(napi_set_element(env, array, idx, value));
-      return napi_ok;
-    };
-    NAPI_STATUS_RETURN(set(ResourceIteratorNextv, "iterator.nextv"));
-    NAPI_STATUS_RETURN(set(ResourceLeveldownOpen, "leveldown.open"));
-    NAPI_STATUS_RETURN(set(ResourceLeveldownClose, "leveldown.close"));
-    NAPI_STATUS_RETURN(set(ResourceLeveldownGetMany, "leveldown.get_many"));
-    NAPI_STATUS_RETURN(set(ResourceLeveldownFlushWal, "leveldown.flush_wal"));
-    NAPI_STATUS_RETURN(set(ResourceLeveldownIteratorSeek, "leveldown.iterator_seek"));
-    NAPI_STATUS_RETURN(set(ResourceLeveldownBatchWrite, "leveldown.batch_write"));
-    NAPI_STATUS_RETURN(set(ResourceLeveldownUpdatesSince, "leveldown.updates_since"));
-    NAPI_STATUS_RETURN(set(ResourceLeveldownCompactRange, "leveldown.compact_range"));
-
-    NAPI_STATUS_RETURN(napi_create_reference(env, array, 1, &db->resourceNamesRef));
-    return napi_ok;
-  }
-
-  napi_status GetResourceName(napi_env env, ResourceName name, napi_value& result) const {
-    napi_value array;
-    NAPI_STATUS_RETURN(napi_get_reference_value(env, resourceNamesRef, &array));
-    NAPI_STATUS_RETURN(napi_get_element(env, array, name, &result));
-    return napi_ok;
-  }
-
  private:
-  mutable std::mutex mutex_;
-  std::set<Closable*> closables_;
+  bool DescriptorsMatchLocked(const std::vector<rocksdb::ColumnFamilyDescriptor>& descriptors) const {
+    if (descriptors.empty()) {
+      return true;
+    }
+    if (descriptors.size() != columns.size()) {
+      return false;
+    }
+    for (const auto& descriptor : descriptors) {
+      bool found = false;
+      for (const auto& [id, column] : columns) {
+        if (column.descriptor.name == descriptor.name) {
+          found = true;
+          break;
+        }
+      }
+      if (!found) {
+        return false;
+      }
+    }
+    return true;
+  }
+
+  void SnapshotLocked(OpenSnapshot& snapshot) const {
+    snapshot.generation = generation_;
+    snapshot.columns.clear();
+    snapshot.columns.reserve(columns.size());
+    for (const auto& [id, column] : columns) {
+      snapshot.columns.push_back({column.descriptor.name, id});
+    }
+  }
+
+  mutable std::mutex stateMutex_;
+  std::condition_variable stateChanged_;
+  State state_ = State::Closed;
+  size_t openReferences_ = 0;
+  uint64_t generation_ = 0;
 };
+
+struct DatabaseReference final {
+  enum class Phase { Inactive, Reserved, Open, Closing };
+
+  explicit DatabaseReference(std::shared_ptr<Database> database) : database(std::move(database)) {}
+
+  std::shared_ptr<Database> database;
+  Phase phase = Phase::Inactive;
+  uint64_t generation = 0;
+  std::mutex resourcesMutex;
+  std::set<Closable*> resources;
+  std::mutex operationsMutex;
+  std::condition_variable operationsChanged;
+  size_t activeOperations = 0;
+};
+
+struct DatabaseOperation final {
+  explicit DatabaseOperation(std::shared_ptr<DatabaseReference> reference) : reference(std::move(reference)) {}
+  ~DatabaseOperation() { Finish(); }
+
+  void Finish() {
+    if (active.exchange(false)) {
+      reference->database->EndOperation(reference);
+    }
+  }
+
+  std::shared_ptr<DatabaseReference> reference;
+  std::atomic<bool> active{false};
+};
+
+struct DatabaseOperationScope final {
+  explicit DatabaseOperationScope(std::shared_ptr<DatabaseOperation> operation)
+      : operation(std::move(operation)) {}
+  ~DatabaseOperationScope() { operation->Finish(); }
+
+  std::shared_ptr<DatabaseOperation> operation;
+};
+
+std::shared_ptr<DatabaseOperation> Database::BeginOperation(
+    const std::shared_ptr<DatabaseReference>& reference) {
+  auto operation = std::make_shared<DatabaseOperation>(reference);
+  std::lock_guard stateLock(stateMutex_);
+  if (state_ != State::Open || reference->phase != DatabaseReference::Phase::Open ||
+      reference->generation != generation_) {
+    return {};
+  }
+
+  std::lock_guard operationsLock(reference->operationsMutex);
+  ++reference->activeOperations;
+  operation->active.store(true);
+  return operation;
+}
+
+void Database::EndOperation(const std::shared_ptr<DatabaseReference>& reference) {
+  std::lock_guard lock(reference->operationsMutex);
+  assert(reference->activeOperations > 0);
+  if (--reference->activeOperations == 0) {
+    reference->operationsChanged.notify_all();
+  }
+}
+
+rocksdb::Status Database::Reserve(const std::shared_ptr<DatabaseReference>& reference) {
+  std::lock_guard lock(stateMutex_);
+  if (state_ != State::Open || reference->phase != DatabaseReference::Phase::Inactive) {
+    return rocksdb::Status::InvalidArgument("Invalid or stale database handle");
+  }
+
+  reference->phase = DatabaseReference::Phase::Reserved;
+  reference->generation = generation_;
+  ++openReferences_;
+  return rocksdb::Status::OK();
+}
+
+rocksdb::Status Database::Open(const std::shared_ptr<DatabaseReference>& reference,
+                               const rocksdb::Options& options,
+                               const std::vector<rocksdb::ColumnFamilyDescriptor>& descriptors,
+                               OpenSnapshot& snapshot) {
+  std::unique_lock lock(stateMutex_);
+  stateChanged_.wait(lock, [&] {
+    return state_ != State::Opening && state_ != State::Closing &&
+           reference->phase != DatabaseReference::Phase::Closing;
+  });
+
+  if (reference->phase == DatabaseReference::Phase::Reserved) {
+    if (state_ != State::Open || reference->generation != generation_) {
+      lock.unlock();
+      // Release through the full close path. This reservation may be the last
+      // lease if its source wrapper closed after exporting the handle.
+      Close(reference);
+      return rocksdb::Status::InvalidArgument("Reserved database handle became stale");
+    }
+    if (!DescriptorsMatchLocked(descriptors)) {
+      lock.unlock();
+      Close(reference);
+      return rocksdb::Status::InvalidArgument("Column families do not match the open database handle");
+    }
+    reference->phase = DatabaseReference::Phase::Open;
+    SnapshotLocked(snapshot);
+    return rocksdb::Status::OK();
+  }
+
+  if (state_ == State::Open) {
+    if (!DescriptorsMatchLocked(descriptors)) {
+      return rocksdb::Status::InvalidArgument("Column families do not match the open database handle");
+    }
+    if (reference->phase == DatabaseReference::Phase::Inactive) {
+      reference->phase = DatabaseReference::Phase::Open;
+      reference->generation = generation_;
+      ++openReferences_;
+    }
+    SnapshotLocked(snapshot);
+    return rocksdb::Status::OK();
+  }
+
+  state_ = State::Opening;
+  lock.unlock();
+
+  std::unique_ptr<rocksdb::DB> openedDb;
+  std::vector<rocksdb::ColumnFamilyHandle*> handles;
+  rocksdb::Status status;
+  std::map<int32_t, ColumnFamily> openedColumns;
+  const auto cleanupOpened = [&] {
+    if (!openedDb) return;
+    for (auto* handle : handles) {
+      openedDb->DestroyColumnFamilyHandle(handle);
+    }
+    openedDb->Close();
+    openedDb.reset();
+  };
+
+  try {
+    status = descriptors.empty()
+                 ? rocksdb::DB::Open(options, location, &openedDb)
+                 : rocksdb::DB::Open(options, location, descriptors, &handles, &openedDb);
+
+    if (status.ok()) {
+      for (size_t n = 0; n < handles.size(); ++n) {
+        ColumnFamily column{handles[n], descriptors[n]};
+        openedColumns.emplace(column.handle->GetID(), std::move(column));
+      }
+    } else {
+      cleanupOpened();
+    }
+  } catch (...) {
+    cleanupOpened();
+    lock.lock();
+    state_ = State::Closed;
+    stateChanged_.notify_all();
+    throw;
+  }
+
+  lock.lock();
+  if (!status.ok()) {
+    state_ = State::Closed;
+    stateChanged_.notify_all();
+    return status;
+  }
+
+  db = std::move(openedDb);
+  columns = std::move(openedColumns);
+  statistics = options.statistics;
+  ++generation_;
+  reference->phase = DatabaseReference::Phase::Open;
+  reference->generation = generation_;
+  ++openReferences_;
+  state_ = State::Open;
+  SnapshotLocked(snapshot);
+  stateChanged_.notify_all();
+  return rocksdb::Status::OK();
+}
+
+rocksdb::Status Database::Dispose(const std::shared_ptr<DatabaseReference>& reference) {
+  {
+    std::lock_guard lock(stateMutex_);
+    if (reference->phase == DatabaseReference::Phase::Inactive) {
+      return rocksdb::Status::OK();
+    }
+    if (reference->phase != DatabaseReference::Phase::Reserved) {
+      return rocksdb::Status::InvalidArgument("Only an unopened database reservation can be disposed");
+    }
+  }
+
+  // A Reserved reference cannot own operations or resources, so synchronous
+  // close cannot wait on the JS event loop. Reuse the normal last-lease path
+  // so a source wrapper that closed after Reserve() does not leave an open DB
+  // behind when this constructor reservation is the final lease.
+  return Close(reference);
+}
+
+rocksdb::Status Database::Close(const std::shared_ptr<DatabaseReference>& reference) {
+  std::unique_lock lock(stateMutex_);
+  stateChanged_.wait(lock, [&] { return state_ != State::Opening && state_ != State::Closing; });
+  if (reference->phase == DatabaseReference::Phase::Inactive) {
+    return rocksdb::Status::OK();
+  }
+  if (reference->phase == DatabaseReference::Phase::Closing) {
+    stateChanged_.wait(lock, [&] { return reference->phase == DatabaseReference::Phase::Inactive; });
+    return rocksdb::Status::OK();
+  }
+
+  reference->phase = DatabaseReference::Phase::Closing;
+  lock.unlock();
+  {
+    std::unique_lock operationsLock(reference->operationsMutex);
+    reference->operationsChanged.wait(operationsLock, [&] { return reference->activeOperations == 0; });
+  }
+  lock.lock();
+
+  rocksdb::Status status = rocksdb::Status::OK();
+  {
+    std::lock_guard resourcesLock(reference->resourcesMutex);
+    for (auto* closable : reference->resources) {
+      const auto closeStatus = closable->CloseResources();
+      if (status.ok() && !closeStatus.ok()) {
+        status = closeStatus;
+      }
+      closable->closed = true;
+    }
+    reference->resources.clear();
+  }
+
+  assert(openReferences_ > 0);
+  if (--openReferences_ > 0) {
+    reference->phase = DatabaseReference::Phase::Inactive;
+    reference->generation = 0;
+    stateChanged_.notify_all();
+    return status;
+  }
+
+  state_ = State::Closing;
+  auto closingDb = std::move(db);
+  auto closingColumns = std::move(columns);
+  statistics.reset();
+  reference->phase = DatabaseReference::Phase::Inactive;
+  reference->generation = 0;
+  lock.unlock();
+
+  if (closingDb) {
+    const auto flushStatus = closingDb->FlushWAL(true);
+    if (status.ok() && !flushStatus.ok()) {
+      status = flushStatus;
+    }
+    for (auto& [id, column] : closingColumns) {
+      const auto destroyStatus = closingDb->DestroyColumnFamilyHandle(column.handle);
+      if (status.ok() && !destroyStatus.ok()) {
+        status = destroyStatus;
+      }
+    }
+    const auto closeStatus = closingDb->Close();
+    if (status.ok() && !closeStatus.ok()) {
+      status = closeStatus;
+    }
+  }
+
+  lock.lock();
+  state_ = State::Closed;
+  stateChanged_.notify_all();
+  return status;
+}
+
+rocksdb::Status Database::Attach(const std::shared_ptr<DatabaseReference>& reference, Closable* closable) {
+  std::lock_guard lock(stateMutex_);
+  if (state_ != State::Open || reference->phase != DatabaseReference::Phase::Open ||
+      reference->generation != generation_) {
+    return rocksdb::Status::InvalidArgument("Database reference is not open");
+  }
+
+  std::lock_guard resourcesLock(reference->resourcesMutex);
+  closable->closed = false;
+  reference->resources.insert(closable);
+  return rocksdb::Status::OK();
+}
+
+rocksdb::Status Database::Close(const std::shared_ptr<DatabaseReference>& reference, Closable* closable) {
+  std::lock_guard lock(reference->resourcesMutex);
+  if (reference->resources.erase(closable) == 0) {
+    return rocksdb::Status::OK();
+  }
+  const auto status = closable->CloseResources();
+  closable->closed = true;
+  return status;
+}
+
+bool Database::IsOpen(const std::shared_ptr<DatabaseReference>& reference) const {
+  std::lock_guard lock(stateMutex_);
+  return state_ == State::Open && reference->phase == DatabaseReference::Phase::Open &&
+         reference->generation == generation_;
+}
+
+static constexpr napi_type_tag kDatabaseReferenceTag = {0x5fe2d764a8c6f421ULL, 0xbdd04ba698b447f1ULL};
+static constexpr napi_type_tag kColumnReferenceTag = {0xc4fcf39734fb4693ULL, 0x96db693318eb1eefULL};
+static constexpr napi_type_tag kCacheReferenceTag = {0x7c82100adab849d8ULL, 0xa886cf25f7aa67b9ULL};
+static constexpr napi_type_tag kWriteBufferManagerReferenceTag = {0xd56882e435534041ULL, 0xba305fd0b052410dULL};
+static constexpr napi_type_tag kBatchReferenceTag = {0x2704d07e44e34ccbULL, 0x853fe5f671d43337ULL};
+static constexpr napi_type_tag kIteratorReferenceTag = {0xf049eb952c784fb0ULL, 0xa445cf59cc65f035ULL};
+static constexpr napi_type_tag kUpdatesReferenceTag = {0xe254e64dfaa9406bULL, 0xb39789f927b49ef5ULL};
+
+static napi_status GetResourceName(napi_env env, ResourceName name, napi_value& result) {
+  static constexpr const char* names[] = {
+      "iterator.nextv",        "leveldown.open",         "leveldown.close",
+      "leveldown.get_many",    "leveldown.flush_wal",    "leveldown.iterator_seek",
+      "leveldown.batch_write", "leveldown.updates_since", "leveldown.compact_range"};
+  static_assert(std::size(names) == ResourceNameCount);
+  return napi_create_string_utf8(env, names[name], NAPI_AUTO_LENGTH, &result);
+}
+
+static napi_status GetDatabaseReference(napi_env env,
+                                        napi_value value,
+                                        std::shared_ptr<DatabaseReference>& result) {
+  bool matches = false;
+  NAPI_STATUS_RETURN(napi_check_object_type_tag(env, value, &kDatabaseReferenceTag, &matches));
+  if (!matches) {
+    return napi_invalid_arg;
+  }
+
+  std::shared_ptr<DatabaseReference>* holder;
+  NAPI_STATUS_RETURN(napi_get_value_external(env, value, reinterpret_cast<void**>(&holder)));
+  if (!holder || !*holder) {
+    return napi_invalid_arg;
+  }
+  result = *holder;
+  return napi_ok;
+}
+
+static napi_status GetDatabase(napi_env env,
+                               napi_value value,
+                               Database*& database,
+                               std::shared_ptr<DatabaseReference>* reference = nullptr,
+                               bool requireOpen = true) {
+  std::shared_ptr<DatabaseReference> databaseReference;
+  NAPI_STATUS_RETURN(GetDatabaseReference(env, value, databaseReference));
+  if (requireOpen && !databaseReference->database->IsOpen(databaseReference)) {
+    napi_throw_error(env, "LEVEL_DATABASE_NOT_OPEN", "Database is not open");
+    return napi_pending_exception;
+  }
+  database = databaseReference->database.get();
+  if (reference) {
+    *reference = std::move(databaseReference);
+  }
+  return napi_ok;
+}
+
+static napi_status BeginDatabaseOperation(napi_env env,
+                                          Database* database,
+                                          const std::shared_ptr<DatabaseReference>& reference,
+                                          std::shared_ptr<DatabaseOperation>& result) {
+  result = database->BeginOperation(reference);
+  if (!result) {
+    napi_throw_error(env, "LEVEL_DATABASE_NOT_OPEN", "Database is not open");
+    return napi_pending_exception;
+  }
+  return napi_ok;
+}
+
+template <typename T>
+struct SharedResource final {
+  explicit SharedResource(std::shared_ptr<T> value) : value(std::move(value)) {}
+  ~SharedResource() { HandleRegistry<SharedResource<T>>::Instance().Erase(handle, this); }
+
+  std::shared_ptr<T> value;
+  uint64_t handle = 0;
+};
+
+using CacheResource = SharedResource<rocksdb::Cache>;
+using WriteBufferManagerResource = SharedResource<rocksdb::WriteBufferManager>;
+
+static std::shared_ptr<CacheResource> RegisterCache(std::shared_ptr<rocksdb::Cache> value) {
+  auto resource = std::make_shared<CacheResource>(std::move(value));
+  resource->handle = HandleRegistry<CacheResource>::Instance().Insert(resource);
+  return resource;
+}
+
+static std::shared_ptr<WriteBufferManagerResource> RegisterWriteBufferManager(
+    std::shared_ptr<rocksdb::WriteBufferManager> value) {
+  auto resource = std::make_shared<WriteBufferManagerResource>(std::move(value));
+  resource->handle = HandleRegistry<WriteBufferManagerResource>::Instance().Insert(resource);
+  return resource;
+}
+
+template <typename Resource>
+static napi_status CreateResourceExternal(napi_env env,
+                                          const std::shared_ptr<Resource>& resource,
+                                          const napi_type_tag& tag,
+                                          napi_value& result) {
+  auto holder = std::make_unique<std::shared_ptr<Resource>>(resource);
+  NAPI_STATUS_RETURN(
+      napi_create_external(env, holder.get(), Finalize<std::shared_ptr<Resource>>, holder.get(), &result));
+  holder.release();
+  return napi_type_tag_object(env, result, &tag);
+}
+
+template <typename Resource>
+static napi_status GetResourceExternal(napi_env env,
+                                       napi_value value,
+                                       const napi_type_tag& tag,
+                                       std::shared_ptr<Resource>& result) {
+  bool matches = false;
+  NAPI_STATUS_RETURN(napi_check_object_type_tag(env, value, &tag, &matches));
+  if (!matches) {
+    return napi_invalid_arg;
+  }
+
+  std::shared_ptr<Resource>* holder;
+  NAPI_STATUS_RETURN(napi_get_value_external(env, value, reinterpret_cast<void**>(&holder)));
+  if (!holder || !*holder) {
+    return napi_invalid_arg;
+  }
+  result = *holder;
+  return napi_ok;
+}
+
+template <typename Resource>
+static napi_status LookupResourceHandle(napi_env env,
+                                        napi_value value,
+                                        HandleRegistry<Resource>& registry,
+                                        std::shared_ptr<Resource>& result) {
+  napi_valuetype type;
+  NAPI_STATUS_RETURN(napi_typeof(env, value, &type));
+  if (type == napi_object) {
+    napi_value handle;
+    NAPI_STATUS_RETURN(napi_get_named_property(env, value, "handle", &handle));
+    value = handle;
+  } else if (type != napi_bigint) {
+    return napi_invalid_arg;
+  }
+
+  uint64_t id;
+  bool lossless = false;
+  NAPI_STATUS_RETURN(napi_get_value_bigint_uint64(env, value, &id, &lossless));
+  if (!lossless || !(result = registry.Lookup(id))) {
+    return napi_invalid_arg;
+  }
+  return napi_ok;
+}
+
+struct ColumnReference final {
+  ColumnReference(const std::shared_ptr<Database>& database, uint64_t generation, int32_t id)
+      : database(database), generation(generation), id(id) {}
+
+  std::weak_ptr<Database> database;
+  const uint64_t generation;
+  const int32_t id;
+};
+
+static napi_status CreateColumnsObject(napi_env env,
+                                       const std::shared_ptr<Database>& database,
+                                       const OpenSnapshot& snapshot,
+                                       napi_value* result) {
+  NAPI_STATUS_RETURN(napi_create_object(env, result));
+
+  for (const auto& column : snapshot.columns) {
+    auto columnReference = std::make_unique<ColumnReference>(database, snapshot.generation, column.id);
+    napi_value value;
+    NAPI_STATUS_RETURN(napi_create_external(env, columnReference.get(), Finalize<ColumnReference>,
+                                            columnReference.get(), &value));
+    columnReference.release();
+    NAPI_STATUS_RETURN(napi_type_tag_object(env, value, &kColumnReferenceTag));
+
+    // Define a data property rather than assigning a named property. Assignment
+    // to "__proto__" invokes Object.prototype's setter (and has crashed V8 for
+    // an external value); a length-aware key also preserves embedded NUL bytes
+    // in valid RocksDB column-family names.
+    napi_value name;
+    NAPI_STATUS_RETURN(napi_create_string_utf8(env, column.name.data(), column.name.size(), &name));
+    napi_property_descriptor descriptor = {
+        nullptr, name, nullptr, nullptr, nullptr, value, napi_default_jsproperty, nullptr};
+    NAPI_STATUS_RETURN(napi_define_properties(env, *result, 1, &descriptor));
+  }
+
+  return napi_ok;
+}
+
+static napi_status GetColumnProperty(napi_env env,
+                                     napi_value options,
+                                     Database* expectedDatabase,
+                                     rocksdb::ColumnFamilyHandle*& result,
+                                     bool useDefault = true) {
+  if (useDefault) {
+    if (!expectedDatabase || !expectedDatabase->db) {
+      return napi_invalid_arg;
+    }
+    result = expectedDatabase->db->DefaultColumnFamily();
+  } else {
+    result = nullptr;
+  }
+
+  napi_valuetype optionsType;
+  NAPI_STATUS_RETURN(napi_typeof(env, options, &optionsType));
+  if (optionsType == napi_undefined || optionsType == napi_null) {
+    return napi_ok;
+  }
+  if (optionsType != napi_object) {
+    return napi_invalid_arg;
+  }
+
+  napi_value value;
+  NAPI_STATUS_RETURN(napi_get_named_property(env, options, "column", &value));
+  napi_valuetype valueType;
+  NAPI_STATUS_RETURN(napi_typeof(env, value, &valueType));
+  if (valueType == napi_undefined || valueType == napi_null) {
+    return napi_ok;
+  }
+
+  bool matches = false;
+  NAPI_STATUS_RETURN(napi_check_object_type_tag(env, value, &kColumnReferenceTag, &matches));
+  if (!matches) {
+    napi_throw_error(env, "LEVEL_INVALID_COLUMN", "Invalid column family handle");
+    return napi_pending_exception;
+  }
+
+  ColumnReference* columnReference;
+  NAPI_STATUS_RETURN(napi_get_value_external(env, value, reinterpret_cast<void**>(&columnReference)));
+  const auto database = columnReference ? columnReference->database.lock() : nullptr;
+  if (!database || (expectedDatabase && database.get() != expectedDatabase) ||
+      !(result = database->ResolveColumn(columnReference->generation, columnReference->id))) {
+    napi_throw_error(env, "LEVEL_INVALID_COLUMN", "Invalid, stale, or foreign column family handle");
+    return napi_pending_exception;
+  }
+
+  return napi_ok;
+}
+
+struct NativeBatch final {
+  explicit NativeBatch(std::shared_ptr<DatabaseReference> reference)
+      : reference(std::move(reference)), generation(this->reference->generation) {}
+
+  std::shared_ptr<DatabaseReference> reference;
+  const uint64_t generation;
+  std::mutex mutex;
+  rocksdb::WriteBatch batch;
+};
+
+static napi_status GetBatch(napi_env env, napi_value value, std::shared_ptr<NativeBatch>& result) {
+  return GetResourceExternal(env, value, kBatchReferenceTag, result);
+}
+
+static napi_status ValidateBatch(napi_env env,
+                                 const std::shared_ptr<NativeBatch>& batch,
+                                 const std::shared_ptr<DatabaseReference>& reference) {
+  if (!batch || batch->reference->database != reference->database || batch->generation != reference->generation ||
+      !reference->database->IsOpen(reference)) {
+    napi_throw_error(env, "LEVEL_INVALID_BATCH", "Batch belongs to a foreign or stale database generation");
+    return napi_pending_exception;
+  }
+  return napi_ok;
+}
 
 enum BatchOp { Empty, Put, Delete, Merge, Data };
 
@@ -184,18 +824,16 @@ struct BatchEntry {
 };
 
 struct BatchIterator : public rocksdb::WriteBatch::Handler {
-  BatchIterator(Database* database,
-                const bool keys,
+  BatchIterator(const bool keys,
                 const bool values,
                 const bool data,
                 const rocksdb::ColumnFamilyHandle* column,
                 const Encoding keyEncoding,
                 const Encoding valueEncoding)
-      : database_(database),
-        keys_(keys),
+      : keys_(keys),
         values_(values),
         data_(data),
-        column_(column),
+        columnId_(column ? std::optional<uint32_t>(column->GetID()) : std::nullopt),
         keyEncoding_(keyEncoding),
         valueEncoding_(valueEncoding) {}
 
@@ -255,7 +893,7 @@ struct BatchIterator : public rocksdb::WriteBatch::Handler {
   }
 
   rocksdb::Status PutCF(uint32_t column_family_id, const rocksdb::Slice& key, const rocksdb::Slice& value) override {
-    if (column_ && column_->GetID() != column_family_id) {
+    if (columnId_ && *columnId_ != column_family_id) {
       return rocksdb::Status::OK();
     }
 
@@ -279,7 +917,7 @@ struct BatchIterator : public rocksdb::WriteBatch::Handler {
   }
 
   rocksdb::Status DeleteCF(uint32_t column_family_id, const rocksdb::Slice& key) override {
-    if (column_ && column_->GetID() != column_family_id) {
+    if (columnId_ && *columnId_ != column_family_id) {
       return rocksdb::Status::OK();
     }
 
@@ -299,7 +937,7 @@ struct BatchIterator : public rocksdb::WriteBatch::Handler {
   }
 
   rocksdb::Status MergeCF(uint32_t column_family_id, const rocksdb::Slice& key, const rocksdb::Slice& value) override {
-    if (column_ && column_->GetID() != column_family_id) {
+    if (columnId_ && *columnId_ != column_family_id) {
       return rocksdb::Status::OK();
     }
 
@@ -337,11 +975,10 @@ struct BatchIterator : public rocksdb::WriteBatch::Handler {
   bool Continue() override { return true; }
 
  private:
-  Database* database_;
   const bool keys_;
   const bool values_;
   const bool data_;
-  const rocksdb::ColumnFamilyHandle* column_;
+  const std::optional<uint32_t> columnId_;
   const Encoding keyEncoding_;
   const Encoding valueEncoding_;
   std::vector<BatchEntry> cache_;
@@ -349,6 +986,7 @@ struct BatchIterator : public rocksdb::WriteBatch::Handler {
 
 struct BaseIterator : public Closable {
   BaseIterator(Database* database,
+               std::shared_ptr<DatabaseReference> reference,
                rocksdb::ColumnFamilyHandle* column,
                const bool reverse,
                const std::optional<std::string>& lt,
@@ -357,20 +995,15 @@ struct BaseIterator : public Closable {
                const std::optional<std::string>& gte,
                const int limit,
                rocksdb::ReadOptions readOptions = {})
-      : database_(database), column_(column), reverse_(reverse), limit_(limit) {
-    // TODO (correctness): the +'\0' byte-successor trick below converts
-    // inclusive/exclusive bounds correctly only under bytewise ordering. With a
-    // custom CF comparator (InitOptions "comparator", e.g.
-    // rocksdb.ReverseBytewiseComparator) RocksDB applies these bounds with that
-    // comparator, silently inverting the lte/gt boundary semantics. Seek()'s
-    // manual bound check below uses raw bytewise Slice::compare as well.
+      : database_(database), reference_(std::move(reference)), column_(column), reverse_(reverse), limit_(limit) {
     if (lte) {
       upper_bound_ = rocksdb::PinnableSlice();
-      *upper_bound_->GetSelf() = std::move(*lte) + '\0';
+      *upper_bound_->GetSelf() = *lte;
       upper_bound_->PinSelf();
+      upper_inclusive_ = true;
     } else if (lt) {
       upper_bound_ = rocksdb::PinnableSlice();
-      *upper_bound_->GetSelf() = std::move(*lt);
+      *upper_bound_->GetSelf() = *lt;
       upper_bound_->PinSelf();
     }
 
@@ -380,11 +1013,15 @@ struct BaseIterator : public Closable {
       lower_bound_->PinSelf();
     } else if (gt) {
       lower_bound_ = rocksdb::PinnableSlice();
-      *lower_bound_->GetSelf() = std::move(*gt) + '\0';
+      *lower_bound_->GetSelf() = *gt;
       lower_bound_->PinSelf();
+      lower_inclusive_ = false;
     }
 
-    if (upper_bound_) {
+    // RocksDB's upper bound is exclusive. `lte` and `gt` need comparator-aware
+    // checks because there is no generally valid byte successor for a custom
+    // comparator.
+    if (upper_bound_ && !upper_inclusive_) {
       readOptions.iterate_upper_bound = &*upper_bound_;
     }
 
@@ -393,32 +1030,25 @@ struct BaseIterator : public Closable {
     }
 
     iterator_.reset(database_->db->NewIterator(readOptions, column_));
+    ResetPosition();
 
-    if (reverse_) {
-      iterator_->SeekToLast();
-    } else {
-      iterator_->SeekToFirst();
+    const auto status = database_->Attach(reference_, this);
+    if (!status.ok()) {
+      throw std::runtime_error(status.ToString());
     }
-
-    database_->Attach(this);
   }
 
   virtual ~BaseIterator() {
-    if (iterator_) {
-      database_->Detach(this);
+    if (!closed.load()) {
+      database_->Close(reference_, this);
     }
   }
 
   virtual void Seek(const rocksdb::Slice& target) {
     assert(iterator_);
 
-    if ((upper_bound_ && target.compare(*upper_bound_) >= 0) || (lower_bound_ && target.compare(*lower_bound_) < 0)) {
-      // TODO (fix): Why is this required? Seek should handle it?
-      // https://github.com/facebook/rocksdb/issues/9904
-      iterator_->SeekToLast();
-      if (iterator_->Valid()) {
-        iterator_->Next();
-      }
+    if (!InRange(target)) {
+      Invalidate();
     } else if (reverse_) {
       iterator_->SeekForPrev(target);
     } else {
@@ -426,19 +1056,39 @@ struct BaseIterator : public Closable {
     }
   }
 
-  virtual rocksdb::Status Close() override {
-    if (iterator_) {
-      lower_bound_.reset();
-      upper_bound_.reset();
-      iterator_.reset();
-      database_->Detach(this);
-    }
+  rocksdb::Status Close() { return database_->Close(reference_, this); }
+
+  rocksdb::Status CloseResources() override {
+    std::lock_guard operationLock(operationMutex_);
+    closed = true;
+    // ReadOptions stores raw pointers to the bound slices, so the iterator must
+    // be destroyed before their backing storage.
+    iterator_.reset();
+    lower_bound_.reset();
+    upper_bound_.reset();
     return rocksdb::Status::OK();
+  }
+
+  rocksdb::Status RefreshSafe() {
+    std::lock_guard operationLock(operationMutex_);
+    if (!iterator_) {
+      return rocksdb::Status::InvalidArgument("Iterator is not open");
+    }
+    return Refresh();
+  }
+
+  rocksdb::Status SeekSafe(const rocksdb::Slice& target) {
+    std::lock_guard operationLock(operationMutex_);
+    if (!iterator_) {
+      return rocksdb::Status::InvalidArgument("Iterator is not open");
+    }
+    Seek(target);
+    return Status();
   }
 
   bool Valid() const {
     assert(iterator_);
-    return iterator_->Valid();
+    return iterator_->Valid() && InRange(iterator_->key());
   }
 
   bool Increment() {
@@ -477,31 +1127,75 @@ struct BaseIterator : public Closable {
     // after a refresh even though every other piece of state was reset.
     count_ = 0;
     ROCKS_STATUS_RETURN(iterator_->Refresh());
-    // rocksdb::Iterator::Refresh invalidates the iterator (a Seek* is required
-    // before use), so re-establish the starting position like the constructor
-    // does — otherwise the next read sees Valid()==false and reports an empty
-    // database.
-    if (reverse_) {
-      iterator_->SeekToLast();
-    } else {
-      iterator_->SeekToFirst();
-    }
+    // Refresh invalidates the iterator, so restore its comparator-aware start.
+    ResetPosition();
     return iterator_->status();
   }
 
   Database* database_;
+  std::shared_ptr<DatabaseReference> reference_;
   rocksdb::ColumnFamilyHandle* column_;
+  std::mutex operationMutex_;
 
  private:
+  bool InRange(const rocksdb::Slice& key) const {
+    const auto* comparator = column_->GetComparator();
+    if (lower_bound_) {
+      const auto compared = comparator->Compare(key, *lower_bound_);
+      if (compared < 0 || (compared == 0 && !lower_inclusive_)) {
+        return false;
+      }
+    }
+    if (upper_bound_) {
+      const auto compared = comparator->Compare(key, *upper_bound_);
+      if (compared > 0 || (compared == 0 && !upper_inclusive_)) {
+        return false;
+      }
+    }
+    return true;
+  }
+
+  void Invalidate() {
+    iterator_->SeekToLast();
+    if (iterator_->Valid()) {
+      iterator_->Next();
+    }
+  }
+
+  void ResetPosition() {
+    if (reverse_) {
+      if (upper_bound_) {
+        iterator_->SeekForPrev(*upper_bound_);
+        if (!upper_inclusive_ && iterator_->Valid() &&
+            column_->GetComparator()->Compare(iterator_->key(), *upper_bound_) == 0) {
+          iterator_->Prev();
+        }
+      } else {
+        iterator_->SeekToLast();
+      }
+    } else if (lower_bound_) {
+      iterator_->Seek(*lower_bound_);
+      if (!lower_inclusive_ && iterator_->Valid() &&
+          column_->GetComparator()->Compare(iterator_->key(), *lower_bound_) == 0) {
+        iterator_->Next();
+      }
+    } else {
+      iterator_->SeekToFirst();
+    }
+  }
+
   int count_ = 0;
   std::optional<rocksdb::PinnableSlice> lower_bound_;
   std::optional<rocksdb::PinnableSlice> upper_bound_;
+  bool lower_inclusive_ = true;
+  bool upper_inclusive_ = false;
   std::unique_ptr<rocksdb::Iterator> iterator_;
   const bool reverse_;
   const int limit_;
 };
 
-class Iterator final : public BaseIterator {
+class Iterator final : public BaseIterator, public std::enable_shared_from_this<Iterator> {
+  Reference databaseContext_;
   const bool keys_;
   const bool values_;
   const size_t highWaterMarkBytes_;
@@ -514,6 +1208,8 @@ class Iterator final : public BaseIterator {
 
  public:
   Iterator(Database* database,
+           std::shared_ptr<DatabaseReference> reference,
+           Reference databaseContext,
            rocksdb::ColumnFamilyHandle* column,
            const bool reverse,
            const bool keys,
@@ -530,7 +1226,8 @@ class Iterator final : public BaseIterator {
            Encoding valueEncoding = Encoding::Invalid,
            const bool unsafe = false,
            rocksdb::ReadOptions readOptions = {})
-      : BaseIterator(database, column, reverse, lt, lte, gt, gte, limit, readOptions),
+      : BaseIterator(database, std::move(reference), column, reverse, lt, lte, gt, gte, limit, readOptions),
+        databaseContext_(std::move(databaseContext)),
         keys_(keys),
         values_(values),
         highWaterMarkBytes_(highWaterMarkBytes),
@@ -562,9 +1259,14 @@ class Iterator final : public BaseIterator {
     return BaseIterator::Refresh();
   }
 
-  static std::unique_ptr<Iterator> create(napi_env env, napi_value db, napi_value options) {
+  static std::shared_ptr<Iterator> create(napi_env env, napi_value db, napi_value options) {
     Database* database;
-    NAPI_STATUS_THROWS(napi_get_value_external(env, db, reinterpret_cast<void**>(&database)));
+    std::shared_ptr<DatabaseReference> reference;
+    NAPI_STATUS_THROWS(GetDatabase(env, db, database, &reference));
+    std::shared_ptr<DatabaseOperation> databaseOperation;
+    NAPI_STATUS_THROWS(BeginDatabaseOperation(env, database, reference, databaseOperation));
+    Reference databaseContext;
+    NAPI_STATUS_THROWS(Reference::Create(env, db, databaseContext));
 
     bool unsafe = false;
     NAPI_STATUS_THROWS(GetProperty(env, options, "unsafe", unsafe));
@@ -585,6 +1287,10 @@ class Iterator final : public BaseIterator {
     // any value > 2 GiB to a garbage cap. Default stays ~2 GiB (effectively no cap).
     int64_t highWaterMarkBytes = std::numeric_limits<int32_t>::max();
     NAPI_STATUS_THROWS(GetProperty(env, options, "highWaterMarkBytes", highWaterMarkBytes));
+    if (highWaterMarkBytes < 0) {
+      napi_throw_range_error(env, nullptr, "highWaterMarkBytes must be non-negative");
+      return nullptr;
+    }
 
     std::optional<std::string> lt;
     NAPI_STATUS_THROWS(GetProperty(env, options, "lt", lt));
@@ -605,7 +1311,7 @@ class Iterator final : public BaseIterator {
     NAPI_STATUS_THROWS(GetProperty(env, options, "valueFilter", valueFilter));
 
     rocksdb::ColumnFamilyHandle* column = database->db->DefaultColumnFamily();
-    NAPI_STATUS_THROWS(GetProperty(env, options, "column", column));
+    NAPI_STATUS_THROWS(GetColumnProperty(env, options, database, column));
 
     Encoding keyEncoding = Encoding::Buffer;
     NAPI_STATUS_THROWS(GetProperty(env, options, "keyEncoding", keyEncoding));
@@ -650,9 +1356,9 @@ class Iterator final : public BaseIterator {
     //   ? std::chrono::microseconds(database->db->GetEnv()->NowMicros() + timeout * 1000)
     //   : std::chrono::microseconds::zero();
 
-    return std::make_unique<Iterator>(database, column, reverse, keys, values, limit, lt, lte, gt, gte,
-                                      highWaterMarkBytes, keyFilter, valueFilter, keyEncoding, valueEncoding, unsafe,
-                                      readOptions);
+    return std::make_shared<Iterator>(database, reference, std::move(databaseContext), column, reverse, keys,
+                                      values, limit, lt, lte, gt, gte, highWaterMarkBytes, keyFilter, valueFilter,
+                                      keyEncoding, valueEncoding, unsafe, readOptions);
   }
 
   napi_value nextv(napi_env env, uint32_t count, uint32_t timeout, napi_value callback) {
@@ -666,15 +1372,29 @@ class Iterator final : public BaseIterator {
     };
 
     napi_value resourceName;
-    NAPI_STATUS_THROWS(database_->GetResourceName(env, ResourceIteratorNextv, resourceName));
+    NAPI_STATUS_THROWS(GetResourceName(env, ResourceIteratorNextv, resourceName));
+
+    const auto self = shared_from_this();
+    std::shared_ptr<DatabaseOperation> databaseOperation;
+    NAPI_STATUS_THROWS(BeginDatabaseOperation(env, database_, reference_, databaseOperation));
 
     NAPI_STATUS_THROWS(runAsync<State>(
         resourceName, env, callback,
-        [=](auto& state) {
-          state.keys.reserve(count);
-          state.values.reserve(count);
+        [self, this, count, timeout, databaseOperation](auto& state) {
+          const DatabaseOperationScope operationScope(databaseOperation);
+          std::lock_guard operationLock(operationMutex_);
+          if (closed.load()) {
+            return rocksdb::Status::InvalidArgument("Iterator is not open");
+          }
 
-          const auto deadline = timeout ? database_->db->GetEnv()->NowMicros() + timeout * 1000 : 0;
+          // Query uses UINT32_MAX as its "all rows" sentinel. Reserving that
+          // value would attempt a huge allocation before reading anything.
+          const auto initialCapacity = std::min<size_t>(count, 4096);
+          state.keys.reserve(initialCapacity);
+          state.values.reserve(initialCapacity);
+
+          const auto deadline =
+              timeout ? database_->db->GetEnv()->NowMicros() + static_cast<uint64_t>(timeout) * 1000 : 0;
 
           while (true) {
             if (state.count >= count || state.bytes > highWaterMarkBytes_) {
@@ -752,7 +1472,7 @@ class Iterator final : public BaseIterator {
 
           return rocksdb::Status::OK();
         },
-        [=](auto& state, napi_env env, napi_value* result) {
+        [self, this](auto& state, napi_env env, napi_value* result) {
           napi_value finished;
           NAPI_STATUS_RETURN(napi_get_boolean(env, state.finished, &finished));
 
@@ -796,6 +1516,14 @@ class Iterator final : public BaseIterator {
   }
 
   napi_value nextv(napi_env env, uint32_t count, uint32_t timeout = 0) {
+    std::shared_ptr<DatabaseOperation> databaseOperation;
+    NAPI_STATUS_THROWS(BeginDatabaseOperation(env, database_, reference_, databaseOperation));
+    std::lock_guard operationLock(operationMutex_);
+    if (closed.load()) {
+      napi_throw_error(env, "LEVEL_ITERATOR_NOT_OPEN", "Iterator is not open");
+      return nullptr;
+    }
+
     napi_value finished;
     NAPI_STATUS_THROWS(napi_get_boolean(env, false, &finished));
 
@@ -805,7 +1533,8 @@ class Iterator final : public BaseIterator {
     napi_value rows;
     NAPI_STATUS_THROWS(napi_create_array(env, &rows));
 
-    const auto deadline = timeout ? database_->db->GetEnv()->NowMicros() + timeout * 1000 : 0;
+    const auto deadline =
+        timeout ? database_->db->GetEnv()->NowMicros() + static_cast<uint64_t>(timeout) * 1000 : 0;
 
     size_t idx = 0;
     size_t bytes = 0;
@@ -894,7 +1623,7 @@ class Iterator final : public BaseIterator {
  * the guarantee that no db operations will be in-flight at this time.
  */
 static void env_cleanup_hook(void* data) {
-  auto database = reinterpret_cast<Database*>(data);
+  auto holder = reinterpret_cast<std::shared_ptr<DatabaseReference>*>(data);
 
   // Do everything that db_close() does but synchronously. We're expecting that GC
   // did not (yet) collect the database because that would be a user mistake (not
@@ -902,77 +1631,69 @@ static void env_cleanup_hook(void* data) {
   // from an environment being torn down (like the main process or a worker thread)
   // where it's our responsibility to clean up. Note also, the following code must
   // be a safe noop if called before db_open() or after db_close().
-  if (database) {
-    database->Close();
+  if (holder && *holder) {
+    (*holder)->database->Close(*holder);
   }
 }
 
 static void FinalizeDatabase(napi_env env, void* data, void* hint) {
-  auto database = reinterpret_cast<Database*>(data);
-  if (database) {
-    napi_remove_env_cleanup_hook(env, env_cleanup_hook, database);
-    if (database->resourceNamesRef) {
-      napi_delete_reference(env, database->resourceNamesRef);
-      database->resourceNamesRef = nullptr;
+  auto holder = reinterpret_cast<std::shared_ptr<DatabaseReference>*>(data);
+  if (holder) {
+    napi_remove_env_cleanup_hook(env, env_cleanup_hook, holder);
+    if (*holder) {
+      (*holder)->database->Close(*holder);
     }
-    database->Close();
-    // This external owns the Database (the bigint-handle external in db_init is
-    // created with no finalizer, so it never reaches here). Close() already
-    // released the rocksdb::DB; free the heap object itself or it leaks for the
-    // lifetime of the process.
-    delete database;
+    delete holder;
   }
 }
 
 NAPI_METHOD(db_init) {
   NAPI_ARGV(2);
 
-  Database* database = nullptr;
-
   napi_valuetype type;
   NAPI_STATUS_THROWS(napi_typeof(env, argv[0], &type));
 
-  napi_value result;
+  std::shared_ptr<Database> database;
 
   if (type == napi_string) {
     std::string location;
-    size_t length = 0;
-    NAPI_STATUS_THROWS(napi_get_value_string_utf8(env, argv[0], nullptr, 0, &length));
-    location.resize(length, '\0');
-    NAPI_STATUS_THROWS(napi_get_value_string_utf8(env, argv[0], &location[0], length + 1, &length));
+    NAPI_STATUS_THROWS(GetValue(env, argv[0], location));
 
-    database = new Database(location);
-    NAPI_STATUS_THROWS(Database::InitResourceNames(env, database));
-    napi_add_env_cleanup_hook(env, env_cleanup_hook, database);
-    NAPI_STATUS_THROWS(napi_create_external(env, database, FinalizeDatabase, nullptr, &result));
+    database = std::make_shared<Database>(std::move(location));
+    database->handle = HandleRegistry<Database>::Instance().Insert(database);
   } else if (type == napi_bigint) {
-    int64_t value;
+    uint64_t value;
     bool lossless;
-    NAPI_STATUS_THROWS(napi_get_value_bigint_int64(env, argv[0], &value, &lossless));
-    if (!lossless) {
-      napi_throw_error(env, nullptr, "invalid database handle");
+    NAPI_STATUS_THROWS(napi_get_value_bigint_uint64(env, argv[0], &value, &lossless));
+    if (!lossless || !(database = HandleRegistry<Database>::Instance().Lookup(value))) {
+      napi_throw_error(env, nullptr, "Invalid or stale database handle");
       return NULL;
     }
-
-    database = reinterpret_cast<Database*>(value);
-    NAPI_STATUS_THROWS(napi_create_external(env, database, nullptr, nullptr, &result));
-
-    // TODO (critical, lifetime): sharing a Database* across V8 environments (e.g.
-    // worker_threads) via db_get_handle is unsafe. There is no cross-env
-    // reference count on the rocksdb::DB, so one env's db_close() runs
-    // Database::Close() (freeing the DB + column handles on a worker thread)
-    // while another env may still be running MultiGet / iterator / updates
-    // against it -> use-after-free / double-free. This branch also installs no
-    // env_cleanup_hook or finalizer, so a tearing-down secondary env never
-    // detaches its iterators, and GetResourceName() dereferences a napi_ref
-    // (resourceNamesRef) that belongs to the originating env (cross-env ref use
-    // is undefined behaviour). Fix: refcount the Database lifetime across all
-    // wrapping envs (run the real Close()/db.reset() only when the last
-    // reference drops), install a cleanup hook here, and make resource names
-    // per-env. Until then, close() on a shared handle must be app-coordinated.
   } else {
     NAPI_STATUS_THROWS(napi_invalid_arg);
   }
+
+  auto reference = std::make_shared<DatabaseReference>(std::move(database));
+  if (type == napi_bigint) {
+    const auto status = reference->database->Reserve(reference);
+    if (!status.ok()) {
+      napi_throw_error(env, nullptr, status.ToString().c_str());
+      return nullptr;
+    }
+  }
+
+  auto holder = std::make_unique<std::shared_ptr<DatabaseReference>>(reference);
+  auto* holderPointer = holder.get();
+
+  napi_value result;
+  const auto status = napi_create_external(env, holder.get(), FinalizeDatabase, nullptr, &result);
+  if (status != napi_ok) {
+    reference->database->Close(reference);
+    NAPI_STATUS_THROWS(status);
+  }
+  holder.release();
+  NAPI_STATUS_THROWS(napi_type_tag_object(env, result, &kDatabaseReferenceTag));
+  NAPI_STATUS_THROWS(napi_add_env_cleanup_hook(env, env_cleanup_hook, holderPointer));
 
   return result;
 }
@@ -981,10 +1702,13 @@ NAPI_METHOD(db_get_handle) {
   NAPI_ARGV(1);
 
   Database* database;
-  NAPI_STATUS_THROWS(napi_get_value_external(env, argv[0], reinterpret_cast<void**>(&database)));
+  std::shared_ptr<DatabaseReference> reference;
+  NAPI_STATUS_THROWS(GetDatabase(env, argv[0], database, &reference));
+  std::shared_ptr<DatabaseOperation> databaseOperation;
+  NAPI_STATUS_THROWS(BeginDatabaseOperation(env, database, reference, databaseOperation));
 
   napi_value result;
-  NAPI_STATUS_THROWS(napi_create_bigint_int64(env, reinterpret_cast<intptr_t>(database), &result));
+  NAPI_STATUS_THROWS(napi_create_bigint_uint64(env, database->handle, &result));
 
   return result;
 }
@@ -993,7 +1717,7 @@ NAPI_METHOD(db_get_location) {
   NAPI_ARGV(1);
 
   Database* database;
-  NAPI_STATUS_THROWS(napi_get_value_external(env, argv[0], reinterpret_cast<void**>(&database)));
+  NAPI_STATUS_THROWS(GetDatabase(env, argv[0], database, nullptr, false));
 
   napi_value result;
   NAPI_STATUS_THROWS(Convert(env, database->location, Encoding::String, result));
@@ -1146,12 +1870,6 @@ napi_status InitOptions(napi_env env, T& columnOptions, const U& options) {
   // sliced away, so it must be settable per column to take effect at all.
   NAPI_STATUS_RETURN(GetProperty(env, options, "memTableHugePageSize", columnOptions.memtable_huge_page_size));
 
-  // Compat
-  NAPI_STATUS_RETURN(GetProperty(env, options, "enableBlobFiles", columnOptions.enable_blob_files));
-  NAPI_STATUS_RETURN(GetProperty(env, options, "minBlobSize", columnOptions.min_blob_size));
-  NAPI_STATUS_RETURN(
-      GetProperty(env, options, "enableBlobGarbageCollection", columnOptions.enable_blob_garbage_collection));
-
   NAPI_STATUS_RETURN(GetProperty(env, options, "blobFiles", columnOptions.enable_blob_files));
   NAPI_STATUS_RETURN(GetProperty(env, options, "blobMinSize", columnOptions.min_blob_size));
   NAPI_STATUS_RETURN(GetProperty(env, options, "blobGarbageCollection", columnOptions.enable_blob_garbage_collection));
@@ -1177,27 +1895,11 @@ napi_status InitOptions(napi_env env, T& columnOptions, const U& options) {
     napi_valuetype cacheType;
     NAPI_STATUS_RETURN(napi_typeof(env, cacheValue, &cacheType));
 
-    if (cacheType == napi_object) {
-      napi_value handleValue;
-      NAPI_STATUS_RETURN(napi_get_named_property(env, cacheValue, "handle", &handleValue));
-
-      bool lossless;
-      int64_t ptr;
-      NAPI_STATUS_RETURN(napi_get_value_bigint_int64(env, handleValue, &ptr, &lossless));
-      if (!lossless) {
-        return napi_invalid_arg;
-      }
-
-      cache = *reinterpret_cast<std::shared_ptr<rocksdb::Cache>*>(ptr);
-    } else if (cacheType == napi_bigint) {
-      bool lossless;
-      int64_t ptr;
-      NAPI_STATUS_RETURN(napi_get_value_bigint_int64(env, cacheValue, &ptr, &lossless));
-      if (!lossless) {
-        return napi_invalid_arg;
-      }
-
-      cache = *reinterpret_cast<std::shared_ptr<rocksdb::Cache>*>(ptr);
+    if (cacheType == napi_object || cacheType == napi_bigint) {
+      std::shared_ptr<CacheResource> resource;
+      NAPI_STATUS_RETURN(
+          LookupResourceHandle(env, cacheValue, HandleRegistry<CacheResource>::Instance(), resource));
+      cache = resource->value;
     } else if (cacheType != napi_undefined && cacheType != napi_null) {
       return napi_invalid_arg;
     }
@@ -1211,6 +1913,10 @@ napi_status InitOptions(napi_env env, T& columnOptions, const U& options) {
 
     NAPI_STATUS_RETURN(GetProperty(env, options, "cacheSize", cacheSize));
     NAPI_STATUS_RETURN(GetProperty(env, options, "cacheCompressedRatio", compressedRatio));
+
+    if (!std::isfinite(compressedRatio) || compressedRatio < 0.0 || compressedRatio > 1.0) {
+      return napi_invalid_arg;
+    }
 
     if (cacheSize == 0) {
       // Do nothing...
@@ -1239,12 +1945,19 @@ napi_status InitOptions(napi_env env, T& columnOptions, const U& options) {
     NAPI_STATUS_RETURN(GetProperty(env, options, "blockCacheCompressedRatio", compressedRatio));
     NAPI_STATUS_RETURN(GetProperty(env, options, "blockCachePrepopulate", tableOptions.prepopulate_block_cache));
 
+    if (cacheSize < -1 || !std::isfinite(compressedRatio) || compressedRatio < 0.0 || compressedRatio > 1.0) {
+      return napi_invalid_arg;
+    }
+
     if (cacheSize == -1) {
       if (cache) {
         tableOptions.block_cache = cache;
       } else {
         tableOptions.no_block_cache = true;
       }
+    } else if (cacheSize == 0) {
+      tableOptions.block_cache.reset();
+      tableOptions.no_block_cache = true;
     } else if (compressedRatio > 0.0) {
       rocksdb::TieredCacheOptions options;
       options.cache_type = rocksdb::PrimaryCacheType::kCacheTypeHCC;
@@ -1268,6 +1981,10 @@ napi_status InitOptions(napi_env env, T& columnOptions, const U& options) {
     NAPI_STATUS_RETURN(GetProperty(env, options, "blobCacheSize", cacheSize));
     NAPI_STATUS_RETURN(GetProperty(env, options, "blobCacheCompressedRatio", compressedRatio));
     NAPI_STATUS_RETURN(GetProperty(env, options, "blobCachePrepopulate", columnOptions.prepopulate_blob_cache));
+
+    if (cacheSize < -1 || !std::isfinite(compressedRatio) || compressedRatio < 0.0 || compressedRatio > 1.0) {
+      return napi_invalid_arg;
+    }
 
     if (cacheSize == -1) {
       columnOptions.blob_cache = cache;
@@ -1380,7 +2097,10 @@ NAPI_METHOD(db_get_identity) {
   NAPI_ARGV(1);
 
   Database* database;
-  NAPI_STATUS_THROWS(napi_get_value_external(env, argv[0], reinterpret_cast<void**>(&database)));
+  std::shared_ptr<DatabaseReference> reference;
+  NAPI_STATUS_THROWS(GetDatabase(env, argv[0], database, &reference));
+  std::shared_ptr<DatabaseOperation> databaseOperation;
+  NAPI_STATUS_THROWS(BeginDatabaseOperation(env, database, reference, databaseOperation));
 
   if (!database->db) {
     napi_throw_error(env, "LEVEL_DATABASE_NOT_OPEN", "Database is not open");
@@ -1400,18 +2120,10 @@ NAPI_METHOD(db_open) {
   NAPI_ARGV(3);
 
   Database* database;
-  NAPI_STATUS_THROWS(napi_get_value_external(env, argv[0], reinterpret_cast<void**>(&database)));
+  std::shared_ptr<DatabaseReference> reference;
+  NAPI_STATUS_THROWS(GetDatabase(env, argv[0], database, &reference, false));
 
-  if (database->db) {
-    napi_value columns;
-    NAPI_STATUS_THROWS(napi_create_object(env, &columns));
-    for (auto& [id, column] : database->columns) {
-      napi_value val;
-      NAPI_STATUS_THROWS(napi_create_external(env, column.handle, nullptr, nullptr, &val));
-      NAPI_STATUS_THROWS(napi_set_named_property(env, columns, column.descriptor.name.c_str(), val));
-    }
-    return columns;
-  } else {
+  {
     rocksdb::Options dbOptions;
 
     const auto options = argv[1];
@@ -1502,20 +2214,13 @@ NAPI_METHOD(db_open) {
       NAPI_STATUS_THROWS(napi_typeof(env, wbmValue, &wbmType));
 
       if (wbmType == napi_object || wbmType == napi_bigint) {
-        napi_value handleValue = wbmValue;
-        if (wbmType == napi_object) {
-          NAPI_STATUS_THROWS(napi_get_named_property(env, wbmValue, "handle", &handleValue));
-        }
-
-        bool lossless;
-        int64_t ptr;
-        NAPI_STATUS_THROWS(napi_get_value_bigint_int64(env, handleValue, &ptr, &lossless));
-        if (!lossless) {
+        std::shared_ptr<WriteBufferManagerResource> resource;
+        if (LookupResourceHandle(env, wbmValue, HandleRegistry<WriteBufferManagerResource>::Instance(), resource) !=
+            napi_ok) {
           napi_throw_error(env, nullptr, "invalid writeBufferManager handle");
           return NULL;
         }
-
-        dbOptions.write_buffer_manager = *reinterpret_cast<std::shared_ptr<rocksdb::WriteBufferManager>*>(ptr);
+        dbOptions.write_buffer_manager = resource->value;
       } else if (wbmType != napi_undefined && wbmType != napi_null) {
         napi_throw_error(env, nullptr, "invalid writeBufferManager");
         return NULL;
@@ -1544,8 +2249,10 @@ NAPI_METHOD(db_open) {
         lvl = rocksdb::InfoLogLevel::FATAL_LEVEL;
       else if (infoLogLevel == "header")
         lvl = rocksdb::InfoLogLevel::HEADER_LEVEL;
-      else
+      else {
         napi_throw_error(env, nullptr, "invalid log level");
+        return nullptr;
+      }
 
       dbOptions.info_log_level = lvl;
     } else {
@@ -1602,8 +2309,6 @@ NAPI_METHOD(db_open) {
       }
     }
 
-    NAPI_STATUS_THROWS(InitOptions(env, dbOptions, options));
-
     std::vector<rocksdb::ColumnFamilyDescriptor> descriptors;
 
     bool hasColumns;
@@ -1633,47 +2338,27 @@ NAPI_METHOD(db_open) {
       }
     }
 
+    // In the descriptor overload RocksDB consumes DBOptions plus each explicit
+    // ColumnFamilyOptions; the ColumnFamilyOptions half of `dbOptions` is
+    // ignored. Avoid constructing an unused cache/table factory on every
+    // multi-column open.
+    if (descriptors.empty()) {
+      NAPI_STATUS_THROWS(InitOptions(env, dbOptions, options));
+    }
+
     auto callback = argv[2];
 
     napi_value resourceName;
-    NAPI_STATUS_THROWS(database->GetResourceName(env, ResourceLeveldownOpen, resourceName));
+    NAPI_STATUS_THROWS(GetResourceName(env, ResourceLeveldownOpen, resourceName));
 
-    const auto statistics = dbOptions.statistics;
-
-    NAPI_STATUS_THROWS(runAsync<std::vector<rocksdb::ColumnFamilyHandle*>>(
-        resourceName, env, callback,
-        [=](auto& handles) {
-          assert(!database->db);
-
-          const auto status =
-              descriptors.empty()
-                  ? rocksdb::DB::Open(dbOptions, database->location, &database->db)
-                  : rocksdb::DB::Open(dbOptions, database->location, descriptors, &handles, &database->db);
-
-          return status;
+    NAPI_STATUS_THROWS(runAsyncKeepAlive<OpenSnapshot>(
+        resourceName, env, callback, argv[0],
+        [database, reference, dbOptions = std::move(dbOptions), descriptors = std::move(descriptors)](
+            auto& snapshot) {
+          return database->Open(reference, dbOptions, descriptors, snapshot);
         },
-        [=](auto& handles, napi_env env, napi_value* result) {
-          NAPI_STATUS_RETURN(napi_create_object(env, result));
-
-          for (size_t n = 0; n < handles.size(); ++n) {
-            ColumnFamily column;
-            column.handle = handles[n];
-            column.descriptor = descriptors[n];
-            database->columns[column.handle->GetID()] = column;
-          }
-
-          napi_value columns = *result;
-          for (auto& [id, column] : database->columns) {
-            napi_value val;
-            NAPI_STATUS_RETURN(napi_create_external(env, column.handle, nullptr, nullptr, &val));
-            NAPI_STATUS_RETURN(napi_set_named_property(env, columns, column.descriptor.name.c_str(), val));
-          }
-
-          // Publish only the Statistics object belonging to this successfully
-          // opened DB. Failed opens must not leave an unattached stale object.
-          database->statistics = statistics;
-
-          return napi_ok;
+        [reference](auto& snapshot, napi_env env, napi_value* result) {
+          return CreateColumnsObject(env, reference->database, snapshot, result);
         }));
   }
 
@@ -1684,29 +2369,44 @@ NAPI_METHOD(db_close) {
   NAPI_ARGV(2);
 
   Database* database;
-  NAPI_STATUS_THROWS(napi_get_value_external(env, argv[0], reinterpret_cast<void**>(&database)));
+  std::shared_ptr<DatabaseReference> reference;
+  NAPI_STATUS_THROWS(GetDatabase(env, argv[0], database, &reference, false));
 
   auto callback = argv[1];
 
   napi_value resourceName;
-  NAPI_STATUS_THROWS(database->GetResourceName(env, ResourceLeveldownClose, resourceName));
+  NAPI_STATUS_THROWS(GetResourceName(env, ResourceLeveldownClose, resourceName));
 
-  NAPI_STATUS_THROWS(runAsync(resourceName, env, callback, [=](auto& state) { return database->Close(); }));
+  NAPI_STATUS_THROWS(
+      runAsyncKeepAlive(resourceName, env, callback, argv[0], [=](auto& state) { return database->Close(reference); }));
 
   return 0;
+}
+
+NAPI_METHOD(db_dispose) {
+  NAPI_ARGV(1);
+
+  Database* database;
+  std::shared_ptr<DatabaseReference> reference;
+  NAPI_STATUS_THROWS(GetDatabase(env, argv[0], database, &reference, false));
+  ROCKS_STATUS_THROWS_NAPI(database->Dispose(reference));
+  return nullptr;
 }
 
 NAPI_METHOD(db_get_many_sync) {
   NAPI_ARGV(3);
 
   Database* database;
-  NAPI_STATUS_THROWS(napi_get_value_external(env, argv[0], reinterpret_cast<void**>(&database)));
+  std::shared_ptr<DatabaseReference> reference;
+  NAPI_STATUS_THROWS(GetDatabase(env, argv[0], database, &reference));
+  std::shared_ptr<DatabaseOperation> databaseOperation;
+  NAPI_STATUS_THROWS(BeginDatabaseOperation(env, database, reference, databaseOperation));
 
   uint32_t count;
   NAPI_STATUS_THROWS(napi_get_array_length(env, argv[1], &count));
 
   rocksdb::ColumnFamilyHandle* column = database->db->DefaultColumnFamily();
-  NAPI_STATUS_THROWS(GetProperty(env, argv[2], "column", column));
+  NAPI_STATUS_THROWS(GetColumnProperty(env, argv[2], database, column));
 
   Encoding valueEncoding = Encoding::Buffer;
   NAPI_STATUS_THROWS(GetProperty(env, argv[2], "valueEncoding", valueEncoding));
@@ -1731,8 +2431,9 @@ NAPI_METHOD(db_get_many_sync) {
   }
 
   rocksdb::ReadOptions readOptions;
-  readOptions.deadline = timeout ? std::chrono::microseconds(database->db->GetEnv()->NowMicros() + timeout * 1000)
-                                 : std::chrono::microseconds::zero();
+  readOptions.deadline =
+      timeout ? std::chrono::microseconds(database->db->GetEnv()->NowMicros() + static_cast<uint64_t>(timeout) * 1000)
+              : std::chrono::microseconds::zero();
 
   readOptions.fill_cache = false;
   NAPI_STATUS_THROWS(GetProperty(env, argv[2], "fillCache", readOptions.fill_cache));
@@ -1762,7 +2463,11 @@ NAPI_METHOD(db_get_many_sync) {
       NAPI_STATUS_THROWS(napi_get_null(env, &row));
     } else {
       ROCKS_STATUS_THROWS_NAPI(statuses[n]);
-      NAPI_STATUS_THROWS(Convert(env, std::move(values[n]), valueEncoding, row, unsafe));
+      // MultiGet may return either cache-pinned or internally-owned slices.
+      // Keep one stable copy policy for the whole batch: hundreds of external
+      // Buffer finalizers were slower in profiling and cannot safely outlive
+      // every RocksDB ownership mode.
+      NAPI_STATUS_THROWS(Convert(env, std::move(values[n]), valueEncoding, row, unsafe, false));
     }
     NAPI_STATUS_THROWS(napi_set_element(env, rows, n, row));
   }
@@ -1774,32 +2479,50 @@ NAPI_METHOD(db_get_many) {
   NAPI_ARGV(4);
 
   Database* database;
-  NAPI_STATUS_THROWS(napi_get_value_external(env, argv[0], reinterpret_cast<void**>(&database)));
+  std::shared_ptr<DatabaseReference> reference;
+  NAPI_STATUS_THROWS(GetDatabase(env, argv[0], database, &reference));
+  std::shared_ptr<DatabaseOperation> databaseOperation;
+  NAPI_STATUS_THROWS(BeginDatabaseOperation(env, database, reference, databaseOperation));
 
   uint32_t count;
   NAPI_STATUS_THROWS(napi_get_array_length(env, argv[1], &count));
 
   rocksdb::ColumnFamilyHandle* column = database->db->DefaultColumnFamily();
-  NAPI_STATUS_THROWS(GetProperty(env, argv[2], "column", column));
+  NAPI_STATUS_THROWS(GetColumnProperty(env, argv[2], database, column));
 
   Encoding valueEncoding = Encoding::Buffer;
   NAPI_STATUS_THROWS(GetProperty(env, argv[2], "valueEncoding", valueEncoding));
+
+  uint32_t timeout = 0;
+  NAPI_STATUS_THROWS(GetProperty(env, argv[2], "timeout", timeout));
 
   bool unsafe = false;
   NAPI_STATUS_THROWS(GetProperty(env, argv[2], "unsafe", unsafe));
 
   auto callback = argv[3];
 
-  std::vector<rocksdb::PinnableSlice> keys;
-  keys.resize(count);
+  std::vector<rocksdb::Slice> keys(count);
+  std::vector<std::string> ownedKeys(count);
+  auto keysReference = std::make_shared<Reference>();
+  NAPI_STATUS_THROWS(Reference::Create(env, argv[1], *keysReference));
 
   for (uint32_t n = 0; n < count; n++) {
     napi_value element;
     NAPI_STATUS_THROWS(napi_get_element(env, argv[1], n, &element));
-    NAPI_STATUS_THROWS(GetValue(env, element, keys[n]));
+    napi_valuetype type;
+    NAPI_STATUS_THROWS(napi_typeof(env, element, &type));
+    if (type == napi_string) {
+      NAPI_STATUS_THROWS(GetValue(env, element, ownedKeys[n]));
+      keys[n] = ownedKeys[n];
+    } else {
+      NAPI_STATUS_THROWS(GetValue(env, element, keys[n]));
+    }
   }
 
   rocksdb::ReadOptions readOptions;
+  readOptions.deadline =
+      timeout ? std::chrono::microseconds(database->db->GetEnv()->NowMicros() + static_cast<uint64_t>(timeout) * 1000)
+              : std::chrono::microseconds::zero();
   readOptions.fill_cache = false;
   NAPI_STATUS_THROWS(GetProperty(env, argv[2], "fillCache", readOptions.fill_cache));
 
@@ -1816,26 +2539,29 @@ NAPI_METHOD(db_get_many) {
   NAPI_STATUS_THROWS(GetProperty(env, argv[2], "highWaterMarkBytes", readOptions.value_size_soft_limit));
 
   napi_value resourceName;
-  NAPI_STATUS_THROWS(database->GetResourceName(env, ResourceLeveldownGetMany, resourceName));
+  NAPI_STATUS_THROWS(GetResourceName(env, ResourceLeveldownGetMany, resourceName));
 
   struct State {
     std::vector<rocksdb::Status> statuses;
     std::vector<rocksdb::PinnableSlice> values;
   };
 
-  NAPI_STATUS_THROWS(runAsync<State>(
-      resourceName, env, callback,
-      [=, keys = std::move(keys), readOptions = std::move(readOptions)](auto& state) {
-        std::vector<rocksdb::Slice> keys2;
-        keys2.reserve(count);
-        for (uint32_t n = 0; n < count; n++) {
-          keys2.emplace_back(keys[n]);
-        }
+  NAPI_STATUS_THROWS(runAsyncKeepAlive<State>(
+      resourceName, env, callback, argv[0],
+      [=, keys = std::move(keys), ownedKeys = std::move(ownedKeys),
+       readOptions = std::move(readOptions)](auto& state) {
+        // MultiGet can return slices pinned to RocksDB cache memory. Retain the
+        // operation through JS conversion (the async worker owns this functor
+        // until Complete) so safe conversion performs only its one required
+        // copy and raw db_close cannot tear down the cache first.
+        (void)databaseOperation;
+        (void)keysReference;
+        (void)ownedKeys;
 
         state.statuses.resize(count);
         state.values.resize(count);
 
-        database->db->MultiGet(readOptions, column, count, keys2.data(), state.values.data(), state.statuses.data());
+        database->db->MultiGet(readOptions, column, count, keys.data(), state.values.data(), state.statuses.data());
 
         return rocksdb::Status::OK();
       },
@@ -1846,11 +2572,11 @@ NAPI_METHOD(db_get_many) {
           napi_value row;
           if (state.statuses[n].IsNotFound()) {
             NAPI_STATUS_RETURN(napi_get_undefined(env, &row));
-          } else if (state.statuses[n].IsAborted()) {
+          } else if (state.statuses[n].IsAborted() || state.statuses[n].IsTimedOut()) {
             NAPI_STATUS_RETURN(napi_get_null(env, &row));
           } else {
             ROCKS_STATUS_RETURN_NAPI(state.statuses[n]);
-            NAPI_STATUS_RETURN(Convert(env, std::move(state.values[n]), valueEncoding, row, unsafe));
+            NAPI_STATUS_RETURN(Convert(env, std::move(state.values[n]), valueEncoding, row, unsafe, false));
           }
           NAPI_STATUS_RETURN(napi_set_element(env, *result, n, row));
         }
@@ -1861,11 +2587,17 @@ NAPI_METHOD(db_get_many) {
   return 0;
 }
 
+// Synchronous compatibility implementation used by the lifetime-safety layer.
+// The following stack layer moves the same operation onto an async worker and
+// adds the DeleteRange fast path.
 NAPI_METHOD(db_clear) {
   NAPI_ARGV(2);
 
   Database* database;
-  NAPI_STATUS_THROWS(napi_get_value_external(env, argv[0], reinterpret_cast<void**>(&database)));
+  std::shared_ptr<DatabaseReference> reference;
+  NAPI_STATUS_THROWS(GetDatabase(env, argv[0], database, &reference));
+  std::shared_ptr<DatabaseOperation> databaseOperation;
+  NAPI_STATUS_THROWS(BeginDatabaseOperation(env, database, reference, databaseOperation));
 
   const auto options = argv[1];
 
@@ -1874,101 +2606,66 @@ NAPI_METHOD(db_clear) {
 
   int32_t limit = -1;
   NAPI_STATUS_THROWS(GetProperty(env, options, "limit", limit));
+  if (limit < -1) {
+    napi_throw_range_error(env, nullptr, "limit must be -1 or non-negative");
+    return nullptr;
+  }
 
   rocksdb::ColumnFamilyHandle* column = database->db->DefaultColumnFamily();
-  NAPI_STATUS_THROWS(GetProperty(env, options, "column", column));
+  NAPI_STATUS_THROWS(GetColumnProperty(env, options, database, column));
 
   std::optional<std::string> lt;
   NAPI_STATUS_THROWS(GetProperty(env, options, "lt", lt));
-
   std::optional<std::string> lte;
   NAPI_STATUS_THROWS(GetProperty(env, options, "lte", lte));
-
   std::optional<std::string> gt;
   NAPI_STATUS_THROWS(GetProperty(env, options, "gt", gt));
-
   std::optional<std::string> gte;
   NAPI_STATUS_THROWS(GetProperty(env, options, "gte", gte));
 
-  if (limit == -1) {
-    rocksdb::PinnableSlice begin;
-    if (gte) {
-      *begin.GetSelf() = std::move(*gte);
-    } else if (gt) {
-      *begin.GetSelf() = std::move(*gt) + '\0';
-    }
-    begin.PinSelf();
+  rocksdb::WriteOptions writeOptions;
+  NAPI_STATUS_THROWS(GetProperty(env, options, "sync", writeOptions.sync));
+  NAPI_STATUS_THROWS(GetProperty(env, options, "lowPriority", writeOptions.low_pri));
 
-    rocksdb::PinnableSlice end;
-    if (lte) {
-      *end.GetSelf() = std::move(*lte) + '\0';
-    } else if (lt) {
-      *end.GetSelf() = std::move(*lt);
-    } else {
-      // HACK: Assume no key that starts with 0xFF is larger than 1MiB.
-      // TODO (correctness): this synthetic upper bound silently leaves any key
-      // >= a 1 MiB run of 0xFF bytes uncleared. Prefer DeleteRange over the full
-      // keyspace (null end) or RangeBound::kInclusive on the max key instead of
-      // assuming a bound.
-      end.GetSelf()->resize(1e6);
-      memset(end.GetSelf()->data(), 255, end.GetSelf()->size());
-    }
-    end.PinSelf();
+  BaseIterator iterator(database, reference, column, reverse, lt, lte, gt, gte, limit);
+  rocksdb::WriteBatch batch;
+  rocksdb::Status status;
 
-    if (begin.compare(end) < 0) {
-      rocksdb::WriteOptions writeOptions;
-      ROCKS_STATUS_THROWS_NAPI(database->db->DeleteRange(writeOptions, column, begin, end));
+  while (true) {
+    size_t bytesRead = 0;
+    while (bytesRead <= 16 * 1024 && iterator.Valid() && iterator.Increment()) {
+      const auto key = iterator.CurrentKey();
+      batch.Delete(column, key);
+      bytesRead += key.size();
+      iterator.Next();
     }
 
-    return 0;
-  } else {
-    // TODO (fix): Error handling.
-    // TODO (fix): This should be async...
-
-    BaseIterator it(database, column, reverse, lt, lte, gt, gte, limit);
-
-    rocksdb::WriteBatch batch;
-    rocksdb::WriteOptions writeOptions;
-    rocksdb::Status status;
-
-    while (true) {
-      size_t bytesRead = 0;
-
-      while (bytesRead <= 16 * 1024 && it.Valid() && it.Increment()) {
-        const auto key = it.CurrentKey();
-        batch.Delete(column, key);
-        bytesRead += key.size();
-        it.Next();
-      }
-
-      status = it.Status();
-      if (!status.ok() || bytesRead == 0) {
-        break;
-      }
-
-      status = database->db->Write(writeOptions, &batch);
-      if (!status.ok()) {
-        break;
-      }
-
-      batch.Clear();
+    status = iterator.Status();
+    if (!status.ok() || bytesRead == 0) {
+      break;
     }
 
-    it.Close();
-
+    status = database->db->Write(writeOptions, &batch);
     if (!status.ok()) {
-      ROCKS_STATUS_THROWS_NAPI(status);
+      break;
     }
-
-    return 0;
+    batch.Clear();
   }
+
+  const auto closeStatus = iterator.Close();
+  if (status.ok()) status = closeStatus;
+  ROCKS_STATUS_THROWS_NAPI(status);
+  return nullptr;
 }
 
 NAPI_METHOD(db_get_property) {
   NAPI_ARGV(3);
 
   Database* database;
-  NAPI_STATUS_THROWS(napi_get_value_external(env, argv[0], reinterpret_cast<void**>(&database)));
+  std::shared_ptr<DatabaseReference> reference;
+  NAPI_STATUS_THROWS(GetDatabase(env, argv[0], database, &reference));
+  std::shared_ptr<DatabaseOperation> databaseOperation;
+  NAPI_STATUS_THROWS(BeginDatabaseOperation(env, database, reference, databaseOperation));
 
   if (!database->db) {
     napi_throw_error(env, "LEVEL_DATABASE_NOT_OPEN", "Database is not open");
@@ -1981,7 +2678,7 @@ NAPI_METHOD(db_get_property) {
   // Most rocksdb properties are column-family scoped; without an explicit
   // column they answer for the default CF only.
   rocksdb::ColumnFamilyHandle* column = database->db->DefaultColumnFamily();
-  NAPI_STATUS_THROWS(GetProperty(env, argv[2], "column", column));
+  NAPI_STATUS_THROWS(GetColumnProperty(env, argv[2], database, column));
 
   std::string value;
   database->db->GetProperty(column, property, &value);
@@ -2062,7 +2759,10 @@ NAPI_METHOD(db_set_stats_level) {
   NAPI_ARGV(2);
 
   Database* database;
-  NAPI_STATUS_THROWS(napi_get_value_external(env, argv[0], reinterpret_cast<void**>(&database)));
+  std::shared_ptr<DatabaseReference> reference;
+  NAPI_STATUS_THROWS(GetDatabase(env, argv[0], database, &reference));
+  std::shared_ptr<DatabaseOperation> databaseOperation;
+  NAPI_STATUS_THROWS(BeginDatabaseOperation(env, database, reference, databaseOperation));
 
   bool enabled = false;
   NAPI_STATUS_THROWS(napi_get_value_bool(env, argv[1], &enabled));
@@ -2087,7 +2787,10 @@ NAPI_METHOD(db_get_statistics) {
   NAPI_ARGV(1);
 
   Database* database;
-  NAPI_STATUS_THROWS(napi_get_value_external(env, argv[0], reinterpret_cast<void**>(&database)));
+  std::shared_ptr<DatabaseReference> reference;
+  NAPI_STATUS_THROWS(GetDatabase(env, argv[0], database, &reference));
+  std::shared_ptr<DatabaseOperation> databaseOperation;
+  NAPI_STATUS_THROWS(BeginDatabaseOperation(env, database, reference, databaseOperation));
 
   if (!database->statistics) {
     napi_value nullResult;
@@ -2097,7 +2800,6 @@ NAPI_METHOD(db_get_statistics) {
 
   napi_value result;
   NAPI_STATUS_THROWS(CreateStatisticsSnapshot(env, database->statistics, &result));
-
   return result;
 }
 
@@ -2105,7 +2807,10 @@ NAPI_METHOD(db_get_latest_sequence) {
   NAPI_ARGV(1);
 
   Database* database;
-  NAPI_STATUS_THROWS(napi_get_value_external(env, argv[0], reinterpret_cast<void**>(&database)));
+  std::shared_ptr<DatabaseReference> reference;
+  NAPI_STATUS_THROWS(GetDatabase(env, argv[0], database, &reference));
+  std::shared_ptr<DatabaseOperation> databaseOperation;
+  NAPI_STATUS_THROWS(BeginDatabaseOperation(env, database, reference, databaseOperation));
 
   if (!database->db) {
     napi_throw_error(env, "LEVEL_DATABASE_NOT_OPEN", "Database is not open");
@@ -2124,7 +2829,8 @@ NAPI_METHOD(db_flush_wal) {
   NAPI_ARGV(3);
 
   Database* database;
-  NAPI_STATUS_THROWS(napi_get_value_external(env, argv[0], reinterpret_cast<void**>(&database)));
+  std::shared_ptr<DatabaseReference> reference;
+  NAPI_STATUS_THROWS(GetDatabase(env, argv[0], database, &reference));
 
   bool sync;
   NAPI_STATUS_THROWS(GetValue(env, argv[1], sync));
@@ -2132,9 +2838,14 @@ NAPI_METHOD(db_flush_wal) {
   auto callback = argv[2];
 
   napi_value resourceName;
-  NAPI_STATUS_THROWS(database->GetResourceName(env, ResourceLeveldownFlushWal, resourceName));
+  NAPI_STATUS_THROWS(GetResourceName(env, ResourceLeveldownFlushWal, resourceName));
+  std::shared_ptr<DatabaseOperation> databaseOperation;
+  NAPI_STATUS_THROWS(BeginDatabaseOperation(env, database, reference, databaseOperation));
 
-  NAPI_STATUS_THROWS(runAsync(resourceName, env, callback, [=](auto& state) { return database->db->FlushWAL(sync); }));
+  NAPI_STATUS_THROWS(runAsyncKeepAlive(resourceName, env, callback, argv[0], [=](auto& state) {
+    const DatabaseOperationScope operationScope(databaseOperation);
+    return database->db->FlushWAL(sync);
+  }));
 
   return 0;
 }
@@ -2145,14 +2856,13 @@ NAPI_METHOD(iterator_init_sync) {
   napi_value result;
   try {
     auto iterator = Iterator::create(env, argv[0], argv[1]);
-    // create() returns an empty unique_ptr (and a pending JS exception) on a
+    // create() returns an empty shared_ptr (and a pending JS exception) on a
     // N-API failure; surface that instead of wrapping a null pointer.
     if (!iterator) {
       return nullptr;
     }
 
-    NAPI_STATUS_THROWS(napi_create_external(env, iterator.get(), Finalize<Iterator>, iterator.get(), &result));
-    iterator.release();
+    NAPI_STATUS_THROWS(CreateResourceExternal(env, iterator, kIteratorReferenceTag, result));
   } catch (const std::exception& e) {
     napi_throw_error(env, nullptr, e.what());
     return nullptr;
@@ -2165,10 +2875,13 @@ NAPI_METHOD(iterator_refresh_sync) {
   NAPI_ARGV(1);
 
   try {
-    Iterator* iterator;
-    NAPI_STATUS_THROWS(napi_get_value_external(env, argv[0], reinterpret_cast<void**>(&iterator)));
+    std::shared_ptr<Iterator> iterator;
+    NAPI_STATUS_THROWS(GetResourceExternal(env, argv[0], kIteratorReferenceTag, iterator));
+    std::shared_ptr<DatabaseOperation> databaseOperation;
+    NAPI_STATUS_THROWS(
+        BeginDatabaseOperation(env, iterator->database_, iterator->reference_, databaseOperation));
 
-    ROCKS_STATUS_THROWS_NAPI(iterator->Refresh());
+    ROCKS_STATUS_THROWS_NAPI(iterator->RefreshSafe());
   } catch (const std::exception& e) {
     napi_throw_error(env, nullptr, e.what());
     return nullptr;
@@ -2181,8 +2894,8 @@ NAPI_METHOD(iterator_seek) {
   NAPI_ARGV(3);
 
   try {
-    Iterator* iterator;
-    NAPI_STATUS_THROWS(napi_get_value_external(env, argv[0], reinterpret_cast<void**>(&iterator)));
+    std::shared_ptr<Iterator> iterator;
+    NAPI_STATUS_THROWS(GetResourceExternal(env, argv[0], kIteratorReferenceTag, iterator));
 
     rocksdb::PinnableSlice target;
     NAPI_STATUS_THROWS(GetValue(env, argv[1], target));
@@ -2190,12 +2903,16 @@ NAPI_METHOD(iterator_seek) {
     auto callback = argv[2];
 
     napi_value resourceName;
-    NAPI_STATUS_THROWS(iterator->database_->GetResourceName(env, ResourceLeveldownIteratorSeek, resourceName));
+    NAPI_STATUS_THROWS(GetResourceName(env, ResourceLeveldownIteratorSeek, resourceName));
+    std::shared_ptr<DatabaseOperation> databaseOperation;
+    NAPI_STATUS_THROWS(
+        BeginDatabaseOperation(env, iterator->database_, iterator->reference_, databaseOperation));
 
-    NAPI_STATUS_THROWS(runAsync(resourceName, env, callback, [iterator, target = std::move(target)](auto& state) {
-      iterator->Seek(target);
-      return iterator->Status();
-    }));
+    NAPI_STATUS_THROWS(runAsync(resourceName, env, callback,
+                                [iterator, databaseOperation, target = std::move(target)](auto& state) {
+                                  const DatabaseOperationScope operationScope(databaseOperation);
+                                  return iterator->SeekSafe(target);
+                                }));
   } catch (const std::exception& e) {
     napi_throw_error(env, nullptr, e.what());
     return nullptr;
@@ -2208,15 +2925,16 @@ NAPI_METHOD(iterator_seek_sync) {
   NAPI_ARGV(2);
 
   try {
-    Iterator* iterator;
-    NAPI_STATUS_THROWS(napi_get_value_external(env, argv[0], reinterpret_cast<void**>(&iterator)));
+    std::shared_ptr<Iterator> iterator;
+    NAPI_STATUS_THROWS(GetResourceExternal(env, argv[0], kIteratorReferenceTag, iterator));
+    std::shared_ptr<DatabaseOperation> databaseOperation;
+    NAPI_STATUS_THROWS(
+        BeginDatabaseOperation(env, iterator->database_, iterator->reference_, databaseOperation));
 
     rocksdb::PinnableSlice target;
     NAPI_STATUS_THROWS(GetValue(env, argv[1], target));
 
-    iterator->Seek(target);
-
-    ROCKS_STATUS_THROWS_NAPI(iterator->Status());
+    ROCKS_STATUS_THROWS_NAPI(iterator->SeekSafe(target));
   } catch (const std::exception& e) {
     napi_throw_error(env, nullptr, e.what());
     return nullptr;
@@ -2229,8 +2947,8 @@ NAPI_METHOD(iterator_close_sync) {
   NAPI_ARGV(1);
 
   try {
-    Iterator* iterator;
-    NAPI_STATUS_THROWS(napi_get_value_external(env, argv[0], reinterpret_cast<void**>(&iterator)));
+    std::shared_ptr<Iterator> iterator;
+    NAPI_STATUS_THROWS(GetResourceExternal(env, argv[0], kIteratorReferenceTag, iterator));
 
     ROCKS_STATUS_THROWS_NAPI(iterator->Close());
   } catch (const std::exception& e) {
@@ -2245,8 +2963,8 @@ NAPI_METHOD(iterator_nextv) {
   NAPI_ARGV(4);
 
   try {
-    Iterator* iterator;
-    NAPI_STATUS_THROWS(napi_get_value_external(env, argv[0], reinterpret_cast<void**>(&iterator)));
+    std::shared_ptr<Iterator> iterator;
+    NAPI_STATUS_THROWS(GetResourceExternal(env, argv[0], kIteratorReferenceTag, iterator));
 
     uint32_t count = 1024;
     NAPI_STATUS_THROWS(GetValue(env, argv[1], count));
@@ -2265,8 +2983,8 @@ NAPI_METHOD(iterator_nextv_sync) {
   NAPI_ARGV(3);
 
   try {
-    Iterator* iterator;
-    NAPI_STATUS_THROWS(napi_get_value_external(env, argv[0], reinterpret_cast<void**>(&iterator)));
+    std::shared_ptr<Iterator> iterator;
+    NAPI_STATUS_THROWS(GetResourceExternal(env, argv[0], kIteratorReferenceTag, iterator));
 
     uint32_t count = 1024;
     NAPI_STATUS_THROWS(GetValue(env, argv[1], count));
@@ -2282,11 +3000,18 @@ NAPI_METHOD(iterator_nextv_sync) {
 }
 
 NAPI_METHOD(batch_init) {
-  auto batch = std::make_unique<rocksdb::WriteBatch>();
+  NAPI_ARGV(1);
+
+  Database* database;
+  std::shared_ptr<DatabaseReference> reference;
+  NAPI_STATUS_THROWS(GetDatabase(env, argv[0], database, &reference));
+  std::shared_ptr<DatabaseOperation> databaseOperation;
+  NAPI_STATUS_THROWS(BeginDatabaseOperation(env, database, reference, databaseOperation));
+
+  auto batch = std::make_shared<NativeBatch>(std::move(reference));
 
   napi_value result;
-  NAPI_STATUS_THROWS(napi_create_external(env, batch.get(), Finalize<rocksdb::WriteBatch>, batch.get(), &result));
-  batch.release();
+  NAPI_STATUS_THROWS(CreateResourceExternal(env, batch, kBatchReferenceTag, result));
 
   return result;
 }
@@ -2294,8 +3019,11 @@ NAPI_METHOD(batch_init) {
 NAPI_METHOD(batch_put) {
   NAPI_ARGV(4);
 
-  rocksdb::WriteBatch* batch;
-  NAPI_STATUS_THROWS(napi_get_value_external(env, argv[0], reinterpret_cast<void**>(&batch)));
+  std::shared_ptr<NativeBatch> batch;
+  NAPI_STATUS_THROWS(GetBatch(env, argv[0], batch));
+  Database* database = batch->reference->database.get();
+  std::shared_ptr<DatabaseOperation> databaseOperation;
+  NAPI_STATUS_THROWS(BeginDatabaseOperation(env, database, batch->reference, databaseOperation));
 
   rocksdb::Slice key;
   NAPI_STATUS_THROWS(GetValue(env, argv[1], key));
@@ -2304,12 +3032,13 @@ NAPI_METHOD(batch_put) {
   NAPI_STATUS_THROWS(GetValue(env, argv[2], val));
 
   rocksdb::ColumnFamilyHandle* column = nullptr;
-  NAPI_STATUS_THROWS(GetProperty(env, argv[3], "column", column));
+  NAPI_STATUS_THROWS(GetColumnProperty(env, argv[3], database, column, false));
 
+  std::lock_guard lock(batch->mutex);
   if (column) {
-    ROCKS_STATUS_THROWS_NAPI(batch->Put(column, key, val));
+    ROCKS_STATUS_THROWS_NAPI(batch->batch.Put(column, key, val));
   } else {
-    ROCKS_STATUS_THROWS_NAPI(batch->Put(key, val));
+    ROCKS_STATUS_THROWS_NAPI(batch->batch.Put(key, val));
   }
 
   return 0;
@@ -2318,13 +3047,14 @@ NAPI_METHOD(batch_put) {
 NAPI_METHOD(batch_put_log_data) {
   NAPI_ARGV(2);
 
-  rocksdb::WriteBatch* batch;
-  NAPI_STATUS_THROWS(napi_get_value_external(env, argv[0], reinterpret_cast<void**>(&batch)));
+  std::shared_ptr<NativeBatch> batch;
+  NAPI_STATUS_THROWS(GetBatch(env, argv[0], batch));
 
   rocksdb::Slice blob;
   NAPI_STATUS_THROWS(GetValue(env, argv[1], blob));
 
-  ROCKS_STATUS_THROWS_NAPI(batch->PutLogData(blob));
+  std::lock_guard lock(batch->mutex);
+  ROCKS_STATUS_THROWS_NAPI(batch->batch.PutLogData(blob));
 
   return 0;
 }
@@ -2332,19 +3062,23 @@ NAPI_METHOD(batch_put_log_data) {
 NAPI_METHOD(batch_del) {
   NAPI_ARGV(3);
 
-  rocksdb::WriteBatch* batch;
-  NAPI_STATUS_THROWS(napi_get_value_external(env, argv[0], reinterpret_cast<void**>(&batch)));
+  std::shared_ptr<NativeBatch> batch;
+  NAPI_STATUS_THROWS(GetBatch(env, argv[0], batch));
+  Database* database = batch->reference->database.get();
+  std::shared_ptr<DatabaseOperation> databaseOperation;
+  NAPI_STATUS_THROWS(BeginDatabaseOperation(env, database, batch->reference, databaseOperation));
 
   rocksdb::Slice key;
   NAPI_STATUS_THROWS(GetValue(env, argv[1], key));
 
   rocksdb::ColumnFamilyHandle* column = nullptr;
-  NAPI_STATUS_THROWS(GetProperty(env, argv[2], "column", column));
+  NAPI_STATUS_THROWS(GetColumnProperty(env, argv[2], database, column, false));
 
+  std::lock_guard lock(batch->mutex);
   if (column) {
-    ROCKS_STATUS_THROWS_NAPI(batch->Delete(column, key));
+    ROCKS_STATUS_THROWS_NAPI(batch->batch.Delete(column, key));
   } else {
-    ROCKS_STATUS_THROWS_NAPI(batch->Delete(key));
+    ROCKS_STATUS_THROWS_NAPI(batch->batch.Delete(key));
   }
 
   return 0;
@@ -2353,8 +3087,11 @@ NAPI_METHOD(batch_del) {
 NAPI_METHOD(batch_merge) {
   NAPI_ARGV(4);
 
-  rocksdb::WriteBatch* batch;
-  NAPI_STATUS_THROWS(napi_get_value_external(env, argv[0], reinterpret_cast<void**>(&batch)));
+  std::shared_ptr<NativeBatch> batch;
+  NAPI_STATUS_THROWS(GetBatch(env, argv[0], batch));
+  Database* database = batch->reference->database.get();
+  std::shared_ptr<DatabaseOperation> databaseOperation;
+  NAPI_STATUS_THROWS(BeginDatabaseOperation(env, database, batch->reference, databaseOperation));
 
   rocksdb::Slice key;
   NAPI_STATUS_THROWS(GetValue(env, argv[1], key));
@@ -2363,12 +3100,13 @@ NAPI_METHOD(batch_merge) {
   NAPI_STATUS_THROWS(GetValue(env, argv[2], val));
 
   rocksdb::ColumnFamilyHandle* column = nullptr;
-  NAPI_STATUS_THROWS(GetProperty(env, argv[3], "column", column));
+  NAPI_STATUS_THROWS(GetColumnProperty(env, argv[3], database, column, false));
 
+  std::lock_guard lock(batch->mutex);
   if (column) {
-    ROCKS_STATUS_THROWS_NAPI(batch->Merge(column, key, val));
+    ROCKS_STATUS_THROWS_NAPI(batch->batch.Merge(column, key, val));
   } else {
-    ROCKS_STATUS_THROWS_NAPI(batch->Merge(key, val));
+    ROCKS_STATUS_THROWS_NAPI(batch->batch.Merge(key, val));
   }
 
   return 0;
@@ -2377,10 +3115,11 @@ NAPI_METHOD(batch_merge) {
 NAPI_METHOD(batch_clear) {
   NAPI_ARGV(1);
 
-  rocksdb::WriteBatch* batch;
-  NAPI_STATUS_THROWS(napi_get_value_external(env, argv[0], reinterpret_cast<void**>(&batch)));
+  std::shared_ptr<NativeBatch> batch;
+  NAPI_STATUS_THROWS(GetBatch(env, argv[0], batch));
 
-  batch->Clear();
+  std::lock_guard lock(batch->mutex);
+  batch->batch.Clear();
 
   return 0;
 }
@@ -2389,10 +3128,14 @@ NAPI_METHOD(batch_write) {
   NAPI_ARGV(4);
 
   Database* database;
-  NAPI_STATUS_THROWS(napi_get_value_external(env, argv[0], reinterpret_cast<void**>(&database)));
+  std::shared_ptr<DatabaseReference> reference;
+  NAPI_STATUS_THROWS(GetDatabase(env, argv[0], database, &reference));
+  std::shared_ptr<DatabaseOperation> databaseOperation;
+  NAPI_STATUS_THROWS(BeginDatabaseOperation(env, database, reference, databaseOperation));
 
-  rocksdb::WriteBatch* batch;
-  NAPI_STATUS_THROWS(napi_get_value_external(env, argv[1], reinterpret_cast<void**>(&batch)));
+  std::shared_ptr<NativeBatch> batch;
+  NAPI_STATUS_THROWS(GetBatch(env, argv[1], batch));
+  NAPI_STATUS_THROWS(ValidateBatch(env, batch, reference));
   bool sync = false;
   NAPI_STATUS_THROWS(GetProperty(env, argv[2], "sync", sync));
 
@@ -2402,13 +3145,15 @@ NAPI_METHOD(batch_write) {
   auto callback = argv[3];
 
   napi_value resourceName;
-  NAPI_STATUS_THROWS(database->GetResourceName(env, ResourceLeveldownBatchWrite, resourceName));
+  NAPI_STATUS_THROWS(GetResourceName(env, ResourceLeveldownBatchWrite, resourceName));
 
-  NAPI_STATUS_THROWS(runAsync(resourceName, env, callback, [=](auto& state) {
+  NAPI_STATUS_THROWS(runAsyncKeepAlive(resourceName, env, callback, argv[0], [=](auto& state) {
+    const DatabaseOperationScope operationScope(databaseOperation);
+    std::lock_guard lock(batch->mutex);
     rocksdb::WriteOptions writeOptions;
     writeOptions.sync = sync;
     writeOptions.low_pri = lowPriority;
-    return database->db->Write(writeOptions, batch);
+    return database->db->Write(writeOptions, &batch->batch);
   }));
 
   return 0;
@@ -2418,10 +3163,14 @@ NAPI_METHOD(batch_write_sync) {
   NAPI_ARGV(3);
 
   Database* database;
-  NAPI_STATUS_THROWS(napi_get_value_external(env, argv[0], reinterpret_cast<void**>(&database)));
+  std::shared_ptr<DatabaseReference> reference;
+  NAPI_STATUS_THROWS(GetDatabase(env, argv[0], database, &reference));
+  std::shared_ptr<DatabaseOperation> databaseOperation;
+  NAPI_STATUS_THROWS(BeginDatabaseOperation(env, database, reference, databaseOperation));
 
-  rocksdb::WriteBatch* batch;
-  NAPI_STATUS_THROWS(napi_get_value_external(env, argv[1], reinterpret_cast<void**>(&batch)));
+  std::shared_ptr<NativeBatch> batch;
+  NAPI_STATUS_THROWS(GetBatch(env, argv[1], batch));
+  NAPI_STATUS_THROWS(ValidateBatch(env, batch, reference));
 
   bool sync = false;
   NAPI_STATUS_THROWS(GetProperty(env, argv[2], "sync", sync));
@@ -2432,7 +3181,8 @@ NAPI_METHOD(batch_write_sync) {
   rocksdb::WriteOptions writeOptions;
   writeOptions.sync = sync;
   writeOptions.low_pri = lowPriority;
-  ROCKS_STATUS_THROWS_NAPI(database->db->Write(writeOptions, batch));
+  std::lock_guard lock(batch->mutex);
+  ROCKS_STATUS_THROWS_NAPI(database->db->Write(writeOptions, &batch->batch));
 
   return 0;
 }
@@ -2440,11 +3190,12 @@ NAPI_METHOD(batch_write_sync) {
 NAPI_METHOD(batch_count) {
   NAPI_ARGV(1);
 
-  rocksdb::WriteBatch* batch;
-  NAPI_STATUS_THROWS(napi_get_value_external(env, argv[0], reinterpret_cast<void**>(&batch)));
+  std::shared_ptr<NativeBatch> batch;
+  NAPI_STATUS_THROWS(GetBatch(env, argv[0], batch));
 
   napi_value result;
-  NAPI_STATUS_THROWS(napi_create_int64(env, batch->Count(), &result));
+  std::lock_guard lock(batch->mutex);
+  NAPI_STATUS_THROWS(napi_create_int64(env, batch->batch.Count(), &result));
 
   return result;
 }
@@ -2453,10 +3204,14 @@ NAPI_METHOD(batch_iterate) {
   NAPI_ARGV(3);
 
   Database* database;
-  NAPI_STATUS_THROWS(napi_get_value_external(env, argv[0], reinterpret_cast<void**>(&database)));
+  std::shared_ptr<DatabaseReference> reference;
+  NAPI_STATUS_THROWS(GetDatabase(env, argv[0], database, &reference));
+  std::shared_ptr<DatabaseOperation> databaseOperation;
+  NAPI_STATUS_THROWS(BeginDatabaseOperation(env, database, reference, databaseOperation));
 
-  rocksdb::WriteBatch* batch;
-  NAPI_STATUS_THROWS(napi_get_value_external(env, argv[1], reinterpret_cast<void**>(&batch)));
+  std::shared_ptr<NativeBatch> batch;
+  NAPI_STATUS_THROWS(GetBatch(env, argv[1], batch));
+  NAPI_STATUS_THROWS(ValidateBatch(env, batch, reference));
 
   const auto options = argv[2];
 
@@ -2476,18 +3231,21 @@ NAPI_METHOD(batch_iterate) {
   NAPI_STATUS_THROWS(GetProperty(env, options, "valueEncoding", valueEncoding));
 
   rocksdb::ColumnFamilyHandle* column = nullptr;
-  NAPI_STATUS_THROWS(GetProperty(env, options, "column", column));
+  NAPI_STATUS_THROWS(GetColumnProperty(env, options, database, column, false));
 
-  BatchIterator iterator(nullptr, keys, values, data, column, keyEncoding, valueEncoding);
+  BatchIterator iterator(keys, values, data, column, keyEncoding, valueEncoding);
 
   napi_value result;
-  NAPI_STATUS_THROWS(iterator.Iterate(env, *batch, &result));
+  std::lock_guard lock(batch->mutex);
+  NAPI_STATUS_THROWS(iterator.Iterate(env, batch->batch, &result));
 
   return result;
 }
 
 struct Updates : public BatchIterator, public Closable {
   Updates(Database* database,
+          std::shared_ptr<DatabaseReference> reference,
+          Reference databaseContext,
           const int64_t since,
           const bool keys,
           const bool values,
@@ -2495,29 +3253,70 @@ struct Updates : public BatchIterator, public Closable {
           const rocksdb::ColumnFamilyHandle* column,
           const Encoding keyEncoding,
           const Encoding valueEncoding)
-      : BatchIterator(database, keys, values, data, column, keyEncoding, valueEncoding),
+      : BatchIterator(keys, values, data, column, keyEncoding, valueEncoding),
         database_(database),
+        reference_(std::move(reference)),
+        databaseContext_(std::move(databaseContext)),
         start_(since) {
-    database_->Attach(this);
+    const auto status = database_->Attach(reference_, this);
+    if (!status.ok()) {
+      throw std::runtime_error(status.ToString());
+    }
   }
 
   virtual ~Updates() {
-    if (iterator_) {
-      database_->Detach(this);
+    if (!closed.load()) {
+      database_->Close(reference_, this);
     }
   }
 
-  rocksdb::Status Close() override {
-    if (iterator_) {
-      iterator_.reset();
-      database_->Detach(this);
+  rocksdb::Status Close() { return database_->Close(reference_, this); }
+
+  rocksdb::Status CloseResources() override {
+    std::lock_guard operationLock(operationMutex_);
+    closed = true;
+    iterator_.reset();
+    return rocksdb::Status::OK();
+  }
+
+  rocksdb::Status Next(rocksdb::BatchResult& result) {
+    std::lock_guard operationLock(operationMutex_);
+    if (closed.load()) {
+      return rocksdb::Status::InvalidArgument("Updates iterator is not open");
     }
+
+    if (iterator_) {
+      iterator_->Next();
+      const auto status = iterator_->status();
+      if (status.IsTryAgain()) {
+        std::unique_ptr<rocksdb::TransactionLogIterator> replacement;
+        rocksdb::TransactionLogIterator::ReadOptions options;
+        ROCKS_STATUS_RETURN(database_->db->GetUpdatesSince(start_, &replacement, options));
+        iterator_ = std::move(replacement);
+      } else {
+        ROCKS_STATUS_RETURN(status);
+      }
+    } else {
+      rocksdb::TransactionLogIterator::ReadOptions options;
+      ROCKS_STATUS_RETURN(database_->db->GetUpdatesSince(start_, &iterator_, options));
+    }
+
+    if (iterator_ && iterator_->Valid()) {
+      result = iterator_->GetBatch();
+      if (result.writeBatchPtr) {
+        start_ = result.sequence + result.writeBatchPtr->Count();
+      }
+    }
+
     return rocksdb::Status::OK();
   }
 
   Database* database_;
+  std::shared_ptr<DatabaseReference> reference_;
+  Reference databaseContext_;
   int64_t start_;
   std::unique_ptr<rocksdb::TransactionLogIterator> iterator_;
+  std::mutex operationMutex_;
 };
 
 NAPI_METHOD(updates_init) {
@@ -2525,7 +3324,10 @@ NAPI_METHOD(updates_init) {
 
   try {
     Database* database;
-    NAPI_STATUS_THROWS(napi_get_value_external(env, argv[0], reinterpret_cast<void**>(&database)));
+    std::shared_ptr<DatabaseReference> reference;
+    NAPI_STATUS_THROWS(GetDatabase(env, argv[0], database, &reference));
+    std::shared_ptr<DatabaseOperation> databaseOperation;
+    NAPI_STATUS_THROWS(BeginDatabaseOperation(env, database, reference, databaseOperation));
 
     const auto options = argv[1];
 
@@ -2548,14 +3350,16 @@ NAPI_METHOD(updates_init) {
     NAPI_STATUS_THROWS(GetProperty(env, options, "valueEncoding", valueEncoding));
 
     rocksdb::ColumnFamilyHandle* column = nullptr;
-    NAPI_STATUS_THROWS(GetProperty(env, options, "column", column));
+    NAPI_STATUS_THROWS(GetColumnProperty(env, options, database, column, false));
+    Reference databaseContext;
+    NAPI_STATUS_THROWS(Reference::Create(env, argv[0], databaseContext));
 
     napi_value result;
-    auto updates =
-        std::unique_ptr<Updates>(new Updates(database, since, keys, values, data, column, keyEncoding, valueEncoding));
+    auto updates = std::make_shared<Updates>(
+        database, reference, std::move(databaseContext), since, keys, values, data, column, keyEncoding,
+        valueEncoding);
 
-    NAPI_STATUS_THROWS(napi_create_external(env, updates.get(), Finalize<Updates>, updates.get(), &result));
-    updates.release();
+    NAPI_STATUS_THROWS(CreateResourceExternal(env, updates, kUpdatesReferenceTag, result));
 
     return result;
   } catch (const std::exception& e) {
@@ -2567,13 +3371,16 @@ NAPI_METHOD(updates_init) {
 NAPI_METHOD(updates_next) {
   NAPI_ARGV(2);
 
-  Updates* updates;
-  NAPI_STATUS_THROWS(napi_get_value_external(env, argv[0], reinterpret_cast<void**>(&updates)));
+  std::shared_ptr<Updates> updates;
+  NAPI_STATUS_THROWS(GetResourceExternal(env, argv[0], kUpdatesReferenceTag, updates));
 
   auto callback = argv[1];
 
   napi_value resourceName;
-  NAPI_STATUS_THROWS(updates->database_->GetResourceName(env, ResourceLeveldownUpdatesSince, resourceName));
+  NAPI_STATUS_THROWS(GetResourceName(env, ResourceLeveldownUpdatesSince, resourceName));
+  std::shared_ptr<DatabaseOperation> databaseOperation;
+  NAPI_STATUS_THROWS(
+      BeginDatabaseOperation(env, updates->database_, updates->reference_, databaseOperation));
 
   struct State {
     rocksdb::BatchResult batchResult;
@@ -2581,20 +3388,9 @@ NAPI_METHOD(updates_next) {
 
   NAPI_STATUS_THROWS(runAsync<State>(
       resourceName, env, callback,
-      [updates](auto& state) {
-        if (!updates->iterator_) {
-          rocksdb::TransactionLogIterator::ReadOptions options;
-          ROCKS_STATUS_RETURN(updates->database_->db->GetUpdatesSince(updates->start_, &updates->iterator_, options));
-        } else {
-          updates->iterator_->Next();
-          ROCKS_STATUS_RETURN(updates->iterator_->status());
-        }
-
-        if (updates->iterator_->Valid()) {
-          state.batchResult = updates->iterator_->GetBatch();
-        }
-
-        return rocksdb::Status::OK();
+      [updates, databaseOperation](auto& state) {
+        const DatabaseOperationScope operationScope(databaseOperation);
+        return updates->Next(state.batchResult);
       },
       [updates](auto& state, napi_env env, napi_value* result) {
         if (state.batchResult.writeBatchPtr != nullptr) {
@@ -2619,8 +3415,8 @@ NAPI_METHOD(updates_close) {
   NAPI_ARGV(1);
 
   try {
-    Updates* updates;
-    NAPI_STATUS_THROWS(napi_get_value_external(env, argv[0], reinterpret_cast<void**>(&updates)));
+    std::shared_ptr<Updates> updates;
+    NAPI_STATUS_THROWS(GetResourceExternal(env, argv[0], kUpdatesReferenceTag, updates));
 
     ROCKS_STATUS_THROWS_NAPI(updates->Close());
     return 0;
@@ -2634,7 +3430,10 @@ NAPI_METHOD(db_compact_range_sync) {
   NAPI_ARGV(2);
 
   Database* database;
-  NAPI_STATUS_THROWS(napi_get_value_external(env, argv[0], reinterpret_cast<void**>(&database)));
+  std::shared_ptr<DatabaseReference> reference;
+  NAPI_STATUS_THROWS(GetDatabase(env, argv[0], database, &reference));
+  std::shared_ptr<DatabaseOperation> databaseOperation;
+  NAPI_STATUS_THROWS(BeginDatabaseOperation(env, database, reference, databaseOperation));
 
   std::optional<std::string> start;
   std::optional<std::string> end;
@@ -2656,7 +3455,8 @@ NAPI_METHOD(db_compact_range) {
   NAPI_ARGV(3);
 
   Database* database;
-  NAPI_STATUS_THROWS(napi_get_value_external(env, argv[0], reinterpret_cast<void**>(&database)));
+  std::shared_ptr<DatabaseReference> reference;
+  NAPI_STATUS_THROWS(GetDatabase(env, argv[0], database, &reference));
 
   std::optional<std::string> start;
   std::optional<std::string> end;
@@ -2667,9 +3467,12 @@ NAPI_METHOD(db_compact_range) {
   auto callback = argv[2];
 
   napi_value resourceName;
-  NAPI_STATUS_THROWS(database->GetResourceName(env, ResourceLeveldownCompactRange, resourceName));
+  NAPI_STATUS_THROWS(GetResourceName(env, ResourceLeveldownCompactRange, resourceName));
+  std::shared_ptr<DatabaseOperation> databaseOperation;
+  NAPI_STATUS_THROWS(BeginDatabaseOperation(env, database, reference, databaseOperation));
 
-  NAPI_STATUS_THROWS(runAsync(resourceName, env, callback, [=](auto& state) {
+  NAPI_STATUS_THROWS(runAsyncKeepAlive(resourceName, env, callback, argv[0], [=](auto& state) {
+    const DatabaseOperationScope operationScope(databaseOperation);
     rocksdb::CompactRangeOptions options;
 
     auto begin = start ? std::make_unique<rocksdb::Slice>(*start) : nullptr;
@@ -2751,13 +3554,27 @@ NAPI_METHOD(statistics_get_statistics) {
 NAPI_METHOD(cache_init) {
   NAPI_ARGV(1);
 
-  size_t capacity = 32 * 1024 * 1024;  // 32 MiB
-  NAPI_STATUS_THROWS(GetProperty(env, argv[0], "capacity", capacity));
+  napi_valuetype type;
+  NAPI_STATUS_THROWS(napi_typeof(env, argv[0], &type));
 
-  auto cache = new std::shared_ptr<rocksdb::Cache>(rocksdb::HyperClockCacheOptions(capacity, 0).MakeSharedCache());
+  std::shared_ptr<CacheResource> cache;
+  if (type == napi_bigint) {
+    if (LookupResourceHandle(env, argv[0], HandleRegistry<CacheResource>::Instance(), cache) != napi_ok) {
+      napi_throw_error(env, nullptr, "Invalid or stale cache handle");
+      return nullptr;
+    }
+  } else {
+    size_t capacity = 32 * 1024 * 1024;  // 32 MiB
+    NAPI_STATUS_THROWS(GetProperty(env, argv[0], "capacity", capacity));
+    if (capacity == 0) {
+      napi_throw_range_error(env, nullptr, "cache capacity must be greater than zero");
+      return nullptr;
+    }
+    cache = RegisterCache(rocksdb::HyperClockCacheOptions(capacity, 0).MakeSharedCache());
+  }
 
   napi_value result;
-  NAPI_STATUS_THROWS(napi_create_external(env, cache, Finalize<std::shared_ptr<rocksdb::Cache>>, cache, &result));
+  NAPI_STATUS_THROWS(CreateResourceExternal(env, cache, kCacheReferenceTag, result));
 
   return result;
 }
@@ -2765,11 +3582,11 @@ NAPI_METHOD(cache_init) {
 NAPI_METHOD(cache_get_handle) {
   NAPI_ARGV(1);
 
-  std::shared_ptr<rocksdb::Cache>* cache;
-  NAPI_STATUS_THROWS(napi_get_value_external(env, argv[0], reinterpret_cast<void**>(&cache)));
+  std::shared_ptr<CacheResource> cache;
+  NAPI_STATUS_THROWS(GetResourceExternal(env, argv[0], kCacheReferenceTag, cache));
 
   napi_value result;
-  NAPI_STATUS_THROWS(napi_create_bigint_int64(env, reinterpret_cast<intptr_t>(cache), &result));
+  NAPI_STATUS_THROWS(napi_create_bigint_uint64(env, cache->handle, &result));
 
   return result;
 }
@@ -2779,6 +3596,10 @@ NAPI_METHOD(write_buffer_manager_init) {
 
   size_t bufferSize = 256 * 1024 * 1024;  // 256 MiB
   NAPI_STATUS_THROWS(GetProperty(env, argv[0], "bufferSize", bufferSize));
+  if (bufferSize == 0) {
+    napi_throw_range_error(env, nullptr, "write buffer size must be greater than zero");
+    return nullptr;
+  }
 
   bool allowStall = false;
   NAPI_STATUS_THROWS(GetProperty(env, argv[0], "allowStall", allowStall));
@@ -2792,32 +3613,23 @@ NAPI_METHOD(write_buffer_manager_init) {
     NAPI_STATUS_THROWS(napi_typeof(env, cacheValue, &cacheType));
 
     if (cacheType == napi_object || cacheType == napi_bigint) {
-      napi_value handleValue = cacheValue;
-      if (cacheType == napi_object) {
-        NAPI_STATUS_THROWS(napi_get_named_property(env, cacheValue, "handle", &handleValue));
-      }
-
-      bool lossless;
-      int64_t ptr;
-      NAPI_STATUS_THROWS(napi_get_value_bigint_int64(env, handleValue, &ptr, &lossless));
-      if (!lossless) {
+      std::shared_ptr<CacheResource> resource;
+      if (LookupResourceHandle(env, cacheValue, HandleRegistry<CacheResource>::Instance(), resource) != napi_ok) {
         napi_throw_error(env, nullptr, "invalid cache handle");
         return NULL;
       }
-
-      cache = *reinterpret_cast<std::shared_ptr<rocksdb::Cache>*>(ptr);
+      cache = resource->value;
     } else if (cacheType != napi_undefined && cacheType != napi_null) {
       napi_throw_error(env, nullptr, "invalid cache");
       return NULL;
     }
   }
 
-  auto wbm = new std::shared_ptr<rocksdb::WriteBufferManager>(
+  auto wbm = RegisterWriteBufferManager(
       std::make_shared<rocksdb::WriteBufferManager>(bufferSize, cache, allowStall));
 
   napi_value result;
-  NAPI_STATUS_THROWS(
-      napi_create_external(env, wbm, Finalize<std::shared_ptr<rocksdb::WriteBufferManager>>, wbm, &result));
+  NAPI_STATUS_THROWS(CreateResourceExternal(env, wbm, kWriteBufferManagerReferenceTag, result));
 
   return result;
 }
@@ -2825,11 +3637,11 @@ NAPI_METHOD(write_buffer_manager_init) {
 NAPI_METHOD(write_buffer_manager_get_handle) {
   NAPI_ARGV(1);
 
-  std::shared_ptr<rocksdb::WriteBufferManager>* wbm;
-  NAPI_STATUS_THROWS(napi_get_value_external(env, argv[0], reinterpret_cast<void**>(&wbm)));
+  std::shared_ptr<WriteBufferManagerResource> wbm;
+  NAPI_STATUS_THROWS(GetResourceExternal(env, argv[0], kWriteBufferManagerReferenceTag, wbm));
 
   napi_value result;
-  NAPI_STATUS_THROWS(napi_create_bigint_int64(env, reinterpret_cast<intptr_t>(wbm), &result));
+  NAPI_STATUS_THROWS(napi_create_bigint_uint64(env, wbm->handle, &result));
 
   return result;
 }
@@ -2837,23 +3649,23 @@ NAPI_METHOD(write_buffer_manager_get_handle) {
 NAPI_METHOD(write_buffer_manager_get_usage) {
   NAPI_ARGV(1);
 
-  std::shared_ptr<rocksdb::WriteBufferManager>* wbm;
-  NAPI_STATUS_THROWS(napi_get_value_external(env, argv[0], reinterpret_cast<void**>(&wbm)));
+  std::shared_ptr<WriteBufferManagerResource> wbm;
+  NAPI_STATUS_THROWS(GetResourceExternal(env, argv[0], kWriteBufferManagerReferenceTag, wbm));
 
   napi_value result;
   NAPI_STATUS_THROWS(napi_create_object(env, &result));
 
   napi_value memoryUsage;
-  NAPI_STATUS_THROWS(napi_create_double(env, static_cast<double>((*wbm)->memory_usage()), &memoryUsage));
+  NAPI_STATUS_THROWS(napi_create_double(env, static_cast<double>(wbm->value->memory_usage()), &memoryUsage));
   NAPI_STATUS_THROWS(napi_set_named_property(env, result, "memoryUsage", memoryUsage));
 
   napi_value mutableMemoryUsage;
   NAPI_STATUS_THROWS(
-      napi_create_double(env, static_cast<double>((*wbm)->mutable_memtable_memory_usage()), &mutableMemoryUsage));
+      napi_create_double(env, static_cast<double>(wbm->value->mutable_memtable_memory_usage()), &mutableMemoryUsage));
   NAPI_STATUS_THROWS(napi_set_named_property(env, result, "mutableMemoryUsage", mutableMemoryUsage));
 
   napi_value bufferSize;
-  NAPI_STATUS_THROWS(napi_create_double(env, static_cast<double>((*wbm)->buffer_size()), &bufferSize));
+  NAPI_STATUS_THROWS(napi_create_double(env, static_cast<double>(wbm->value->buffer_size()), &bufferSize));
   NAPI_STATUS_THROWS(napi_set_named_property(env, result, "bufferSize", bufferSize));
 
   return result;
@@ -2903,6 +3715,7 @@ NAPI_INIT() {
   NAPI_EXPORT_FUNCTION(db_get_handle);
   NAPI_EXPORT_FUNCTION(db_get_location);
   NAPI_EXPORT_FUNCTION(db_close);
+  NAPI_EXPORT_FUNCTION(db_dispose);
   NAPI_EXPORT_FUNCTION(db_get_many);
   NAPI_EXPORT_FUNCTION(db_get_many_sync);
   NAPI_EXPORT_FUNCTION(db_clear);

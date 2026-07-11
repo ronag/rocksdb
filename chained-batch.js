@@ -19,7 +19,7 @@ class ChainedBatch extends AbstractChainedBatch {
     super(db)
 
     this[kDbContext] = context
-    this[kBatchContext] = binding.batch_init()
+    this[kBatchContext] = binding.batch_init(context)
     this[kBusy] = false
   }
 
