@@ -103,10 +103,6 @@ class RocksLevel extends AbstractLevel {
   }
 
   _open (options, callback) {
-    if (options.statistics instanceof RocksStatistics) {
-      options = { ...options, statistics: getStatisticsContext(options.statistics) }
-    }
-
     const failOpen = (err) => {
       // db_init reserves imported handles immediately. Release that reservation
       // on every open failure, including synchronous option-validation errors
@@ -120,6 +116,10 @@ class RocksLevel extends AbstractLevel {
 
     const doOpen = () => {
       try {
+        if (options.statistics instanceof RocksStatistics) {
+          options = { ...options, statistics: getStatisticsContext(options.statistics) }
+        }
+
         binding.db_open(this[kContext], options, (err, columns) => {
           if (err) {
             failOpen(err)

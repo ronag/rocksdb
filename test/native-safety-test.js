@@ -3,7 +3,7 @@
 const test = require('tape')
 const tempy = require('tempy')
 const binding = require('../binding')
-const { RocksLevel, RocksCache, RocksWriteBufferManager } = require('..')
+const { RocksLevel, RocksCache, RocksWriteBufferManager, RocksStatistics } = require('..')
 
 function nativeOpen (context, options = { createIfMissing: true }) {
   return new Promise((resolve, reject) => {
@@ -66,6 +66,41 @@ test('an imported handle reserves the database until its wrapper opens', async f
 
   const reopened = await RocksLevel.open(location, { createIfMissing: false })
   t.equal(await reopened.get('key'), 'value', 'last imported close released the directory lock')
+  await reopened.close()
+  t.end()
+})
+
+test('an imported handle preserves its shared statistics resource', async function (t) {
+  const location = tempy.directory()
+  const statistics = new RocksStatistics({ enabled: true })
+  const first = await RocksLevel.open(location, { statistics })
+  const second = new RocksLevel(first.handle, { statistics })
+
+  await first.close()
+  const before = statistics.getStatistics().numberKeysWritten
+  await second.open()
+  await second.put('key', 'value')
+
+  const after = statistics.getStatistics().numberKeysWritten
+  t.ok(after > before, 'the imported wrapper contributes to the shared resource')
+  t.equal(second.getStatistics().numberKeysWritten, after, 'the imported wrapper exposes the shared snapshot')
+  await second.close()
+  t.end()
+})
+
+test('invalid statistics resources release imported handle reservations', async function (t) {
+  const location = tempy.directory()
+  const first = await RocksLevel.open(location)
+  const invalid = Object.create(RocksStatistics.prototype)
+  const second = new RocksLevel(first.handle, { statistics: invalid })
+
+  await first.close()
+  const err = await rejection(second.open())
+  t.equal(err && err.code, 'LEVEL_DATABASE_NOT_OPEN', 'invalid resource rejects the open')
+  t.equal(err && err.cause && err.cause.message, 'Invalid RocksStatistics resource', 'validation error is preserved')
+
+  const reopened = await RocksLevel.open(location, { createIfMissing: false })
+  t.pass('synchronous statistics validation did not retain the directory lock')
   await reopened.close()
   t.end()
 })
