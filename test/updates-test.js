@@ -118,3 +118,23 @@ make('updates since:0 returns all updates', async function (db, t, done) {
 
   done()
 })
+
+make('updates surfaces clear range tombstones', async function (db, t, done) {
+  const since = db.sequence + 1
+  await db.clear({ gte: 'one', lt: 'three' })
+
+  const updates = []
+  for await (const update of db.updates({
+    since,
+    keys: true,
+    values: false,
+    keyEncoding: 'buffer',
+    valueEncoding: 'utf8'
+  })) updates.push(update)
+  const rows = updates.flatMap((update) => update.rows)
+  const clear = rows.indexOf('clear')
+  t.ok(clear >= 0, 'range deletion is reported as clear')
+  t.same(rows[clear + 1], Buffer.from('one'), 'clear includes its exact lower key bound')
+  t.same(rows[clear + 2], Buffer.from('three'), 'clear includes its exact upper key bound despite values:false')
+  done()
+})

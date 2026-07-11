@@ -65,6 +65,7 @@ enum ResourceName {
   ResourceLeveldownBatchWrite,
   ResourceLeveldownUpdatesSince,
   ResourceLeveldownCompactRange,
+  ResourceLeveldownClear,
   ResourceNameCount
 };
 
@@ -570,7 +571,8 @@ static napi_status GetResourceName(napi_env env, ResourceName name, napi_value& 
   static constexpr const char* names[] = {
       "iterator.nextv",        "leveldown.open",         "leveldown.close",
       "leveldown.get_many",    "leveldown.flush_wal",    "leveldown.iterator_seek",
-      "leveldown.batch_write", "leveldown.updates_since", "leveldown.compact_range"};
+      "leveldown.batch_write", "leveldown.updates_since", "leveldown.compact_range",
+      "leveldown.clear"};
   static_assert(std::size(names) == ResourceNameCount);
   return napi_create_string_utf8(env, names[name], NAPI_AUTO_LENGTH, &result);
 }
@@ -816,7 +818,7 @@ static napi_status ValidateBatch(napi_env env,
   return napi_ok;
 }
 
-enum BatchOp { Empty, Put, Delete, Merge, Data };
+enum BatchOp { Empty, Put, Delete, Merge, Data, DeleteRange };
 
 struct BatchEntry {
   BatchOp op = BatchOp::Empty;
@@ -856,6 +858,9 @@ struct BatchIterator : public rocksdb::WriteBatch::Handler {
     napi_value dataStr;
     NAPI_STATUS_RETURN(napi_create_string_utf8(env, "data", NAPI_AUTO_LENGTH, &dataStr));
 
+    napi_value clearStr;
+    NAPI_STATUS_RETURN(napi_create_string_utf8(env, "clear", NAPI_AUTO_LENGTH, &clearStr));
+
     napi_value nullVal;
     NAPI_STATUS_RETURN(napi_get_null(env, &nullVal));
 
@@ -870,6 +875,8 @@ struct BatchIterator : public rocksdb::WriteBatch::Handler {
         op = mergeStr;
       } else if (cache_[n].op == BatchOp::Data) {
         op = dataStr;
+      } else if (cache_[n].op == BatchOp::DeleteRange) {
+        op = clearStr;
       } else {
         continue;
       }
@@ -881,7 +888,8 @@ struct BatchIterator : public rocksdb::WriteBatch::Handler {
       NAPI_STATUS_RETURN(napi_set_element(env, *result, n * 4 + 1, key));
 
       napi_value val;
-      NAPI_STATUS_RETURN(Convert(env, cache_[n].val, valueEncoding_, val));
+      NAPI_STATUS_RETURN(Convert(env, cache_[n].val,
+                                 cache_[n].op == BatchOp::DeleteRange ? keyEncoding_ : valueEncoding_, val));
       NAPI_STATUS_RETURN(napi_set_element(env, *result, n * 4 + 2, val));
 
       // TODO (fix)
@@ -959,6 +967,22 @@ struct BatchIterator : public rocksdb::WriteBatch::Handler {
 
     cache_.push_back(entry);
 
+    return rocksdb::Status::OK();
+  }
+
+  rocksdb::Status DeleteRangeCF(uint32_t column_family_id,
+                                const rocksdb::Slice& beginKey,
+                                const rocksdb::Slice& endKey) override {
+    if (columnId_ && *columnId_ != column_family_id) {
+      return rocksdb::Status::OK();
+    }
+
+    BatchEntry entry = {BatchOp::DeleteRange};
+    if (keys_) {
+      entry.key = beginKey.ToStringView();
+      entry.val = endKey.ToStringView();
+    }
+    cache_.push_back(std::move(entry));
     return rocksdb::Status::OK();
   }
 
@@ -2589,80 +2613,165 @@ NAPI_METHOD(db_get_many) {
   return 0;
 }
 
-// Synchronous compatibility implementation used by the lifetime-safety layer.
-// The following stack layer moves the same operation onto an async worker and
-// adds the DeleteRange fast path.
 NAPI_METHOD(db_clear) {
-  try {
-    NAPI_ARGV(2);
+  NAPI_ARGV(3);
 
-    Database* database;
-    std::shared_ptr<DatabaseReference> reference;
-    NAPI_STATUS_THROWS(GetDatabase(env, argv[0], database, &reference));
-    std::shared_ptr<DatabaseOperation> databaseOperation;
-    NAPI_STATUS_THROWS(BeginDatabaseOperation(env, database, reference, databaseOperation));
+  Database* database;
+  std::shared_ptr<DatabaseReference> reference;
+  NAPI_STATUS_THROWS(GetDatabase(env, argv[0], database, &reference));
+  std::shared_ptr<DatabaseOperation> databaseOperation;
+  NAPI_STATUS_THROWS(BeginDatabaseOperation(env, database, reference, databaseOperation));
 
-    const auto options = argv[1];
+  const auto options = argv[1];
 
-    bool reverse = false;
-    NAPI_STATUS_THROWS(GetProperty(env, options, "reverse", reverse));
+  bool reverse = false;
+  NAPI_STATUS_THROWS(GetProperty(env, options, "reverse", reverse));
 
-    int32_t limit = -1;
-    NAPI_STATUS_THROWS(GetProperty(env, options, "limit", limit));
-    if (limit < -1) {
-      napi_throw_range_error(env, nullptr, "limit must be -1 or non-negative");
-      return nullptr;
-    }
-
-    rocksdb::ColumnFamilyHandle* column = database->db->DefaultColumnFamily();
-    NAPI_STATUS_THROWS(GetColumnProperty(env, options, database, column));
-
-    std::optional<std::string> lt;
-    NAPI_STATUS_THROWS(GetProperty(env, options, "lt", lt));
-    std::optional<std::string> lte;
-    NAPI_STATUS_THROWS(GetProperty(env, options, "lte", lte));
-    std::optional<std::string> gt;
-    NAPI_STATUS_THROWS(GetProperty(env, options, "gt", gt));
-    std::optional<std::string> gte;
-    NAPI_STATUS_THROWS(GetProperty(env, options, "gte", gte));
-
-    rocksdb::WriteOptions writeOptions;
-    NAPI_STATUS_THROWS(GetProperty(env, options, "sync", writeOptions.sync));
-    NAPI_STATUS_THROWS(GetProperty(env, options, "lowPriority", writeOptions.low_pri));
-
-    BaseIterator iterator(database, reference, column, reverse, lt, lte, gt, gte, limit);
-    rocksdb::WriteBatch batch;
-    rocksdb::Status status;
-
-    while (true) {
-      size_t bytesRead = 0;
-      while (bytesRead <= 16 * 1024 && iterator.Valid() && iterator.Increment()) {
-        const auto key = iterator.CurrentKey();
-        batch.Delete(column, key);
-        bytesRead += key.size();
-        iterator.Next();
-      }
-
-      status = iterator.Status();
-      if (!status.ok() || bytesRead == 0) {
-        break;
-      }
-
-      status = database->db->Write(writeOptions, &batch);
-      if (!status.ok()) {
-        break;
-      }
-      batch.Clear();
-    }
-
-    const auto closeStatus = iterator.Close();
-    if (status.ok()) status = closeStatus;
-    ROCKS_STATUS_THROWS_NAPI(status);
-    return nullptr;
-  } catch (const std::exception& e) {
-    napi_throw_error(env, nullptr, e.what());
+  int32_t limit = -1;
+  NAPI_STATUS_THROWS(GetProperty(env, options, "limit", limit));
+  if (limit < -1) {
+    napi_throw_range_error(env, nullptr, "limit must be -1 or non-negative");
     return nullptr;
   }
+
+  rocksdb::ColumnFamilyHandle* column = database->db->DefaultColumnFamily();
+  NAPI_STATUS_THROWS(GetColumnProperty(env, options, database, column));
+
+  std::optional<std::string> lt;
+  NAPI_STATUS_THROWS(GetProperty(env, options, "lt", lt));
+
+  std::optional<std::string> lte;
+  NAPI_STATUS_THROWS(GetProperty(env, options, "lte", lte));
+
+  std::optional<std::string> gt;
+  NAPI_STATUS_THROWS(GetProperty(env, options, "gt", gt));
+
+  std::optional<std::string> gte;
+  NAPI_STATUS_THROWS(GetProperty(env, options, "gte", gte));
+
+  bool sync = false;
+  NAPI_STATUS_THROWS(GetProperty(env, options, "sync", sync));
+
+  bool lowPriority = false;
+  NAPI_STATUS_THROWS(GetProperty(env, options, "lowPriority", lowPriority));
+
+  const auto callback = argv[2];
+  napi_value resourceName;
+  NAPI_STATUS_THROWS(GetResourceName(env, ResourceLeveldownClear, resourceName));
+
+  NAPI_STATUS_THROWS(runAsyncKeepAlive(
+      resourceName, env, callback, argv[0],
+      [database, databaseOperation, column, reverse, limit, lt = std::move(lt), lte = std::move(lte),
+       gt = std::move(gt), gte = std::move(gte), sync, lowPriority](auto& state) {
+        const DatabaseOperationScope operationScope(databaseOperation);
+        if (limit == 0) {
+          return rocksdb::Status::OK();
+        }
+
+        rocksdb::WriteOptions writeOptions;
+        writeOptions.sync = sync;
+        writeOptions.low_pri = lowPriority;
+        const auto* comparator = column->GetComparator();
+
+        // An unlimited bytewise range can be represented by one range tombstone.
+        // For an unbounded upper end, derive a finite successor from the actual
+        // last key instead of guessing at a maximum key length.
+        if (limit == -1 && comparator == rocksdb::BytewiseComparator()) {
+          std::string begin;
+          if (gte) {
+            begin = *gte;
+          } else if (gt) {
+            begin = *gt;
+            begin.push_back('\0');
+          }
+
+          std::string end;
+          if (lte) {
+            end = *lte;
+            end.push_back('\0');
+          } else if (lt) {
+            end = *lt;
+          } else {
+            std::unique_ptr<rocksdb::Iterator> iterator(database->db->NewIterator({}, column));
+            iterator->SeekToLast();
+            ROCKS_STATUS_RETURN(iterator->status());
+            if (!iterator->Valid()) {
+              return rocksdb::Status::OK();
+            }
+            end = iterator->key().ToString();
+            end.push_back('\0');
+          }
+
+          if (rocksdb::Slice(begin).compare(end) < 0) {
+            return database->db->DeleteRange(writeOptions, column, begin, end);
+          }
+          return rocksdb::Status::OK();
+        }
+
+        // Limited clears and custom comparators cannot safely synthesize an
+        // exclusive successor. Delete concrete keys in bounded write batches.
+        std::unique_ptr<rocksdb::Iterator> iterator(database->db->NewIterator({}, column));
+        const auto equal = [comparator](const rocksdb::Slice& a, const std::string& b) {
+          return comparator->Compare(a, b) == 0;
+        };
+
+        if (reverse) {
+          if (lte) {
+            iterator->SeekForPrev(*lte);
+          } else if (lt) {
+            iterator->SeekForPrev(*lt);
+            if (iterator->Valid() && equal(iterator->key(), *lt)) {
+              iterator->Prev();
+            }
+          } else {
+            iterator->SeekToLast();
+          }
+        } else if (gte) {
+          iterator->Seek(*gte);
+        } else if (gt) {
+          iterator->Seek(*gt);
+          if (iterator->Valid() && equal(iterator->key(), *gt)) {
+            iterator->Next();
+          }
+        } else {
+          iterator->SeekToFirst();
+        }
+
+        const auto inRange = [&](const rocksdb::Slice& key) {
+          if (gte && comparator->Compare(key, *gte) < 0) return false;
+          if (gt && comparator->Compare(key, *gt) <= 0) return false;
+          if (lte && comparator->Compare(key, *lte) > 0) return false;
+          if (lt && comparator->Compare(key, *lt) >= 0) return false;
+          return true;
+        };
+
+        rocksdb::WriteBatch batch;
+        size_t batchBytes = 0;
+        int64_t deleted = 0;
+        while (iterator->Valid() && inRange(iterator->key()) && (limit < 0 || deleted < limit)) {
+          const auto key = iterator->key();
+          ROCKS_STATUS_RETURN(batch.Delete(column, key));
+          batchBytes += key.size();
+          ++deleted;
+
+          if (reverse) {
+            iterator->Prev();
+          } else {
+            iterator->Next();
+          }
+
+          if (batchBytes >= 16 * 1024) {
+            ROCKS_STATUS_RETURN(database->db->Write(writeOptions, &batch));
+            batch.Clear();
+            batchBytes = 0;
+          }
+        }
+
+        ROCKS_STATUS_RETURN(iterator->status());
+        return batch.Count() == 0 ? rocksdb::Status::OK() : database->db->Write(writeOptions, &batch);
+      }));
+
+  return nullptr;
 }
 
 NAPI_METHOD(db_get_property) {
