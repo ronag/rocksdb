@@ -36,7 +36,7 @@ make('async query matches sync HWM and limit semantics', async function (db, t, 
   t.equal(asyncResult.limited, true, 'high-water mark reports a limited result')
 
   const limited = await db.query({ gte: 'a', lte: 'd', limit: 2 })
-  t.equal(limited.rows.length, 4, 'limit returns two key/value rows')
+  t.equal(limited.rows.length, 4, 'limit returns two key/value pairs')
   t.equal(limited.finished, true, 'limit is terminal')
   t.equal(limited.limited, true, 'limit is reported separately from exhaustion')
   done()

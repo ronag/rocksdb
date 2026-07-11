@@ -124,17 +124,20 @@ test('chained batch length remains readable after write and close', async functi
   t.end()
 })
 
-test('public getMany rejects partial high-water-mark results', async function (t) {
-  const db = testCommon.factory()
+test('public getMany allows explicitly bounded partial results', async function (t) {
+  const db = testCommon.factory({ valueEncoding: 'utf8' })
   await db.open()
+  const value = 'x'.repeat(1024)
   await db.batch(Array.from({ length: 3 }, (_, i) => ({
     type: 'put',
     key: `key${i}`,
-    value: 'x'.repeat(1024)
+    value
   })))
 
-  const err = await rejection(db.getMany(['key0', 'key1', 'key2'], { highWaterMarkBytes: 100 }))
-  t.equal(err && err.code, 'LEVEL_ABORTED')
+  const rows = await db.getMany(['key0', 'key1', 'key2'], { highWaterMarkBytes: 0 })
+  t.equal(rows.length, 3, 'returns one slot per requested key')
+  t.ok(rows.includes(null), 'the explicit high-water mark can return partial results')
+  t.ok(rows.every((row) => row === null || row === value), 'each slot is a value or an explicit partial marker')
   await db.close()
   t.end()
 })

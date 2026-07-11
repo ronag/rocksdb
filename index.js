@@ -204,6 +204,9 @@ class RocksLevel extends AbstractLevel {
     }
 
     callback = fromCallback(callback, kPromise)
+    const allowPartial = options != null && (
+      options.timeout > 0 || options.highWaterMarkBytes != null
+    )
 
     try {
       this[kRef]()
@@ -211,7 +214,7 @@ class RocksLevel extends AbstractLevel {
         this[kUnref]()
         if (err) {
           callback(err)
-        } else if (val.includes(null)) {
+        } else if (!allowPartial && val.includes(null)) {
           callback(new ModuleError('Multi-get stopped before every value was read', {
             code: 'LEVEL_ABORTED'
           }))
