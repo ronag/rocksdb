@@ -282,6 +282,8 @@ test('GC cannot deadlock a raw native operation finalizer', function (t) {
       const clearing = new Promise((resolve, reject) => {
         binding.db_clear(context, { limit: 50000 }, (err) => err ? reject(err) : resolve())
       })
+      // Drop the caller's reference; runAsyncKeepAlive retains the context
+      // until the native operation completes.
       context = null
       for (let i = 0; i < 20; i++) {
         global.gc()
@@ -300,6 +302,6 @@ test('GC cannot deadlock a raw native operation finalizer', function (t) {
     timeout: 30000
   })
   t.equal(result.status, 0, result.error ? result.error.message : result.stderr)
-  t.match(result.stdout, /completed/, 'the operation completed after its JS context reference was dropped and GC ran')
+  t.match(result.stdout, /completed/, 'the operation completed after the caller dropped its context reference and forced GC')
   t.end()
 })
