@@ -2026,6 +2026,39 @@ NAPI_METHOD(db_get_statistics) {
   NAPI_STATUS_THROWS(setTicker("blockCacheBytesRead", rocksdb::BLOCK_CACHE_BYTES_READ));
   NAPI_STATUS_THROWS(setTicker("blockCacheBytesWrite", rocksdb::BLOCK_CACHE_BYTES_WRITE));
 
+  // Bloom/filter effectiveness.
+  NAPI_STATUS_THROWS(setTicker("bloomFilterUseful", rocksdb::BLOOM_FILTER_USEFUL));
+  NAPI_STATUS_THROWS(setTicker("bloomFilterFullPositive", rocksdb::BLOOM_FILTER_FULL_POSITIVE));
+  NAPI_STATUS_THROWS(
+      setTicker("bloomFilterFullTruePositive", rocksdb::BLOOM_FILTER_FULL_TRUE_POSITIVE));
+
+  // Where reads are served from: memtable vs the LSM levels.
+  NAPI_STATUS_THROWS(setTicker("memtableHit", rocksdb::MEMTABLE_HIT));
+  NAPI_STATUS_THROWS(setTicker("memtableMiss", rocksdb::MEMTABLE_MISS));
+  NAPI_STATUS_THROWS(setTicker("getHitL0", rocksdb::GET_HIT_L0));
+  NAPI_STATUS_THROWS(setTicker("getHitL1", rocksdb::GET_HIT_L1));
+  NAPI_STATUS_THROWS(setTicker("getHitL2AndUp", rocksdb::GET_HIT_L2_AND_UP));
+
+  // User-visible read/write volume.
+  NAPI_STATUS_THROWS(setTicker("bytesRead", rocksdb::BYTES_READ));
+  NAPI_STATUS_THROWS(setTicker("bytesWritten", rocksdb::BYTES_WRITTEN));
+  NAPI_STATUS_THROWS(setTicker("numberKeysRead", rocksdb::NUMBER_KEYS_READ));
+  NAPI_STATUS_THROWS(setTicker("numberKeysWritten", rocksdb::NUMBER_KEYS_WRITTEN));
+  NAPI_STATUS_THROWS(setTicker("numberDbSeek", rocksdb::NUMBER_DB_SEEK));
+  NAPI_STATUS_THROWS(setTicker("numberDbNext", rocksdb::NUMBER_DB_NEXT));
+
+  // Background write amplification: compaction + flush I/O.
+  NAPI_STATUS_THROWS(setTicker("compactReadBytes", rocksdb::COMPACT_READ_BYTES));
+  NAPI_STATUS_THROWS(setTicker("compactWriteBytes", rocksdb::COMPACT_WRITE_BYTES));
+  NAPI_STATUS_THROWS(setTicker("flushWriteBytes", rocksdb::FLUSH_WRITE_BYTES));
+
+  // WAL + write-stall pressure + compression.
+  NAPI_STATUS_THROWS(setTicker("walFileBytes", rocksdb::WAL_FILE_BYTES));
+  NAPI_STATUS_THROWS(setTicker("walFileSynced", rocksdb::WAL_FILE_SYNCED));
+  NAPI_STATUS_THROWS(setTicker("stallMicros", rocksdb::STALL_MICROS));
+  NAPI_STATUS_THROWS(setTicker("numberBlockCompressed", rocksdb::NUMBER_BLOCK_COMPRESSED));
+  NAPI_STATUS_THROWS(setTicker("numberBlockDecompressed", rocksdb::NUMBER_BLOCK_DECOMPRESSED));
+
   return result;
 }
 
