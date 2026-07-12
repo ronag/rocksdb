@@ -5,6 +5,7 @@ import { AbstractLevel } from 'abstract-level'
 
 import {
   RocksCache,
+  RocksBatchSlice,
   RocksColumn,
   RocksFormat,
   RocksGetManyOptions,
@@ -198,9 +199,12 @@ expectType<Promise<{
 }>>(valuesOnlyIterator._nextvAsync(10))
 
 const batch = db.batch()
+const batchParts: RocksBatchSlice = [Buffer.from('va'), slice, Buffer.from('ue')]
 batch._put(slice, Buffer.from('value'))
+batch._putParts([Buffer.from('k'), slice], batchParts)
 batch._del(slice)
 batch._merge(slice, slice)
+batch._mergeParts([slice], batchParts)
 batch._putLogData(slice)
 batch._writeSync({ sync: true })
 expectType<Array<string | Buffer | null>>(

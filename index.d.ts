@@ -35,6 +35,9 @@ export interface SliceLike {
 
 export type RocksFormat = string | Buffer | SliceLike
 export type RocksSlice = RocksFormat
+export type RocksSlicePart = Buffer | SliceLike
+export type RocksSliceParts = readonly RocksSlicePart[]
+export type RocksBatchSlice = RocksSlicePart | RocksSliceParts
 export type RocksNativeEncoding = 'buffer' | 'view' | 'utf8' | 'utf-8'
 export type RocksNativeValue = string | Buffer
 export type RocksDecoded<E extends RocksNativeEncoding> = E extends 'utf8' | 'utf-8' ? string : Buffer
@@ -440,9 +443,11 @@ export interface RocksChainedBatch<TDatabase, KDefault, VDefault>
   write (callback: NodeCallback<void>): void
   write (options: RocksChainedBatchWriteOptions, callback: NodeCallback<void>): void
   _put (key: RocksSlice, value: RocksSlice, options?: RocksColumnOperationOptions): void
+  _putParts (key: RocksBatchSlice, value: RocksBatchSlice, options?: RocksColumnOperationOptions): void
   _putLogData (blob: RocksSlice): void
   _del (key: RocksSlice, options?: RocksColumnOperationOptions): void
   _merge (key: RocksSlice, value: RocksSlice, options?: RocksColumnOperationOptions): void
+  _mergeParts (key: RocksBatchSlice, value: RocksBatchSlice, options?: RocksColumnOperationOptions): void
   _clear (): void
   _writeSync (options?: RocksChainedBatchWriteOptions): void
   _writeAsync (options?: RocksChainedBatchWriteOptions): Promise<void>

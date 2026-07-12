@@ -60,6 +60,25 @@ class ChainedBatch extends AbstractChainedBatch {
     binding.batch_put(this[kBatchContext], key, value, options ?? EMPTY)
   }
 
+  _putParts (key, value, options) {
+    assert(this[kBatchContext])
+    assert(!this[kBusy])
+
+    if (key === null || key === undefined) {
+      throw new ModuleError('Key cannot be null or undefined', {
+        code: 'LEVEL_INVALID_KEY'
+      })
+    }
+
+    if (value === null || value === undefined) {
+      throw new ModuleError('value cannot be null or undefined', {
+        code: 'LEVEL_INVALID_VALUE'
+      })
+    }
+
+    binding.batch_put_parts(this[kBatchContext], key, value, options ?? EMPTY)
+  }
+
   _putLogData (blob) {
     assert(this[kBatchContext])
     assert(!this[kBusy])
@@ -194,6 +213,25 @@ class ChainedBatch extends AbstractChainedBatch {
     value = typeof value === 'string' ? Buffer.from(value) : value
 
     binding.batch_merge(this[kBatchContext], key, value, options ?? EMPTY)
+  }
+
+  _mergeParts (key, value, options) {
+    assert(this[kBatchContext])
+    assert(!this[kBusy])
+
+    if (key === null || key === undefined) {
+      throw new ModuleError('Key cannot be null or undefined', {
+        code: 'LEVEL_INVALID_KEY'
+      })
+    }
+
+    if (value === null || value === undefined) {
+      throw new ModuleError('value cannot be null or undefined', {
+        code: 'LEVEL_INVALID_VALUE'
+      })
+    }
+
+    binding.batch_merge_parts(this[kBatchContext], key, value, options ?? EMPTY)
   }
 
   * [Symbol.iterator] () {
