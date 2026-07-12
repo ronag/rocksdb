@@ -12,6 +12,7 @@ const kBatchContext = Symbol('batchContext')
 const kDbContext = Symbol('dbContext')
 const kBusy = Symbol('busy')
 const kLength = Symbol('length')
+const kPendingClose = Symbol('pendingClose')
 
 const EMPTY = {}
 
@@ -23,6 +24,7 @@ class ChainedBatch extends AbstractChainedBatch {
     this[kBatchContext] = binding.batch_init(context)
     this[kBusy] = false
     this[kLength] = 0
+    this[kPendingClose] = null
   }
 
   [Symbol.asyncDispose] () {
@@ -116,14 +118,23 @@ class ChainedBatch extends AbstractChainedBatch {
     callback = fromCallback(callback, kPromise)
 
     this[kBusy] = true
-    try {
-      binding.batch_write(this[kDbContext], this[kBatchContext], options ?? EMPTY, (err) => {
-        this[kBusy] = false
-        callback(err)
-      })
-    } catch (err) {
+    const done = (err) => {
       this[kBusy] = false
-      process.nextTick(callback, err)
+      try {
+        callback(err)
+      } finally {
+        // Raw _writeAsync() calls bypass AbstractChainedBatch's `writing`
+        // state. A concurrent batch.close() or db.close() therefore reaches
+        // _close() while the native write is still in flight. Settle the write
+        // first, then release the native batch and its attached DB resource.
+        this._flushPendingClose()
+      }
+    }
+
+    try {
+      binding.batch_write(this[kDbContext], this[kBatchContext], options ?? EMPTY, done)
+    } catch (err) {
+      process.nextTick(done, err)
     }
 
     return callback[kPromise]
@@ -131,13 +142,26 @@ class ChainedBatch extends AbstractChainedBatch {
 
   _close (callback) {
     assert(this[kBatchContext])
-    assert(!this[kBusy])
+
+    if (this[kBusy]) {
+      assert(!this[kPendingClose])
+      this[kPendingClose] = callback
+      return
+    }
 
     try {
       this._closeSync()
       process.nextTick(callback, null)
     } catch (err) {
       process.nextTick(callback, err)
+    }
+  }
+
+  _flushPendingClose () {
+    if (!this[kBusy] && this[kPendingClose]) {
+      const callback = this[kPendingClose]
+      this[kPendingClose] = null
+      this._close(callback)
     }
   }
 
