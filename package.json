@@ -4,10 +4,12 @@
   "description": "A low-level Node.js RocksDB binding",
   "license": "MIT",
   "main": "index.js",
+  "types": "index.d.ts",
   "scripts": {
     "install": "node scripts/install.js",
     "build-deps": "node scripts/build-deps.js",
-    "test": "standard && (nyc -s tape test/*-test.js | faucet) && nyc report && npm run test-gc",
+    "test": "standard && npm run test:types && (nyc -s tape test/*-test.js | faucet) && nyc report && npm run test-gc",
+    "test:types": "tsc -p test/tsconfig.json",
     "test-gc": "node --expose-gc test/gc.js",
     "test-prebuild": "cross-env PREBUILDS_ONLY=1 npm t",
     "prebuildify": "node scripts/prebuildify.js",
@@ -22,6 +24,7 @@
     "node-gyp-build": "^4.8.2"
   },
   "devDependencies": {
+    "@types/node": "^26.1.1",
     "cross-env": "^10.1.0",
     "du": "^1.0.0",
     "faucet": "^0.0.4",
@@ -32,7 +35,8 @@
     "prebuildify": "^6.0.1",
     "standard": "^17.1.2",
     "tape": "^5.9.0",
-    "tempy": "^1.0.1"
+    "tempy": "^1.0.1",
+    "typescript": "^7.0.2"
   },
   "standard": {
     "ignore": [
