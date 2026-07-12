@@ -3199,6 +3199,81 @@ NAPI_METHOD(batch_put) {
   return 0;
 }
 
+// RocksDB copies SliceParts into the WriteBatch synchronously. Keep the common
+// record layout (a handful of header/body slices) on the stack so accepting
+// scatter/gather input does not replace one staging copy with a heap allocation.
+struct NapiSliceParts {
+  static constexpr size_t kInlineParts = 8;
+
+  std::array<rocksdb::Slice, kInlineParts> inlineParts;
+  std::vector<rocksdb::Slice> overflowParts;
+  rocksdb::Slice* parts = inlineParts.data();
+  int count = 0;
+
+  rocksdb::SliceParts value() const { return {parts, count}; }
+};
+
+static napi_status GetBatchSliceParts(napi_env env, napi_value value, NapiSliceParts& result) {
+  bool isArray = false;
+  NAPI_STATUS_RETURN(napi_is_array(env, value, &isArray));
+
+  if (!isArray) {
+    result.count = 1;
+    return GetValue(env, value, result.inlineParts[0]);
+  }
+
+  uint32_t count = 0;
+  NAPI_STATUS_RETURN(napi_get_array_length(env, value, &count));
+  if (count > static_cast<uint32_t>(std::numeric_limits<int>::max())) {
+    return napi_invalid_arg;
+  }
+
+  result.count = static_cast<int>(count);
+  if (count > NapiSliceParts::kInlineParts) {
+    result.overflowParts.resize(count);
+    result.parts = result.overflowParts.data();
+  }
+
+  for (uint32_t index = 0; index < count; ++index) {
+    napi_value part;
+    NAPI_STATUS_RETURN(napi_get_element(env, value, index, &part));
+    NAPI_STATUS_RETURN(GetValue(env, part, result.parts[index]));
+  }
+
+  return napi_ok;
+}
+
+NAPI_METHOD(batch_put_parts) {
+  NAPI_ARGV(4);
+
+  std::shared_ptr<NativeBatch> batch;
+  NAPI_STATUS_THROWS(GetBatch(env, argv[0], batch));
+  Database* database = batch->reference->database.get();
+  std::shared_ptr<DatabaseOperation> databaseOperation;
+  NAPI_STATUS_THROWS(BeginDatabaseOperation(env, database, batch->reference, databaseOperation));
+  NAPI_STATUS_THROWS(ValidateBatch(env, batch, batch->reference));
+
+  NapiSliceParts keyStorage;
+  NAPI_STATUS_THROWS(GetBatchSliceParts(env, argv[1], keyStorage));
+  const auto key = keyStorage.value();
+
+  NapiSliceParts valStorage;
+  NAPI_STATUS_THROWS(GetBatchSliceParts(env, argv[2], valStorage));
+  const auto val = valStorage.value();
+
+  rocksdb::ColumnFamilyHandle* column = nullptr;
+  NAPI_STATUS_THROWS(GetColumnProperty(env, argv[3], database, column, false));
+
+  std::lock_guard lock(batch->mutex);
+  if (column) {
+    ROCKS_STATUS_THROWS_NAPI(batch->batch.Put(column, key, val));
+  } else {
+    ROCKS_STATUS_THROWS_NAPI(batch->batch.Put(key, val));
+  }
+
+  return 0;
+}
+
 NAPI_METHOD(batch_put_log_data) {
   NAPI_ARGV(2);
 
@@ -3259,6 +3334,37 @@ NAPI_METHOD(batch_merge) {
 
   rocksdb::Slice val;
   NAPI_STATUS_THROWS(GetValue(env, argv[2], val));
+
+  rocksdb::ColumnFamilyHandle* column = nullptr;
+  NAPI_STATUS_THROWS(GetColumnProperty(env, argv[3], database, column, false));
+
+  std::lock_guard lock(batch->mutex);
+  if (column) {
+    ROCKS_STATUS_THROWS_NAPI(batch->batch.Merge(column, key, val));
+  } else {
+    ROCKS_STATUS_THROWS_NAPI(batch->batch.Merge(key, val));
+  }
+
+  return 0;
+}
+
+NAPI_METHOD(batch_merge_parts) {
+  NAPI_ARGV(4);
+
+  std::shared_ptr<NativeBatch> batch;
+  NAPI_STATUS_THROWS(GetBatch(env, argv[0], batch));
+  Database* database = batch->reference->database.get();
+  std::shared_ptr<DatabaseOperation> databaseOperation;
+  NAPI_STATUS_THROWS(BeginDatabaseOperation(env, database, batch->reference, databaseOperation));
+  NAPI_STATUS_THROWS(ValidateBatch(env, batch, batch->reference));
+
+  NapiSliceParts keyStorage;
+  NAPI_STATUS_THROWS(GetBatchSliceParts(env, argv[1], keyStorage));
+  const auto key = keyStorage.value();
+
+  NapiSliceParts valStorage;
+  NAPI_STATUS_THROWS(GetBatchSliceParts(env, argv[2], valStorage));
+  const auto val = valStorage.value();
 
   rocksdb::ColumnFamilyHandle* column = nullptr;
   NAPI_STATUS_THROWS(GetColumnProperty(env, argv[3], database, column, false));
@@ -3908,12 +4014,14 @@ NAPI_INIT() {
 
   NAPI_EXPORT_FUNCTION(batch_init);
   NAPI_EXPORT_FUNCTION(batch_put);
+  NAPI_EXPORT_FUNCTION(batch_put_parts);
   NAPI_EXPORT_FUNCTION(batch_put_log_data);
   NAPI_EXPORT_FUNCTION(batch_del);
   NAPI_EXPORT_FUNCTION(batch_clear);
   NAPI_EXPORT_FUNCTION(batch_write);
   NAPI_EXPORT_FUNCTION(batch_write_sync);
   NAPI_EXPORT_FUNCTION(batch_merge);
+  NAPI_EXPORT_FUNCTION(batch_merge_parts);
   NAPI_EXPORT_FUNCTION(batch_count);
   NAPI_EXPORT_FUNCTION(batch_iterate);
 
