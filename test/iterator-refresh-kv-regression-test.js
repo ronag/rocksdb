@@ -108,6 +108,7 @@ test('iterator with keys:false and values:false yields undefined pairs', async f
   const seekLimitedIterator = db.iterator({ keys: false, values: false, limit: 3 })
   t.same(await seekLimitedIterator.next(), [undefined, undefined], 'seek-limited next returns entry 1')
   t.same(await seekLimitedIterator.next(), [undefined, undefined], 'seek-limited next returns entry 2')
+  t.is(seekLimitedIterator.cached, 1, 'finite no-field next keeps prefetch enabled')
   seekLimitedIterator.seek('a')
   t.same(await seekLimitedIterator.all(), [[undefined, undefined]],
     'seek preserves the remaining finite-limit delivery')
@@ -209,6 +210,71 @@ test('iterator with keys:false and values:false yields undefined pairs', async f
   t.same(await deferredIterator.next(), [undefined, undefined],
     'deferred promise next returns a no-field entry after open')
   await deferredIterator.close()
+  await db.close()
+  t.end()
+})
+
+test('seek preserves the remaining finite iterator limit after prefetch', async function (t) {
+  const db = testCommon.factory()
+  await db.open()
+  await db.batch(Array.from({ length: 20 }, (_, i) => ({
+    type: 'put',
+    key: String(i).padStart(2, '0'),
+    value: 'value'
+  })))
+
+  const iterator = db.iterator({ limit: 10 })
+  t.same(await iterator.next(), ['00', 'value'], 'next returns entry 1')
+  t.same(await iterator.next(), ['01', 'value'], 'next returns entry 2')
+  t.is(iterator.cached, 8, 'second next prefetched the rest of the native limit')
+
+  iterator.seek('00')
+  const remaining = await iterator.all()
+  t.same(remaining, Array.from({ length: 8 }, (_, i) => [
+    String(i).padStart(2, '0'),
+    'value'
+  ]), 'seek returns every entry remaining under the public limit')
+  t.is(iterator.count, 10, 'iterator reaches its public limit after seek')
+
+  const rawSync = db.iterator({ limit: 3 })
+  t.is(rawSync._nextvSync(2).rows.length / 2, 2, 'raw sync read consumes two native rows')
+  rawSync._seekSync(Buffer.from('00'))
+  t.is(rawSync._nextvSync(10).rows.length / 2, 1,
+    'raw sync seek preserves the remaining native limit')
+  await rawSync.close()
+
+  const rawAsync = db.iterator({ limit: 3 })
+  t.is((await rawAsync._nextvAsync(2)).rows.length / 2, 2,
+    'raw async read consumes two native rows')
+  await rawAsync._seekAsync(Buffer.from('00'))
+  t.is((await rawAsync._nextvAsync(10)).rows.length / 2, 1,
+    'raw async seek preserves the remaining native limit')
+  await rawAsync.close()
+
+  const publicThenRaw = db.iterator({ limit: 3 })
+  await publicThenRaw.next()
+  await publicThenRaw.next()
+  t.is(publicThenRaw.cached, 1, 'public next has one undelivered prefetched row')
+  publicThenRaw._seekSync(Buffer.from('00'))
+  t.is(publicThenRaw._nextvSync(10).rows.length / 2, 1,
+    'raw seek credits the public row that its cache discarded')
+  await publicThenRaw.close()
+
+  const rawThenPublic = db.iterator({ limit: 3 })
+  t.is(rawThenPublic._nextvSync(1).rows.length / 2, 1, 'mixed raw read consumes one row')
+  rawThenPublic.seek('00')
+  t.is(rawThenPublic._nextvSync(10).rows.length / 2, 2,
+    'public seek preserves prior raw limit consumption')
+  await rawThenPublic.close()
+
+  const asyncMixed = db.iterator({ limit: 3 })
+  await asyncMixed.next()
+  await asyncMixed.next()
+  await asyncMixed._seekAsync(Buffer.from('00'))
+  t.is((await asyncMixed._nextvAsync(10)).rows.length / 2, 1,
+    'raw async seek credits only its discarded public cache row')
+  await asyncMixed.close()
+
   await db.close()
   t.end()
 })
