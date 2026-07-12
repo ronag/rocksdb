@@ -29,6 +29,12 @@ const slice: SliceLike = {
   byteOffset: 1,
   byteLength: 3
 }
+// @ts-expect-error SliceLike buffers are readonly
+slice.buffer = Buffer.alloc(0)
+// @ts-expect-error SliceLike offsets are readonly
+slice.byteOffset = 0
+// @ts-expect-error SliceLike lengths are readonly
+slice.byteLength = 0
 
 const db = new RocksLevel('/tmp/rocks-level-types')
 expectType<AbstractLevel<RocksFormat, string, string>>(db)
@@ -121,6 +127,11 @@ expectTrue<Equal<
   ReturnType<typeof publicValuesOnlyIterator[typeof Symbol.asyncIterator]>,
   AsyncGenerator<[undefined, string], void, unknown>
 >>()
+publicValuesOnlyIterator.next((err, key, value) => {
+  expectType<Error | null | undefined>(err)
+  expectType<undefined>(key)
+  expectType<string | undefined>(value)
+})
 
 const publicHexIterator = db.iterator({ valueEncoding: 'hex' })
 const publicHexRows = publicHexIterator._nextvAsync(10)
@@ -131,12 +142,17 @@ expectTrue<Equal<
 
 const publicNoFieldsIterator = db.iterator({ keys: false, values: false })
 const publicNoFieldsNext = publicNoFieldsIterator.next()
+const publicNoFieldsNextv = publicNoFieldsIterator.nextv(10)
 const publicNoFieldsAll = publicNoFieldsIterator.all()
 // @ts-expect-error Callback next cannot distinguish a no-field row from exhaustion
 publicNoFieldsIterator.next(() => {})
 expectTrue<Equal<
   Awaited<typeof publicNoFieldsNext>,
   [undefined, undefined] | undefined
+>>()
+expectTrue<Equal<
+  Awaited<typeof publicNoFieldsNextv>,
+  Array<[undefined, undefined]>
 >>()
 expectTrue<Equal<
   Awaited<typeof publicNoFieldsAll>,
@@ -171,8 +187,8 @@ expectType<Array<string | Buffer | null>>(
 expectType<Promise<void>>(batch[Symbol.asyncDispose]())
 for (const entry of batch) {
   expectType<'put' | 'del' | 'merge' | 'data'>(entry.type)
-  expectType<string | null | undefined>(entry.key)
-  expectType<string | null | undefined>(entry.value)
+  expectType<string | null>(entry.key)
+  expectType<string | null>(entry.value)
 }
 batch._clear()
 

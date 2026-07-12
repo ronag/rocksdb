@@ -393,8 +393,8 @@ export interface RocksChainedBatchWriteOptions extends AbstractChainedBatchWrite
 
 export interface RocksBatchEntry<K = Buffer | string, V = Buffer | string> {
   readonly type: 'put' | 'del' | 'merge' | 'data'
-  readonly key?: K | null
-  readonly value?: V | null
+  readonly key: K | null
+  readonly value: V | null
 }
 
 export interface RocksBatchToArrayOptions<
