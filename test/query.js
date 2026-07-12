@@ -20,7 +20,7 @@ make('querySync HWM', function (db, t, done) {
     })
     t.equal(rows.length, 2)
     t.equal(finished, false)
-    t.end()
+    done()
   })
 })
 
