@@ -575,14 +575,30 @@ class RocksLevel extends AbstractLevel {
       return callback[kPromise]
     }
 
-    this[kRef]()
+    let referenced = false
     try {
-      binding.db_flush_wal(this[kContext], options?.sync ?? false, (err, val) => {
+      let sync
+      if (typeof options === 'boolean') {
+        sync = options
+      } else {
+        if (typeof options !== 'object' || options === null || Array.isArray(options)) {
+          throw new TypeError('flushWAL options must be a boolean or object')
+        }
+
+        sync = options.sync ?? false
+        if (typeof sync !== 'boolean') {
+          throw new TypeError('flushWAL options.sync must be a boolean')
+        }
+      }
+
+      this[kRef]()
+      referenced = true
+      binding.db_flush_wal(this[kContext], sync, (err, val) => {
         this[kUnref]()
         callback(err, val)
       })
     } catch (err) {
-      this[kUnref]()
+      if (referenced) this[kUnref]()
       process.nextTick(callback, err)
     }
 

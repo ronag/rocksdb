@@ -182,21 +182,22 @@ class Iterator extends AbstractIterator {
             this[kBusy] = false
             this[kDB][kUnref]()
 
-            if (err) {
-              callback(err)
-            } else {
-              this[kCache] = result.rows
-              this[kFinished] = result.finished
-              this[kPosition] = 0
-              this._next(callback)
+            try {
+              if (err) {
+                callback(err)
+              } else {
+                this[kCache] = result.rows
+                this[kFinished] = result.finished
+                this[kPosition] = 0
+                this._next(callback)
+              }
+            } finally {
+              this._flushPendingClose()
             }
-
-            this._flushPendingClose()
           })
         } catch (err) {
-          this[kBusy] = false
           this[kDB][kUnref]()
-          process.nextTick(callback, err)
+          this._deferNextResult(callback, err)
         }
       } else {
         try {
@@ -416,20 +417,85 @@ class Iterator extends AbstractIterator {
           this[kBusy] = false
           this[kDB][kUnref]()
 
+          try {
+            if (err) {
+              callback(err)
+            } else {
+              this[kFinished] = result.finished
+              callback(null, result)
+            }
+          } finally {
+            this._flushPendingClose()
+          }
+        })
+      }
+    } catch (err) {
+      this[kDB][kUnref]()
+      this._deferNextResult(callback, err)
+    }
+
+    return callback[kPromise]
+  }
+
+  _deferNextResult (callback, err) {
+    process.nextTick(() => {
+      this[kBusy] = false
+      try {
+        callback(err)
+      } finally {
+        this._flushPendingClose()
+      }
+    })
+  }
+
+  _nextvPackedAsync (size, options, callback) {
+    assert(this[kContext])
+    assert(!this[kBusy])
+
+    callback = fromCallback(callback, kPromise)
+
+    if (this[kPosition] < this[kCache].length) {
+      process.nextTick(callback, new ModuleError(
+        'Cannot read packed rows while prefetched iterator rows remain',
+        { code: 'LEVEL_NOT_SUPPORTED' }
+      ))
+      return callback[kPromise]
+    }
+
+    if (this[kFinished]) {
+      process.nextTick(callback, null, {
+        buffer: Buffer.alloc(0),
+        offsets: new Uint32Array([0]),
+        count: 0,
+        finished: true,
+        limited: false
+      })
+      return callback[kPromise]
+    }
+
+    let referenced = false
+    try {
+      this[kDB][kRef]()
+      referenced = true
+      this[kBusy] = true
+      binding.iterator_nextv_packed(this[kContext], size, options, (err, result) => {
+        this[kBusy] = false
+        this[kDB][kUnref]()
+
+        try {
           if (err) {
             callback(err)
           } else {
             this[kFinished] = result.finished
             callback(null, result)
           }
-
+        } finally {
           this._flushPendingClose()
-        })
-      }
+        }
+      })
     } catch (err) {
-      this[kBusy] = false
-      this[kDB][kUnref]()
-      process.nextTick(callback, err)
+      if (referenced) this[kDB][kUnref]()
+      this._deferNextResult(callback, err)
     }
 
     return callback[kPromise]

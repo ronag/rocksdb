@@ -288,7 +288,7 @@ static napi_status GetValue(napi_env env, napi_value value, Encoding& result) {
   if (encoding == "buffer" || encoding == "view") {
     result = Encoding::Buffer;
     return napi_ok;
-  } else if (encoding == "utf8") {
+  } else if (encoding == "utf8" || encoding == "utf-8") {
     result = Encoding::String;
     return napi_ok;
   }

@@ -35,9 +35,12 @@ export interface SliceLike {
 
 export type RocksFormat = string | Buffer | SliceLike
 export type RocksSlice = RocksFormat
-export type RocksNativeEncoding = 'buffer' | 'view' | 'utf8'
+export type RocksSlicePart = Buffer | SliceLike
+export type RocksSliceParts = readonly RocksSlicePart[]
+export type RocksBatchSlice = RocksSlicePart | RocksSliceParts
+export type RocksNativeEncoding = 'buffer' | 'view' | 'utf8' | 'utf-8'
 export type RocksNativeValue = string | Buffer
-export type RocksDecoded<E extends RocksNativeEncoding> = E extends 'utf8' ? string : Buffer
+export type RocksDecoded<E extends RocksNativeEncoding> = E extends 'utf8' | 'utf-8' ? string : Buffer
 
 declare const columnHandleBrand: unique symbol
 declare const cacheHandleBrand: unique symbol
@@ -333,6 +336,19 @@ export interface RocksRawIteratorResult<
   readonly limited?: boolean
 }
 
+export interface RocksPackedIteratorResult {
+  /** Concatenated raw key/value bytes for this batch. */
+  readonly buffer: Buffer
+  /**
+   * Cumulative field boundaries, starting at zero. Fields are stored in
+   * key-then-value order according to the iterator's keys/values options.
+   */
+  readonly offsets: Uint32Array
+  readonly count: number
+  readonly finished: boolean
+  readonly limited: boolean
+}
+
 export interface RocksIteratorNative<
   KRaw,
   VRaw,
@@ -351,6 +367,12 @@ export interface RocksIteratorNative<
     size: number,
     options: { timeout?: number } | undefined,
     callback: NodeCallback<RocksRawIteratorResult<KRaw, VRaw, Keys, Values>>
+  ): void
+  _nextvPackedAsync (size: number, options?: { timeout?: number }): Promise<RocksPackedIteratorResult>
+  _nextvPackedAsync (
+    size: number,
+    options: { timeout?: number } | undefined,
+    callback: NodeCallback<RocksPackedIteratorResult>
   ): void
   _closeSync (): void
   _closeAsync (): Promise<void>
@@ -421,9 +443,11 @@ export interface RocksChainedBatch<TDatabase, KDefault, VDefault>
   write (callback: NodeCallback<void>): void
   write (options: RocksChainedBatchWriteOptions, callback: NodeCallback<void>): void
   _put (key: RocksSlice, value: RocksSlice, options?: RocksColumnOperationOptions): void
+  _putParts (key: RocksBatchSlice, value: RocksBatchSlice, options?: RocksColumnOperationOptions): void
   _putLogData (blob: RocksSlice): void
   _del (key: RocksSlice, options?: RocksColumnOperationOptions): void
   _merge (key: RocksSlice, value: RocksSlice, options?: RocksColumnOperationOptions): void
+  _mergeParts (key: RocksBatchSlice, value: RocksBatchSlice, options?: RocksColumnOperationOptions): void
   _clear (): void
   _writeSync (options?: RocksChainedBatchWriteOptions): void
   _writeAsync (options?: RocksChainedBatchWriteOptions): Promise<void>
@@ -504,7 +528,7 @@ export class RocksLevel<KDefault = string, VDefault = string>
   ): Promise<RocksLevel<KDefault, VDefault>>
 
   get sequence (): number
-  get columns (): Readonly<Record<string, RocksColumn>>
+  get columns (): Readonly<Record<string, RocksColumn | undefined>>
   get handle (): bigint
   get location (): string
   get identity (): string
@@ -694,8 +718,10 @@ export class RocksLevel<KDefault = string, VDefault = string>
   compactRange (options: RocksCompactRangeOptions, callback: NodeCallback<void>): void
 
   flushWAL (): Promise<void>
+  flushWAL (sync: boolean): Promise<void>
   flushWAL (options: RocksFlushWALOptions): Promise<void>
   flushWAL (callback: NodeCallback<void>): void
+  flushWAL (sync: boolean, callback: NodeCallback<void>): void
   flushWAL (options: RocksFlushWALOptions, callback: NodeCallback<void>): void
 
   [Symbol.asyncDispose] (): Promise<void>

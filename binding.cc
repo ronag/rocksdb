@@ -23,10 +23,12 @@
 #include <re2/re2.h>
 
 #include <algorithm>
+#include <array>
 #include <atomic>
 #include <cmath>
 #include <condition_variable>
 #include <iostream>
+#include <limits>
 #include <map>
 #include <memory>
 #include <mutex>
@@ -1397,10 +1399,12 @@ class Iterator final : public BaseIterator, public std::enable_shared_from_this<
                                       keyEncoding, valueEncoding, unsafe, readOptions);
   }
 
-  napi_value nextv(napi_env env, uint32_t count, uint32_t timeout, napi_value callback) {
+  napi_value nextv(napi_env env, uint32_t count, uint32_t timeout, napi_value callback, const bool packed = false) {
     struct State {
       std::vector<rocksdb::PinnableSlice> keys;
       std::vector<rocksdb::PinnableSlice> values;
+      rocksdb::PinnableSlice packedData;
+      std::vector<uint32_t> offsets;
       size_t count = 0;
       size_t bytes = 0;
       bool finished = false;
@@ -1416,7 +1420,7 @@ class Iterator final : public BaseIterator, public std::enable_shared_from_this<
 
     NAPI_STATUS_THROWS(runAsync<State>(
         resourceName, env, callback,
-        [self, this, count, timeout, databaseOperation](auto& state) {
+        [self, this, count, timeout, databaseOperation, packed](auto& state) {
           const DatabaseOperationScope operationScope(databaseOperation);
           std::lock_guard operationLock(operationMutex_);
           if (closed.load()) {
@@ -1426,8 +1430,15 @@ class Iterator final : public BaseIterator, public std::enable_shared_from_this<
           // Query uses UINT32_MAX as its "all rows" sentinel. Reserving that
           // value would attempt a huge allocation before reading anything.
           const auto initialCapacity = std::min<size_t>(count, 4096);
-          state.keys.reserve(initialCapacity);
-          state.values.reserve(initialCapacity);
+          if (packed) {
+            const auto fieldsPerRow = static_cast<size_t>(keys_) + static_cast<size_t>(values_);
+            state.offsets.reserve(initialCapacity * fieldsPerRow + 1);
+            state.offsets.push_back(0);
+            state.packedData.GetSelf()->reserve(std::min<size_t>(highWaterMarkBytes_, initialCapacity * 128));
+          } else {
+            state.keys.reserve(initialCapacity);
+            state.values.reserve(initialCapacity);
+          }
 
           const auto deadline =
               timeout ? database_->db->GetEnv()->NowMicros() + static_cast<uint64_t>(timeout) * 1000 : 0;
@@ -1480,7 +1491,25 @@ class Iterator final : public BaseIterator, public std::enable_shared_from_this<
               break;
             }
 
-            if (keys_ && values_) {
+            if (packed) {
+              const auto append = [&](const rocksdb::Slice& value) {
+                auto* data = state.packedData.GetSelf();
+                if (value.size() > std::numeric_limits<uint32_t>::max() - data->size()) {
+                  return rocksdb::Status::InvalidArgument("Packed iterator result exceeds 4 GiB");
+                }
+                data->append(value.data(), value.size());
+                state.bytes += value.size();
+                state.offsets.push_back(static_cast<uint32_t>(data->size()));
+                return rocksdb::Status::OK();
+              };
+
+              if (keys_) {
+                ROCKS_STATUS_RETURN(append(CurrentKey()));
+              }
+              if (values_) {
+                ROCKS_STATUS_RETURN(append(CurrentValue()));
+              }
+            } else if (keys_ && values_) {
               rocksdb::PinnableSlice k;
               k.PinSelf(CurrentKey());
               state.bytes += k.size();
@@ -1508,12 +1537,44 @@ class Iterator final : public BaseIterator, public std::enable_shared_from_this<
 
           return rocksdb::Status::OK();
         },
-        [self, this](auto& state, napi_env env, napi_value* result) {
+        [self, this, packed](auto& state, napi_env env, napi_value* result) {
           napi_value finished;
           NAPI_STATUS_RETURN(napi_get_boolean(env, state.finished, &finished));
 
           napi_value limited;
           NAPI_STATUS_RETURN(napi_get_boolean(env, state.limited, &limited));
+
+          if (packed) {
+            state.packedData.PinSelf();
+
+            napi_value buffer;
+            // The packed data owns its storage independently of RocksDB. For a
+            // non-trivial batch, transfer that storage to the Buffer finalizer
+            // instead of copying the whole arena a second time.
+            NAPI_STATUS_RETURN(Convert(env, std::move(state.packedData), Encoding::Buffer, buffer, true));
+
+            void* offsetsData = nullptr;
+            napi_value offsetsBuffer;
+            NAPI_STATUS_RETURN(
+                napi_create_arraybuffer(env, state.offsets.size() * sizeof(uint32_t), &offsetsData, &offsetsBuffer));
+            std::copy(state.offsets.begin(), state.offsets.end(), static_cast<uint32_t*>(offsetsData));
+
+            napi_value offsets;
+            NAPI_STATUS_RETURN(
+                napi_create_typedarray(env, napi_uint32_array, state.offsets.size(), offsetsBuffer, 0, &offsets));
+
+            napi_value count;
+            NAPI_STATUS_RETURN(napi_create_uint32(env, static_cast<uint32_t>(state.count), &count));
+
+            NAPI_STATUS_RETURN(napi_create_object(env, result));
+            NAPI_STATUS_RETURN(napi_set_named_property(env, *result, "buffer", buffer));
+            NAPI_STATUS_RETURN(napi_set_named_property(env, *result, "offsets", offsets));
+            NAPI_STATUS_RETURN(napi_set_named_property(env, *result, "count", count));
+            NAPI_STATUS_RETURN(napi_set_named_property(env, *result, "finished", finished));
+            NAPI_STATUS_RETURN(napi_set_named_property(env, *result, "limited", limited));
+
+            return napi_ok;
+          }
 
           napi_value rows;
           NAPI_STATUS_RETURN(napi_create_array(env, &rows));
@@ -3129,6 +3190,26 @@ NAPI_METHOD(iterator_nextv) {
   }
 }
 
+NAPI_METHOD(iterator_nextv_packed) {
+  NAPI_ARGV(4);
+
+  try {
+    std::shared_ptr<Iterator> iterator;
+    NAPI_STATUS_THROWS(GetResourceExternal(env, argv[0], kIteratorReferenceTag, iterator));
+
+    uint32_t count = 1024;
+    NAPI_STATUS_THROWS(GetValue(env, argv[1], count));
+
+    uint32_t timeout = 0;
+    NAPI_STATUS_THROWS(GetProperty(env, argv[2], "timeout", timeout));
+
+    return iterator->nextv(env, count, timeout, argv[3], true);
+  } catch (const std::exception& e) {
+    napi_throw_error(env, nullptr, e.what());
+    return nullptr;
+  }
+}
+
 NAPI_METHOD(iterator_nextv_sync) {
   NAPI_ARGV(3);
 
@@ -3181,6 +3262,81 @@ NAPI_METHOD(batch_put) {
 
   rocksdb::Slice val;
   NAPI_STATUS_THROWS(GetValue(env, argv[2], val));
+
+  rocksdb::ColumnFamilyHandle* column = nullptr;
+  NAPI_STATUS_THROWS(GetColumnProperty(env, argv[3], database, column, false));
+
+  std::lock_guard lock(batch->mutex);
+  if (column) {
+    ROCKS_STATUS_THROWS_NAPI(batch->batch.Put(column, key, val));
+  } else {
+    ROCKS_STATUS_THROWS_NAPI(batch->batch.Put(key, val));
+  }
+
+  return 0;
+}
+
+// RocksDB copies SliceParts into the WriteBatch synchronously. Keep the common
+// record layout (a handful of header/body slices) on the stack so accepting
+// scatter/gather input does not replace one staging copy with a heap allocation.
+struct NapiSliceParts {
+  static constexpr size_t kInlineParts = 8;
+
+  std::array<rocksdb::Slice, kInlineParts> inlineParts;
+  std::vector<rocksdb::Slice> overflowParts;
+  rocksdb::Slice* parts = inlineParts.data();
+  int count = 0;
+
+  rocksdb::SliceParts value() const { return {parts, count}; }
+};
+
+static napi_status GetBatchSliceParts(napi_env env, napi_value value, NapiSliceParts& result) {
+  bool isArray = false;
+  NAPI_STATUS_RETURN(napi_is_array(env, value, &isArray));
+
+  if (!isArray) {
+    result.count = 1;
+    return GetValue(env, value, result.inlineParts[0]);
+  }
+
+  uint32_t count = 0;
+  NAPI_STATUS_RETURN(napi_get_array_length(env, value, &count));
+  if (count > static_cast<uint32_t>(std::numeric_limits<int>::max())) {
+    return napi_invalid_arg;
+  }
+
+  result.count = static_cast<int>(count);
+  if (count > NapiSliceParts::kInlineParts) {
+    result.overflowParts.resize(count);
+    result.parts = result.overflowParts.data();
+  }
+
+  for (uint32_t index = 0; index < count; ++index) {
+    napi_value part;
+    NAPI_STATUS_RETURN(napi_get_element(env, value, index, &part));
+    NAPI_STATUS_RETURN(GetValue(env, part, result.parts[index]));
+  }
+
+  return napi_ok;
+}
+
+NAPI_METHOD(batch_put_parts) {
+  NAPI_ARGV(4);
+
+  std::shared_ptr<NativeBatch> batch;
+  NAPI_STATUS_THROWS(GetBatch(env, argv[0], batch));
+  Database* database = batch->reference->database.get();
+  std::shared_ptr<DatabaseOperation> databaseOperation;
+  NAPI_STATUS_THROWS(BeginDatabaseOperation(env, database, batch->reference, databaseOperation));
+  NAPI_STATUS_THROWS(ValidateBatch(env, batch, batch->reference));
+
+  NapiSliceParts keyStorage;
+  NAPI_STATUS_THROWS(GetBatchSliceParts(env, argv[1], keyStorage));
+  const auto key = keyStorage.value();
+
+  NapiSliceParts valStorage;
+  NAPI_STATUS_THROWS(GetBatchSliceParts(env, argv[2], valStorage));
+  const auto val = valStorage.value();
 
   rocksdb::ColumnFamilyHandle* column = nullptr;
   NAPI_STATUS_THROWS(GetColumnProperty(env, argv[3], database, column, false));
@@ -3255,6 +3411,37 @@ NAPI_METHOD(batch_merge) {
 
   rocksdb::Slice val;
   NAPI_STATUS_THROWS(GetValue(env, argv[2], val));
+
+  rocksdb::ColumnFamilyHandle* column = nullptr;
+  NAPI_STATUS_THROWS(GetColumnProperty(env, argv[3], database, column, false));
+
+  std::lock_guard lock(batch->mutex);
+  if (column) {
+    ROCKS_STATUS_THROWS_NAPI(batch->batch.Merge(column, key, val));
+  } else {
+    ROCKS_STATUS_THROWS_NAPI(batch->batch.Merge(key, val));
+  }
+
+  return 0;
+}
+
+NAPI_METHOD(batch_merge_parts) {
+  NAPI_ARGV(4);
+
+  std::shared_ptr<NativeBatch> batch;
+  NAPI_STATUS_THROWS(GetBatch(env, argv[0], batch));
+  Database* database = batch->reference->database.get();
+  std::shared_ptr<DatabaseOperation> databaseOperation;
+  NAPI_STATUS_THROWS(BeginDatabaseOperation(env, database, batch->reference, databaseOperation));
+  NAPI_STATUS_THROWS(ValidateBatch(env, batch, batch->reference));
+
+  NapiSliceParts keyStorage;
+  NAPI_STATUS_THROWS(GetBatchSliceParts(env, argv[1], keyStorage));
+  const auto key = keyStorage.value();
+
+  NapiSliceParts valStorage;
+  NAPI_STATUS_THROWS(GetBatchSliceParts(env, argv[2], valStorage));
+  const auto val = valStorage.value();
 
   rocksdb::ColumnFamilyHandle* column = nullptr;
   NAPI_STATUS_THROWS(GetColumnProperty(env, argv[3], database, column, false));
@@ -3896,6 +4083,7 @@ NAPI_INIT() {
   NAPI_EXPORT_FUNCTION(iterator_seek_sync);
   NAPI_EXPORT_FUNCTION(iterator_close_sync);
   NAPI_EXPORT_FUNCTION(iterator_nextv);
+  NAPI_EXPORT_FUNCTION(iterator_nextv_packed);
   NAPI_EXPORT_FUNCTION(iterator_nextv_sync);
 
   NAPI_EXPORT_FUNCTION(updates_init);
@@ -3904,12 +4092,14 @@ NAPI_INIT() {
 
   NAPI_EXPORT_FUNCTION(batch_init);
   NAPI_EXPORT_FUNCTION(batch_put);
+  NAPI_EXPORT_FUNCTION(batch_put_parts);
   NAPI_EXPORT_FUNCTION(batch_put_log_data);
   NAPI_EXPORT_FUNCTION(batch_del);
   NAPI_EXPORT_FUNCTION(batch_clear);
   NAPI_EXPORT_FUNCTION(batch_write);
   NAPI_EXPORT_FUNCTION(batch_write_sync);
   NAPI_EXPORT_FUNCTION(batch_merge);
+  NAPI_EXPORT_FUNCTION(batch_merge_parts);
   NAPI_EXPORT_FUNCTION(batch_count);
   NAPI_EXPORT_FUNCTION(batch_iterate);
 

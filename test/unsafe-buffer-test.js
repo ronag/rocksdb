@@ -78,6 +78,30 @@ test('unsafe iterator nextv returns correct values', async function (t) {
   t.end()
 })
 
+test('packed iterator arena survives iterator close and forced GC', async function (t) {
+  const db = testCommon.factory({ keyEncoding: 'buffer', valueEncoding: 'buffer' })
+  await db.open()
+
+  const expected = Buffer.alloc(128 * 1024, 0x7a)
+  await db.put(Buffer.from('packed'), expected)
+
+  const iterator = db._iterator({ keyEncoding: 'buffer', valueEncoding: 'buffer' })
+  const result = await iterator._nextvPackedAsync(10)
+  await iterator.close()
+  await db.close()
+
+  if (global.gc) {
+    for (let index = 0; index < 4; index++) global.gc()
+  }
+
+  const valueStart = result.offsets[1]
+  const valueEnd = result.offsets[2]
+  t.equal(result.count, 1, 'retained one packed row')
+  t.ok(result.buffer.subarray(valueStart, valueEnd).equals(expected),
+    'external packed arena remains valid after close and GC')
+  t.end()
+})
+
 test('async getMany snapshots key buffers through forced GC', async function (t) {
   if (!global.gc) {
     t.pass('forced-GC variant runs through test/gc.js')
