@@ -2593,71 +2593,76 @@ NAPI_METHOD(db_get_many) {
 // The following stack layer moves the same operation onto an async worker and
 // adds the DeleteRange fast path.
 NAPI_METHOD(db_clear) {
-  NAPI_ARGV(2);
+  try {
+    NAPI_ARGV(2);
 
-  Database* database;
-  std::shared_ptr<DatabaseReference> reference;
-  NAPI_STATUS_THROWS(GetDatabase(env, argv[0], database, &reference));
-  std::shared_ptr<DatabaseOperation> databaseOperation;
-  NAPI_STATUS_THROWS(BeginDatabaseOperation(env, database, reference, databaseOperation));
+    Database* database;
+    std::shared_ptr<DatabaseReference> reference;
+    NAPI_STATUS_THROWS(GetDatabase(env, argv[0], database, &reference));
+    std::shared_ptr<DatabaseOperation> databaseOperation;
+    NAPI_STATUS_THROWS(BeginDatabaseOperation(env, database, reference, databaseOperation));
 
-  const auto options = argv[1];
+    const auto options = argv[1];
 
-  bool reverse = false;
-  NAPI_STATUS_THROWS(GetProperty(env, options, "reverse", reverse));
+    bool reverse = false;
+    NAPI_STATUS_THROWS(GetProperty(env, options, "reverse", reverse));
 
-  int32_t limit = -1;
-  NAPI_STATUS_THROWS(GetProperty(env, options, "limit", limit));
-  if (limit < -1) {
-    napi_throw_range_error(env, nullptr, "limit must be -1 or non-negative");
+    int32_t limit = -1;
+    NAPI_STATUS_THROWS(GetProperty(env, options, "limit", limit));
+    if (limit < -1) {
+      napi_throw_range_error(env, nullptr, "limit must be -1 or non-negative");
+      return nullptr;
+    }
+
+    rocksdb::ColumnFamilyHandle* column = database->db->DefaultColumnFamily();
+    NAPI_STATUS_THROWS(GetColumnProperty(env, options, database, column));
+
+    std::optional<std::string> lt;
+    NAPI_STATUS_THROWS(GetProperty(env, options, "lt", lt));
+    std::optional<std::string> lte;
+    NAPI_STATUS_THROWS(GetProperty(env, options, "lte", lte));
+    std::optional<std::string> gt;
+    NAPI_STATUS_THROWS(GetProperty(env, options, "gt", gt));
+    std::optional<std::string> gte;
+    NAPI_STATUS_THROWS(GetProperty(env, options, "gte", gte));
+
+    rocksdb::WriteOptions writeOptions;
+    NAPI_STATUS_THROWS(GetProperty(env, options, "sync", writeOptions.sync));
+    NAPI_STATUS_THROWS(GetProperty(env, options, "lowPriority", writeOptions.low_pri));
+
+    BaseIterator iterator(database, reference, column, reverse, lt, lte, gt, gte, limit);
+    rocksdb::WriteBatch batch;
+    rocksdb::Status status;
+
+    while (true) {
+      size_t bytesRead = 0;
+      while (bytesRead <= 16 * 1024 && iterator.Valid() && iterator.Increment()) {
+        const auto key = iterator.CurrentKey();
+        batch.Delete(column, key);
+        bytesRead += key.size();
+        iterator.Next();
+      }
+
+      status = iterator.Status();
+      if (!status.ok() || bytesRead == 0) {
+        break;
+      }
+
+      status = database->db->Write(writeOptions, &batch);
+      if (!status.ok()) {
+        break;
+      }
+      batch.Clear();
+    }
+
+    const auto closeStatus = iterator.Close();
+    if (status.ok()) status = closeStatus;
+    ROCKS_STATUS_THROWS_NAPI(status);
+    return nullptr;
+  } catch (const std::exception& e) {
+    napi_throw_error(env, nullptr, e.what());
     return nullptr;
   }
-
-  rocksdb::ColumnFamilyHandle* column = database->db->DefaultColumnFamily();
-  NAPI_STATUS_THROWS(GetColumnProperty(env, options, database, column));
-
-  std::optional<std::string> lt;
-  NAPI_STATUS_THROWS(GetProperty(env, options, "lt", lt));
-  std::optional<std::string> lte;
-  NAPI_STATUS_THROWS(GetProperty(env, options, "lte", lte));
-  std::optional<std::string> gt;
-  NAPI_STATUS_THROWS(GetProperty(env, options, "gt", gt));
-  std::optional<std::string> gte;
-  NAPI_STATUS_THROWS(GetProperty(env, options, "gte", gte));
-
-  rocksdb::WriteOptions writeOptions;
-  NAPI_STATUS_THROWS(GetProperty(env, options, "sync", writeOptions.sync));
-  NAPI_STATUS_THROWS(GetProperty(env, options, "lowPriority", writeOptions.low_pri));
-
-  BaseIterator iterator(database, reference, column, reverse, lt, lte, gt, gte, limit);
-  rocksdb::WriteBatch batch;
-  rocksdb::Status status;
-
-  while (true) {
-    size_t bytesRead = 0;
-    while (bytesRead <= 16 * 1024 && iterator.Valid() && iterator.Increment()) {
-      const auto key = iterator.CurrentKey();
-      batch.Delete(column, key);
-      bytesRead += key.size();
-      iterator.Next();
-    }
-
-    status = iterator.Status();
-    if (!status.ok() || bytesRead == 0) {
-      break;
-    }
-
-    status = database->db->Write(writeOptions, &batch);
-    if (!status.ok()) {
-      break;
-    }
-    batch.Clear();
-  }
-
-  const auto closeStatus = iterator.Close();
-  if (status.ok()) status = closeStatus;
-  ROCKS_STATUS_THROWS_NAPI(status);
-  return nullptr;
 }
 
 NAPI_METHOD(db_get_property) {
