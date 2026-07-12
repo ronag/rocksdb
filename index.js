@@ -17,6 +17,8 @@ const kColumns = Symbol('columns')
 const kPromise = Symbol('promise')
 const kRefs = Symbol('refs')
 const kPendingClose = Symbol('pendingClose')
+const kDeferPartialResults = Symbol('deferPartialResults')
+const partialResults = new WeakMap()
 
 const { kRef, kUnref } = require('./util')
 
@@ -173,7 +175,15 @@ class RocksLevel extends AbstractLevel {
   }
 
   _put (key, value, options, callback) {
-    return this._batch([{ ...options, type: 'put', key, value }], options ?? kEmpty, callback)
+    callback = fromCallback(callback, kPromise)
+
+    try {
+      this._batch([{ ...options, type: 'put', key, value }], options ?? kEmpty, callback)
+    } catch (err) {
+      process.nextTick(callback, err)
+    }
+
+    return callback[kPromise]
   }
 
   _get (key, options, callback) {
@@ -182,6 +192,10 @@ class RocksLevel extends AbstractLevel {
     this._getMany([key], options ?? kEmpty, (err, val) => {
       if (err) {
         callback(err)
+      } else if (val[0] === null) {
+        callback(new ModuleError('Multi-get stopped before the value was read', {
+          code: 'LEVEL_ABORTED'
+        }))
       } else if (val[0] === undefined) {
         callback(Object.assign(new Error('not found'), {
           code: 'LEVEL_NOT_FOUND'
@@ -189,45 +203,85 @@ class RocksLevel extends AbstractLevel {
       } else {
         callback(null, val[0])
       }
-    })
+    }, false)
 
     return callback[kPromise]
   }
 
-  _getMany (keys, options, callback) {
-    return this._getManyAsync(keys, options, callback)
+  _getMany (keys, options, callback, allowPartial) {
+    return this._getManyAsync(keys, options, callback, allowPartial)
   }
 
-  _getManyAsync (keys, options, callback) {
+  _getManyAsync (keys, options, callback, allowPartial) {
     if (keys.some(key => typeof key === 'string')) {
       keys = keys.map(key => typeof key === 'string' ? Buffer.from(key) : key)
     }
 
     callback = fromCallback(callback, kPromise)
-    const allowPartial = options != null && (
-      options.timeout > 0 || options.highWaterMarkBytes != null
-    )
+    let referenced = false
 
     try {
+      allowPartial ??= options != null && (
+        options.timeout > 0 || options.highWaterMarkBytes != null
+      )
       this[kRef]()
+      referenced = true
       binding.db_get_many(this[kContext], keys, options ?? kEmpty, (err, val) => {
         this[kUnref]()
         if (err) {
           callback(err)
-        } else if (!allowPartial && val.includes(null)) {
-          callback(new ModuleError('Multi-get stopped before every value was read', {
-            code: 'LEVEL_ABORTED'
-          }))
+        } else if (val.includes(null)) {
+          if (!allowPartial) {
+            callback(new ModuleError('Multi-get stopped before every value was read', {
+              code: 'LEVEL_ABORTED'
+            }))
+          } else {
+            const indexes = []
+            for (let i = 0; i < val.length; i++) {
+              if (val[i] === null) {
+                indexes.push(i)
+                val[i] = undefined
+              }
+            }
+            partialResults.set(val, indexes)
+            callback(null, val)
+          }
         } else {
           callback(null, val)
         }
       })
     } catch (err) {
-      this[kUnref]()
+      if (referenced) this[kUnref]()
       process.nextTick(callback, err)
     }
 
     return callback[kPromise]
+  }
+
+  getMany (keys, options, callback) {
+    if (typeof options === 'function') {
+      callback = options
+      options = undefined
+    }
+    callback = fromCallback(callback, kPromise)
+    const deferPartialResults = options != null && options[kDeferPartialResults] === true
+
+    const done = (err, values) => {
+      if (!err && !deferPartialResults) restorePartialResults(values)
+      callback(err, values)
+    }
+
+    if (options === undefined) {
+      super.getMany(keys, done)
+    } else {
+      super.getMany(keys, options, done)
+    }
+
+    return callback[kPromise]
+  }
+
+  _sublevel (name, options) {
+    return wrapSublevel(super._sublevel(name, options))
   }
 
   _getManySync (keys, options) {
@@ -239,7 +293,15 @@ class RocksLevel extends AbstractLevel {
   }
 
   _del (key, options, callback) {
-    return this._batch([{ ...options, type: 'del', key }], options ?? kEmpty, callback)
+    callback = fromCallback(callback, kPromise)
+
+    try {
+      this._batch([{ ...options, type: 'del', key }], options ?? kEmpty, callback)
+    } catch (err) {
+      process.nextTick(callback, err)
+    }
+
+    return callback[kPromise]
   }
 
   _clear (options, callback) {
@@ -489,6 +551,63 @@ class RocksLevel extends AbstractLevel {
 
     return callback[kPromise]
   }
+}
+
+function restorePartialResults (values) {
+  const indexes = partialResults.get(values)
+  if (indexes !== undefined) {
+    partialResults.delete(values)
+    for (const index of indexes) values[index] = null
+  }
+}
+
+function markSublevelOptions (options) {
+  if (typeof options !== 'object' || options === null) {
+    return { [kDeferPartialResults]: true }
+  }
+
+  const marked = Object.create(
+    Object.getPrototypeOf(options),
+    Object.getOwnPropertyDescriptors(options)
+  )
+  Object.defineProperty(marked, kDeferPartialResults, {
+    value: true,
+    enumerable: true
+  })
+  return marked
+}
+
+function wrapSublevel (db) {
+  const getMany = db.getMany
+  Object.defineProperty(db, 'getMany', {
+    configurable: true,
+    writable: true,
+    value: function (keys, options, callback) {
+      if (typeof options === 'function') {
+        callback = options
+        options = undefined
+      }
+      callback = fromCallback(callback, kPromise)
+
+      getMany.call(this, keys, markSublevelOptions(options), (err, values) => {
+        if (!err) restorePartialResults(values)
+        callback(err, values)
+      })
+
+      return callback[kPromise]
+    }
+  })
+
+  const sublevel = db._sublevel
+  Object.defineProperty(db, '_sublevel', {
+    configurable: true,
+    writable: true,
+    value: function (name, options) {
+      return wrapSublevel(sublevel.call(this, name, options))
+    }
+  })
+
+  return db
 }
 
 exports.RocksLevel = RocksLevel

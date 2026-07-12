@@ -142,6 +142,115 @@ test('public getMany allows explicitly bounded partial results', async function 
   t.end()
 })
 
+test('bounded getMany preserves partial markers across value decoding', async function (t) {
+  const db = testCommon.factory({ valueEncoding: 'hex' })
+  await db.open()
+  await db.batch(['key0', 'key1', 'key2'].map((key) => ({
+    type: 'put',
+    key,
+    value: 'ff'.repeat(1024)
+  })))
+
+  const rows = await db.getMany(['key0', 'key1', 'key2'], { highWaterMarkBytes: 0 })
+  t.ok(rows.includes(null), 'bounded reads expose at least one partial marker')
+  t.ok(rows.every((row) => row === null || row === 'ff'.repeat(1024)),
+    'hex decoding leaves partial markers intact')
+
+  await db.close()
+  t.end()
+})
+
+test('bounded sublevel getMany preserves partial markers across nested decoding', async function (t) {
+  const db = testCommon.factory()
+  await db.open()
+  const targets = [
+    ['sublevel', db.sublevel('one', { valueEncoding: 'hex' })],
+    ['nested sublevel', db.sublevel('outer').sublevel('inner', { valueEncoding: 'hex' })]
+  ]
+
+  for (const [name, target] of targets) {
+    await target.batch(['key0', 'key1', 'key2'].map((key) => ({
+      type: 'put',
+      key,
+      value: 'ff'.repeat(1024)
+    })))
+
+    const rows = await target.getMany(['key0', 'key1', 'key2'], { highWaterMarkBytes: 0 })
+    t.ok(rows.includes(null), `${name} exposes at least one partial marker`)
+    t.ok(rows.every((row) => row === null || row === 'ff'.repeat(1024)),
+      `${name} leaves partial markers intact`)
+  }
+
+  await db.close()
+  t.end()
+})
+
+test('single get never returns a partial marker', async function (t) {
+  const db = testCommon.factory()
+  await db.open()
+  const getManyAsync = db._getManyAsync
+  db._getManyAsync = (keys, options, callback) => process.nextTick(callback, null, [null])
+
+  const err = await rejection(db.get('key', { timeout: 1 }))
+  t.equal(err && err.code, 'LEVEL_ABORTED', 'partial single-key reads reject')
+
+  db._getManyAsync = getManyAsync
+  await db.close()
+  t.end()
+})
+
+test('getMany reports option accessor failures asynchronously', async function (t) {
+  const db = testCommon.factory()
+  await db.open()
+  const expected = new Error('timeout getter failed')
+  const options = { keyEncoding: 'utf8', valueEncoding: 'utf8' }
+  Object.defineProperty(options, 'timeout', {
+    get: () => { throw expected }
+  })
+
+  await new Promise((resolve) => {
+    let synchronous = true
+    db.getMany(['key'], options, (err) => {
+      t.notOk(synchronous, 'callback is asynchronous')
+      t.equal(err, expected, 'callback receives the accessor error')
+      resolve()
+    })
+    synchronous = false
+  })
+
+  await db.close()
+  t.end()
+})
+
+test('put and del report option spread failures asynchronously', async function (t) {
+  const db = testCommon.factory()
+  await db.open()
+
+  for (const [name, options, invoke] of [
+    ['put', { keyEncoding: 'utf8', valueEncoding: 'utf8' }, (callback, value) => db.put('key', 'value', value, callback)],
+    ['del', { keyEncoding: 'utf8' }, (callback, value) => db.del('key', value, callback)]
+  ]) {
+    const expected = new Error(`${name} option getter failed`)
+    Object.defineProperty(options, name === 'put' ? 'sync' : 'lowPriority', {
+      enumerable: true,
+      get: () => { throw expected }
+    })
+
+    await new Promise((resolve) => {
+      let synchronous = true
+      invoke((err) => {
+        t.notOk(synchronous, `${name} callback is asynchronous`)
+        t.equal(err, expected, `${name} callback receives the accessor error`)
+        resolve()
+      }, options)
+      synchronous = false
+    })
+  }
+
+  await db.close()
+  t.end()
+})
+
 test('clear is asynchronous and covers keys beyond the old synthetic maximum', async function (t) {
   const db = testCommon.factory({ keyEncoding: 'buffer' })
   await db.open()
