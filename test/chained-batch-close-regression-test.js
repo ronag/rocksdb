@@ -99,6 +99,7 @@ test('db.close waits for a failed raw async batch write and releases its lock', 
     await nextTurn()
     t.equal(db.status, 'closing', 'database entered its normal closing state')
     t.notOk(closeSettled, 'database close waits for the attached batch')
+    t.equal(typeof complete, 'function', 'native completion is held by the test')
 
     complete(expected)
     t.equal(await writing, expected, 'raw write promise preserves the native error')
