@@ -2553,15 +2553,38 @@ NAPI_METHOD(db_get_many) {
   auto callback = argv[3];
 
   std::vector<std::string> ownedKeys(count);
+  std::vector<rocksdb::Slice> borrowedKeys(count);
+  std::vector<bool> isBorrowed(count, false);
+  napi_value borrowedKeyBackings = nullptr;
+  std::shared_ptr<Reference> borrowedKeysReference;
 
   for (uint32_t n = 0; n < count; n++) {
     napi_value element;
     NAPI_STATUS_THROWS(napi_get_element(env, argv[1], n, &element));
-    // Async work must not borrow Buffer or SliceLike storage. The caller can
-    // mutate a Buffer, replace an array element / SliceLike.buffer, or release
-    // the original object as soon as this method returns. Snapshot every key
-    // while still on the JS thread so the worker observes call-time bytes.
+
+    // Safe async work snapshots Buffer and SliceLike bytes on the JS thread.
+    // Explicitly unsafe reads retain the previous borrowed-buffer fast path;
+    // strings still need native-owned storage in either mode.
+    if (unsafe) {
+      napi_valuetype type;
+      NAPI_STATUS_THROWS(napi_typeof(env, element, &type));
+      if (type != napi_string) {
+        napi_value backing;
+        NAPI_STATUS_THROWS(GetString(env, element, borrowedKeys[n], &backing));
+        if (!borrowedKeyBackings) {
+          NAPI_STATUS_THROWS(napi_create_array_with_length(env, count, &borrowedKeyBackings));
+        }
+        NAPI_STATUS_THROWS(napi_set_element(env, borrowedKeyBackings, n, backing));
+        isBorrowed[n] = true;
+        continue;
+      }
+    }
     NAPI_STATUS_THROWS(GetValue(env, element, ownedKeys[n]));
+  }
+
+  if (borrowedKeyBackings) {
+    borrowedKeysReference = std::make_shared<Reference>();
+    NAPI_STATUS_THROWS(Reference::Create(env, borrowedKeyBackings, *borrowedKeysReference));
   }
 
   rocksdb::ReadOptions readOptions;
@@ -2593,17 +2616,19 @@ NAPI_METHOD(db_get_many) {
 
   NAPI_STATUS_THROWS(runAsyncKeepAlive<State>(
       resourceName, env, callback, argv[0],
-      [=, ownedKeys = std::move(ownedKeys), readOptions = std::move(readOptions)](auto& state) {
+      [=, ownedKeys = std::move(ownedKeys), borrowedKeys = std::move(borrowedKeys),
+       isBorrowed = std::move(isBorrowed), readOptions = std::move(readOptions)](auto& state) {
         // MultiGet can return slices pinned to RocksDB cache memory. Retain the
         // operation through JS conversion (the async worker owns this functor
         // until Complete) so safe conversion performs only its one required
         // copy and raw db_close cannot tear down the cache first.
         (void)databaseOperation;
+        (void)borrowedKeysReference;
 
         std::vector<rocksdb::Slice> keys;
         keys.reserve(ownedKeys.size());
-        for (const auto& key : ownedKeys) {
-          keys.emplace_back(key);
+        for (size_t n = 0; n < ownedKeys.size(); n++) {
+          keys.emplace_back(isBorrowed[n] ? borrowedKeys[n] : rocksdb::Slice(ownedKeys[n]));
         }
 
         state.statuses.resize(count);

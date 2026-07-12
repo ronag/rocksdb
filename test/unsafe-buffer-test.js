@@ -78,7 +78,7 @@ test('unsafe iterator nextv returns correct values', async function (t) {
   t.end()
 })
 
-test('async getMany retains borrowed key buffers through forced GC', async function (t) {
+test('unsafe async getMany retains borrowed Buffer and SliceLike keys through forced GC', async function (t) {
   if (!global.gc) {
     t.pass('forced-GC variant runs through test/gc.js')
     t.end()
@@ -95,12 +95,23 @@ test('async getMany retains borrowed key buffers through forced GC', async funct
 
   let keys = Array.from({ length: 1000 }, (_, i) =>
     Buffer.from('borrowed-' + String(i).padStart(4, '0')))
-  const pending = db._getMany(keys, { valueEncoding: 'buffer' })
+  keys[998] = {
+    buffer: Buffer.from('xborrowed-0998'),
+    byteOffset: 1,
+    byteLength: 13
+  }
+  const pending = db._getMany(keys, {
+    valueEncoding: 'buffer',
+    unsafe: true
+  })
+  keys[998].buffer = Buffer.from('discarded-slice-backing')
+  keys[999] = Buffer.from('discarded-buffer-key')
   keys = null
   for (let i = 0; i < 4; i++) global.gc()
 
   const values = await pending
   t.equal(values.length, 1000, 'all borrowed keys remained alive')
+  t.equal(values[998].toString(), 'value-998', 'the SliceLike key retained its backing Buffer')
   t.equal(values[999].toString(), 'value-999', 'the final borrowed key read the correct value')
   await db.close()
   t.end()
