@@ -15,6 +15,7 @@ import {
   AbstractClearOptions,
   AbstractIterator,
   AbstractIteratorOptions,
+  AbstractSeekOptions,
   AbstractKeyIterator,
   AbstractKeyIteratorOptions,
   AbstractValueIterator,
@@ -35,31 +36,32 @@ export interface SliceLike {
 export type RocksFormat = string | Buffer | SliceLike
 export type RocksSlice = RocksFormat
 export type RocksNativeEncoding = 'buffer' | 'view' | 'utf8'
+export type RocksNativeValue = string | Buffer
 export type RocksDecoded<E extends RocksNativeEncoding> = E extends 'utf8' ? string : Buffer
 
 declare const columnHandleBrand: unique symbol
+declare const cacheHandleBrand: unique symbol
+declare const statisticsBrand: unique symbol
+declare const writeBufferManagerHandleBrand: unique symbol
 
 export interface RocksColumn {
   readonly [columnHandleBrand]: never
-}
-
-export interface RocksHandle {
-  readonly handle: bigint
 }
 
 export interface RocksCacheOptions {
   capacity?: number
 }
 
-export class RocksCache implements RocksHandle {
+export class RocksCache {
   constructor (optionsOrHandle?: RocksCacheOptions | bigint)
+  readonly [cacheHandleBrand]: never
   get handle (): bigint
 }
 
 export interface RocksWriteBufferManagerOptions {
   bufferSize?: number
   allowStall?: boolean
-  cache?: RocksCache | RocksHandle | bigint | null
+  cache?: RocksCache | bigint | null
 }
 
 export interface RocksWriteBufferManagerUsage {
@@ -68,8 +70,9 @@ export interface RocksWriteBufferManagerUsage {
   readonly bufferSize: number
 }
 
-export class RocksWriteBufferManager implements RocksHandle {
+export class RocksWriteBufferManager {
   constructor (options?: RocksWriteBufferManagerOptions)
+  readonly [writeBufferManagerHandleBrand]: never
   get handle (): bigint
   get usage (): RocksWriteBufferManagerUsage
 }
@@ -122,6 +125,7 @@ export interface RocksStatisticsSnapshot {
 
 export class RocksStatistics {
   constructor (options?: RocksStatisticsOptions)
+  readonly [statisticsBrand]: never
   setStatisticsEnabled (enabled: boolean): true
   getStatistics (): RocksStatisticsSnapshot
 }
@@ -152,7 +156,7 @@ export interface RocksColumnOptions {
   blobCompactionReadaheadSize?: number
   blobFileStartingLevel?: number
   blobCompression?: RocksCompression
-  cache?: RocksCache | RocksHandle | bigint | null
+  cache?: RocksCache | bigint | null
   cacheSize?: number
   cacheCompressedRatio?: number
   cachePrepopulate?: RocksCachePrepopulate
@@ -208,7 +212,7 @@ export interface RocksOpenOptions extends AbstractOpenOptions, RocksColumnOption
   compactionReadaheadSize?: number
   useAdaptiveMutex?: boolean
   writeBufferSize?: number
-  writeBufferManager?: RocksWriteBufferManager | RocksHandle | bigint | null
+  writeBufferManager?: RocksWriteBufferManager | bigint | null
   manualWALFlush?: boolean
   walManualFlush?: boolean
   infoLogLevel?: 'debug' | 'info' | 'warn' | 'error' | 'fatal' | 'header'
@@ -239,6 +243,9 @@ export interface RocksWriteOptions extends RocksColumnOperationOptions {
 
 export interface RocksGetOptions<K, V> extends AbstractGetOptions<K, V>, RocksReadOptions {}
 export interface RocksGetManyOptions<K, V> extends AbstractGetManyOptions<K, V>, RocksReadOptions {}
+export type RocksBoundedGetManyOptions<K, V> = RocksGetManyOptions<K, V> & (
+  { highWaterMarkBytes: number } | { timeout: number }
+)
 export interface RocksPutOptions<K, V> extends AbstractPutOptions<K, V>, RocksWriteOptions {}
 export interface RocksDelOptions<K> extends AbstractDelOptions<K>, RocksWriteOptions {}
 export interface RocksBatchOptions<K, V> extends AbstractBatchOptions<K, V> {
@@ -301,6 +308,13 @@ export type RocksRows<
   ? Values extends false ? undefined : V | undefined
   : Values extends false ? K | undefined : K | V
 
+export type RocksIteratorKey<K, Keys extends boolean> = Keys extends false ? undefined : K
+export type RocksIteratorValue<V, Values extends boolean> = Values extends false ? undefined : V
+// AbstractIterator reserves an undefined/undefined single entry as its end sentinel.
+export type RocksIteratorEntry<K, V, Keys extends boolean, Values extends boolean> = Keys extends false
+  ? Values extends false ? never : [undefined, V]
+  : Values extends false ? [K, undefined] : [K, V]
+
 export interface RocksRawIteratorResult<
   K = Buffer,
   V = Buffer,
@@ -312,29 +326,55 @@ export interface RocksRawIteratorResult<
   readonly limited?: boolean
 }
 
-export interface RocksIterator<
-  TDatabase,
-  K,
-  V,
+export interface RocksIteratorNative<
+  KRaw,
+  VRaw,
   Keys extends boolean = true,
   Values extends boolean = true
-> extends AbstractIterator<TDatabase, K, V> {
+> {
   readonly cached: number
   [Symbol.asyncDispose] (): Promise<void>
   _refreshSync (): void
   _seekSync (target: RocksSlice): void
   _seekAsync (target: RocksSlice): Promise<void>
   _seekAsync (target: RocksSlice, callback: NodeCallback<void>): void
-  _nextvSync (size: number, options?: { timeout?: number }): RocksRawIteratorResult<K, V, Keys, Values>
-  _nextvAsync (size: number, options?: { timeout?: number }): Promise<RocksRawIteratorResult<K, V, Keys, Values>>
+  _nextvSync (size: number, options?: { timeout?: number }): RocksRawIteratorResult<KRaw, VRaw, Keys, Values>
+  _nextvAsync (size: number, options?: { timeout?: number }): Promise<RocksRawIteratorResult<KRaw, VRaw, Keys, Values>>
   _nextvAsync (
     size: number,
     options: { timeout?: number } | undefined,
-    callback: NodeCallback<RocksRawIteratorResult<K, V, Keys, Values>>
+    callback: NodeCallback<RocksRawIteratorResult<KRaw, VRaw, Keys, Values>>
   ): void
   _closeSync (): void
   _closeAsync (): Promise<void>
   _closeAsync (callback: NodeCallback<void>): void
+}
+
+export type RocksIterator<
+  TDatabase,
+  K,
+  V,
+  Keys extends boolean = true,
+  Values extends boolean = true,
+  KRaw = K,
+  VRaw = V
+> = Omit<
+  AbstractIterator<
+    TDatabase,
+    RocksIteratorKey<K, Keys>,
+    RocksIteratorValue<V, Values>
+  >,
+  'seek' | 'next' | typeof Symbol.asyncIterator
+> & RocksIteratorNative<KRaw, VRaw, Keys, Values> & {
+  next (): Promise<RocksIteratorEntry<K, V, Keys, Values> | undefined>
+  next (callback: (
+    err: Error | undefined | null,
+    key?: RocksIteratorKey<K, Keys>,
+    value?: RocksIteratorValue<V, Values>
+  ) => void): void
+  [Symbol.asyncIterator] (): AsyncGenerator<RocksIteratorEntry<K, V, Keys, Values>, void, unknown>
+  seek (target: K): void
+  seek<TTarget = K> (target: TTarget, options: AbstractSeekOptions<TTarget>): void
 }
 
 export interface RocksChainedBatchPutOptions<TDatabase, K, V>
@@ -476,10 +516,39 @@ export class RocksLevel<KDefault = string, VDefault = string>
   get<K = KDefault, V = VDefault> (key: K, options: RocksGetOptions<K, V>): Promise<V>
   get<K = KDefault, V = VDefault> (key: K, options: RocksGetOptions<K, V>, callback: NodeCallback<V>): void
 
+  getMany (keys: KDefault[]): Promise<Array<VDefault | undefined>>
+  getMany (keys: KDefault[], callback: NodeCallback<Array<VDefault | undefined>>): void
+  getMany<K = KDefault, V = VDefault> (
+    keys: K[],
+    options: RocksBoundedGetManyOptions<K, V>
+  ): Promise<Array<V | null | undefined>>
+  getMany<K = KDefault, V = VDefault> (
+    keys: K[],
+    options: RocksBoundedGetManyOptions<K, V>,
+    callback: NodeCallback<Array<V | null | undefined>>
+  ): void
+  getMany<K = KDefault, V = VDefault> (
+    keys: K[],
+    options: RocksGetManyOptions<K, V>
+  ): Promise<Array<V | null | undefined>>
+  getMany<K = KDefault, V = VDefault> (
+    keys: K[],
+    options: RocksGetManyOptions<K, V>,
+    callback: NodeCallback<Array<V | null | undefined>>
+  ): void
+  // Upstream compatibility overloads. The accurate Rocks overloads above are
+  // ordered first and are selected for direct calls.
   getMany (keys: KDefault[]): Promise<VDefault[]>
   getMany (keys: KDefault[], callback: NodeCallback<VDefault[]>): void
-  getMany<K = KDefault, V = VDefault> (keys: K[], options: RocksGetManyOptions<K, V>): Promise<V[]>
-  getMany<K = KDefault, V = VDefault> (keys: K[], options: RocksGetManyOptions<K, V>, callback: NodeCallback<V[]>): void
+  getMany<K = KDefault, V = VDefault> (
+    keys: K[],
+    options: AbstractGetManyOptions<K, V>
+  ): Promise<V[]>
+  getMany<K = KDefault, V = VDefault> (
+    keys: K[],
+    options: AbstractGetManyOptions<K, V>,
+    callback: NodeCallback<V[]>
+  ): void
 
   put (key: KDefault, value: VDefault): Promise<void>
   put (key: KDefault, value: VDefault, callback: NodeCallback<void>): void
@@ -501,13 +570,29 @@ export class RocksLevel<KDefault = string, VDefault = string>
   batch<K = KDefault, V = VDefault> (operations: Array<RocksBatchOperation<this, K, V>>, options: RocksBatchOptions<K, V>, callback: NodeCallback<void>): void
   batch (): RocksChainedBatch<this, KDefault, VDefault>
 
-  iterator (): RocksIterator<this, KDefault, VDefault, true, true>
+  iterator (): RocksIterator<
+    this,
+    KDefault,
+    VDefault,
+    true,
+    true,
+    RocksNativeValue,
+    RocksNativeValue
+  >
   iterator<
     K = KDefault,
     V = VDefault,
     Keys extends boolean = true,
     Values extends boolean = true
-  > (options: RocksIteratorOptions<K, V, Keys, Values>): RocksIterator<this, K, V, Keys, Values>
+  > (options: RocksIteratorOptions<K, V, Keys, Values>): RocksIterator<
+    this,
+    K,
+    V,
+    Keys,
+    Values,
+    RocksNativeValue,
+    RocksNativeValue
+  >
   keys (): AbstractKeyIterator<this, KDefault>
   keys<K = KDefault> (options: RocksKeyIteratorOptions<K>): AbstractKeyIterator<this, K>
   values (): AbstractValueIterator<this, KDefault, VDefault>
@@ -548,7 +633,9 @@ export class RocksLevel<KDefault = string, VDefault = string>
     RocksDecoded<KEncoding>,
     RocksDecoded<VEncoding>,
     Keys,
-    Values
+    Values,
+    RocksDecoded<KEncoding>,
+    RocksDecoded<VEncoding>
   >
   _chainedBatch (): RocksChainedBatch<this, KDefault, VDefault>
 

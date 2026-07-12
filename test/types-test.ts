@@ -5,6 +5,7 @@ import { AbstractLevel } from 'abstract-level'
 import {
   RocksCache,
   RocksFormat,
+  RocksGetManyOptions,
   RocksLevel,
   RocksStatistics,
   RocksUpdate,
@@ -15,6 +16,13 @@ import {
 
 declare function expectType<T> (value: T): void
 declare const booleanFlag: boolean
+type Equal<A, B> =
+  (<T>() => T extends A ? 1 : 2) extends (<T>() => T extends B ? 1 : 2)
+    ? (<T>() => T extends B ? 1 : 2) extends (<T>() => T extends A ? 1 : 2)
+        ? true
+        : false
+    : false
+declare function expectTrue<T extends true> (): void
 
 const slice: SliceLike = {
   buffer: Buffer.from('value'),
@@ -49,6 +57,22 @@ expectType<Promise<Array<string | null | undefined>>>(
   db._getManyAsync([slice], { valueEncoding: 'utf8' }, undefined, true)
 )
 
+const boundedValues = db.getMany(['key'], { highWaterMarkBytes: 0 })
+expectTrue<Equal<
+  Awaited<typeof boundedValues>,
+  Array<string | null | undefined>
+>>()
+const unboundedValues = db.getMany(['key'])
+expectTrue<Equal<Awaited<typeof unboundedValues>, Array<string | undefined>>>()
+const annotatedBoundedOptions: RocksGetManyOptions<string, string> = {
+  highWaterMarkBytes: 0
+}
+const annotatedBoundedValues = db.getMany(['key'], annotatedBoundedOptions)
+expectTrue<Equal<
+  Awaited<typeof annotatedBoundedValues>,
+  Array<string | null | undefined>
+>>()
+
 const query = db.querySync({ gte: slice, lt: Buffer.from('z') })
 expectType<Array<Buffer>>(query.rows)
 expectType<Array<string>>(
@@ -75,6 +99,48 @@ expectType<Promise<{ readonly rows: Array<Buffer>; readonly finished: boolean; r
   iterator._nextvAsync(10)
 )
 expectType<Promise<void>>(iterator[Symbol.asyncDispose]())
+
+const publicValuesOnlyIterator = db.iterator({ keys: false, values: true })
+publicValuesOnlyIterator.seek('key')
+const publicNext = publicValuesOnlyIterator.next()
+const publicNextv = publicValuesOnlyIterator.nextv(10)
+const publicAll = publicValuesOnlyIterator.all()
+expectTrue<Equal<
+  Awaited<typeof publicNext>,
+  [undefined, string] | undefined
+>>()
+expectTrue<Equal<
+  Awaited<typeof publicNextv>,
+  Array<[undefined, string]>
+>>()
+expectTrue<Equal<
+  Awaited<typeof publicAll>,
+  Array<[undefined, string]>
+>>()
+expectTrue<Equal<
+  ReturnType<typeof publicValuesOnlyIterator[typeof Symbol.asyncIterator]>,
+  AsyncGenerator<[undefined, string], void, unknown>
+>>()
+
+const publicHexIterator = db.iterator({ valueEncoding: 'hex' })
+const publicHexRows = publicHexIterator._nextvAsync(10)
+expectTrue<Equal<
+  Awaited<typeof publicHexRows>['rows'],
+  Array<string | Buffer>
+>>()
+
+const publicNoFieldsIterator = db.iterator({ keys: false, values: false })
+const publicNoFieldsNext = publicNoFieldsIterator.next()
+const publicNoFieldsAll = publicNoFieldsIterator.all()
+expectTrue<Equal<Awaited<typeof publicNoFieldsNext>, undefined>>()
+expectTrue<Equal<
+  Awaited<typeof publicNoFieldsAll>,
+  Array<[undefined, undefined]>
+>>()
+expectTrue<Equal<
+  ReturnType<typeof publicNoFieldsIterator[typeof Symbol.asyncIterator]>,
+  AsyncGenerator<never, void, unknown>
+>>()
 
 const valuesOnlyIterator = db._iterator({
   keys: false,
@@ -151,7 +217,10 @@ expectType<number>(new DerivedRocksLevel('/tmp/derived-rocks-level-types').curre
 
 new RocksLevel('/tmp/rocks-level-options', {
   compression: false,
-  blobCompression: 'zstd'
+  blobCompression: 'zstd',
+  cache,
+  writeBufferManager,
+  statistics
 })
 
 // SliceLike is a private encoded format. The default public encoding remains utf8.
@@ -171,6 +240,19 @@ new RocksLevel('/tmp/rocks-level-types', { compression: 'zstd' })
 new RocksLevel('/tmp/rocks-level-types', { paralellism: 4 })
 // @ts-expect-error Removed compatibility aliases are not runtime options
 new RocksLevel('/tmp/rocks-level-types', { enableBlobFiles: true })
+// @ts-expect-error Cache and write-buffer-manager handles are resource-specific
+new RocksWriteBufferManager({ cache: writeBufferManager })
+// @ts-expect-error Cache and write-buffer-manager handles are resource-specific
+new RocksLevel('/tmp/rocks-level-types', { cache: writeBufferManager })
+// @ts-expect-error Cache and write-buffer-manager handles are resource-specific
+new RocksLevel('/tmp/rocks-level-types', { writeBufferManager: cache })
+new RocksLevel('/tmp/rocks-level-types', {
+  // @ts-expect-error Statistics resources require the actual branded wrapper
+  statistics: {
+    setStatisticsEnabled: () => true as const,
+    getStatistics: () => statistics.getStatistics()
+  }
+})
 
 void invalidBuffer
 void missingLength
