@@ -112,13 +112,12 @@ test('query, compactRange and flushWAL support callback-only overloads', async f
   t.end()
 })
 
-test('flushWAL validates options instead of silently weakening sync', async function (t) {
+test('flushWAL accepts boolean sync and validates other options', async function (t) {
   const db = testCommon.factory()
   await db.open()
 
   for (const [name, options] of [
     ['null', null],
-    ['boolean', true],
     ['number', 1],
     ['string', 'sync'],
     ['array', []],
@@ -130,7 +129,7 @@ test('flushWAL validates options instead of silently weakening sync', async func
 
   await new Promise((resolve) => {
     let synchronous = true
-    db.flushWAL(true, (err) => {
+    db.flushWAL(1, (err) => {
       t.notOk(synchronous, 'invalid callback options reject asynchronously')
       t.ok(err instanceof TypeError, 'callback receives the validation error')
       resolve()
@@ -148,19 +147,30 @@ test('flushWAL validates options instead of silently weakening sync', async func
     }
   })
 
-  let nativeSync
+  const nativeSync = []
   const originalFlushWAL = binding.db_flush_wal
   binding.db_flush_wal = function (context, sync, callback) {
-    nativeSync = sync
+    nativeSync.push(sync)
     return originalFlushWAL(context, sync, callback)
   }
   try {
+    await db.flushWAL(true)
+    await db.flushWAL(false)
+    await new Promise((resolve, reject) => {
+      let synchronous = true
+      db.flushWAL(true, (err) => {
+        t.notOk(synchronous, 'boolean callback overload completes asynchronously')
+        if (err) reject(err)
+        else resolve()
+      })
+      synchronous = false
+    })
     await db.flushWAL(options)
   } finally {
     binding.db_flush_wal = originalFlushWAL
   }
   t.equal(reads, 1, 'sync is read exactly once')
-  t.equal(nativeSync, true, 'sync:true reaches the native binding')
+  t.same(nativeSync, [true, false, true, true], 'boolean and object sync values reach the native binding')
 
   await db.close()
   t.end()
