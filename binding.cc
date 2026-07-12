@@ -3026,6 +3026,7 @@ NAPI_METHOD(batch_put) {
   Database* database = batch->reference->database.get();
   std::shared_ptr<DatabaseOperation> databaseOperation;
   NAPI_STATUS_THROWS(BeginDatabaseOperation(env, database, batch->reference, databaseOperation));
+  NAPI_STATUS_THROWS(ValidateBatch(env, batch, batch->reference));
 
   rocksdb::Slice key;
   NAPI_STATUS_THROWS(GetValue(env, argv[1], key));
@@ -3051,6 +3052,10 @@ NAPI_METHOD(batch_put_log_data) {
 
   std::shared_ptr<NativeBatch> batch;
   NAPI_STATUS_THROWS(GetBatch(env, argv[0], batch));
+  Database* database = batch->reference->database.get();
+  std::shared_ptr<DatabaseOperation> databaseOperation;
+  NAPI_STATUS_THROWS(BeginDatabaseOperation(env, database, batch->reference, databaseOperation));
+  NAPI_STATUS_THROWS(ValidateBatch(env, batch, batch->reference));
 
   rocksdb::Slice blob;
   NAPI_STATUS_THROWS(GetValue(env, argv[1], blob));
@@ -3069,6 +3074,7 @@ NAPI_METHOD(batch_del) {
   Database* database = batch->reference->database.get();
   std::shared_ptr<DatabaseOperation> databaseOperation;
   NAPI_STATUS_THROWS(BeginDatabaseOperation(env, database, batch->reference, databaseOperation));
+  NAPI_STATUS_THROWS(ValidateBatch(env, batch, batch->reference));
 
   rocksdb::Slice key;
   NAPI_STATUS_THROWS(GetValue(env, argv[1], key));
@@ -3094,6 +3100,7 @@ NAPI_METHOD(batch_merge) {
   Database* database = batch->reference->database.get();
   std::shared_ptr<DatabaseOperation> databaseOperation;
   NAPI_STATUS_THROWS(BeginDatabaseOperation(env, database, batch->reference, databaseOperation));
+  NAPI_STATUS_THROWS(ValidateBatch(env, batch, batch->reference));
 
   rocksdb::Slice key;
   NAPI_STATUS_THROWS(GetValue(env, argv[1], key));

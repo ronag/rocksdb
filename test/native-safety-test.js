@@ -152,6 +152,28 @@ test('constructor option failures release imported handle reservations', async f
   t.end()
 })
 
+test('stale native batches reject every mutation after reopen', async function (t) {
+  const context = binding.db_init(tempy.directory())
+  await nativeOpen(context)
+  const batch = binding.batch_init(context)
+
+  await nativeClose(context)
+  await nativeOpen(context, { createIfMissing: false })
+
+  for (const [name, mutate] of [
+    ['put', () => binding.batch_put(batch, Buffer.from('key'), Buffer.from('value'), {})],
+    ['put log data', () => binding.batch_put_log_data(batch, Buffer.from('data'))],
+    ['delete', () => binding.batch_del(batch, Buffer.from('key'), {})],
+    ['merge', () => binding.batch_merge(batch, Buffer.from('key'), Buffer.from('value'), {})]
+  ]) {
+    t.throws(mutate, (err) => err.code === 'LEVEL_INVALID_BATCH', `${name} rejects the stale generation`)
+  }
+
+  binding.batch_clear(batch)
+  await nativeClose(context)
+  t.end()
+})
+
 test('stale column handles and closed native iterators fail safely', async function (t) {
   const location = tempy.directory()
   const db = await RocksLevel.open(location, { columns: { default: {}, records: {} } })

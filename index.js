@@ -49,7 +49,7 @@ class RocksLevel extends AbstractLevel {
       // rejects constructor options, release it synchronously because no JS
       // instance exists whose cleanup hook we can rely on.
       try {
-        if (context) binding.db_dispose(context)
+        if (context && typeof locationOrHandle === 'bigint') binding.db_dispose(context)
       } catch {
         // Preserve the constructor error that prevented the instance from
         // being created. The native cleanup hook is still a final fallback.
