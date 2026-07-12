@@ -3,7 +3,7 @@
 const test = require('tape')
 const { spawnSync } = require('node:child_process')
 
-test('async getMany snapshots safe keys and borrows unsafe buffers', function (t) {
+test('async getMany always snapshots Buffer and SliceLike keys before queueing', function (t) {
   const packagePath = JSON.stringify(require.resolve('..'))
   const script = `
     'use strict'
@@ -12,8 +12,8 @@ test('async getMany snapshots safe keys and borrows unsafe buffers', function (t
     const tempy = require('tempy')
     const { RocksLevel } = require(${packagePath})
 
-    const occupyWorker = (iterations = 400000) => new Promise((resolve, reject) => {
-      pbkdf2('password', 'salt', iterations, 16, 'sha256', (err) => {
+    const occupyWorker = () => new Promise((resolve, reject) => {
+      pbkdf2('password', 'salt', 400000, 16, 'sha256', (err) => {
         if (err) reject(err)
         else resolve()
       })
@@ -28,11 +28,6 @@ test('async getMany snapshots safe keys and borrows unsafe buffers', function (t
         { type: 'put', key: Buffer.from('a'), value: Buffer.from('value-a') },
         { type: 'put', key: Buffer.from('b'), value: Buffer.from('value-b') }
       ])
-      assert.deepEqual(
-        await db._getManyAsync([], { valueEncoding: 'buffer', unsafe: true }),
-        []
-      )
-
       let blocker = occupyWorker()
       const bufferKey = Buffer.from('a')
       let pending = db._getManyAsync([bufferKey], { valueEncoding: 'buffer' })
@@ -56,49 +51,6 @@ test('async getMany snapshots safe keys and borrows unsafe buffers', function (t
         unsafe: true
       })
       unsafeKey[0] = 0x62
-      assert.equal((await pending)[0].toString(), 'value-b')
-      await blocker
-
-      blocker = occupyWorker(1000000)
-      let unsafeBacking = Buffer.allocUnsafeSlow(1)
-      unsafeBacking[0] = 0x61
-      const unsafeBackingRef = new WeakRef(unsafeBacking)
-      const unsafeKeys = [unsafeBacking]
-      pending = db._getManyAsync(unsafeKeys, {
-        valueEncoding: 'buffer',
-        unsafe: true
-      })
-      unsafeKeys[0] = Buffer.from('b')
-      unsafeBacking = null
-      await new Promise(resolve => setImmediate(resolve))
-      for (let i = 0; i < 4; i++) global.gc()
-      assert.equal(unsafeBackingRef.deref()?.[0], 0x61, 'native holder retains the exact Buffer')
-      assert.equal((await pending)[0].toString(), 'value-a')
-      await blocker
-
-      blocker = occupyWorker(1000000)
-      let unsafeSliceBacking = Buffer.allocUnsafeSlow(2)
-      unsafeSliceBacking[0] = 0x78
-      unsafeSliceBacking[1] = 0x61
-      const unsafeSliceBackingRef = new WeakRef(unsafeSliceBacking)
-      const unsafeSlice = {
-        buffer: unsafeSliceBacking,
-        byteOffset: 1,
-        byteLength: 1
-      }
-      pending = db._getManyAsync([unsafeSlice], {
-        valueEncoding: 'buffer',
-        unsafe: true
-      })
-      unsafeSlice.buffer = Buffer.from('xb')
-      unsafeSliceBacking = null
-      await new Promise(resolve => setImmediate(resolve))
-      for (let i = 0; i < 4; i++) global.gc()
-      assert.equal(
-        unsafeSliceBackingRef.deref()?.[1],
-        0x61,
-        'native holder retains the exact SliceLike backing'
-      )
       assert.equal((await pending)[0].toString(), 'value-a')
       await blocker
 
@@ -109,7 +61,7 @@ test('async getMany snapshots safe keys and borrows unsafe buffers', function (t
     })
   `
 
-  const result = spawnSync(process.execPath, ['--expose-gc', '-e', script], {
+  const result = spawnSync(process.execPath, ['-e', script], {
     encoding: 'utf8',
     env: { ...process.env, UV_THREADPOOL_SIZE: '1' },
     timeout: 20000

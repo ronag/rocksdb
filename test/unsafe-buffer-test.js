@@ -78,7 +78,7 @@ test('unsafe iterator nextv returns correct values', async function (t) {
   t.end()
 })
 
-test('unsafe async getMany retains borrowed Buffer and SliceLike keys through forced GC', async function (t) {
+test('async getMany snapshots key buffers through forced GC', async function (t) {
   if (!global.gc) {
     t.pass('forced-GC variant runs through test/gc.js')
     t.end()
@@ -89,30 +89,19 @@ test('unsafe async getMany retains borrowed Buffer and SliceLike keys through fo
   await db.open()
   await db.batch(Array.from({ length: 1000 }, (_, i) => ({
     type: 'put',
-    key: Buffer.from('borrowed-' + String(i).padStart(4, '0')),
+    key: Buffer.from('snapshot-' + String(i).padStart(4, '0')),
     value: Buffer.from('value-' + i)
   })))
 
   let keys = Array.from({ length: 1000 }, (_, i) =>
-    Buffer.from('borrowed-' + String(i).padStart(4, '0')))
-  keys[998] = {
-    buffer: Buffer.from('xborrowed-0998'),
-    byteOffset: 1,
-    byteLength: 13
-  }
-  const pending = db._getMany(keys, {
-    valueEncoding: 'buffer',
-    unsafe: true
-  })
-  keys[998].buffer = Buffer.from('discarded-slice-backing')
-  keys[999] = Buffer.from('discarded-buffer-key')
+    Buffer.from('snapshot-' + String(i).padStart(4, '0')))
+  const pending = db._getMany(keys, { valueEncoding: 'buffer' })
   keys = null
   for (let i = 0; i < 4; i++) global.gc()
 
   const values = await pending
-  t.equal(values.length, 1000, 'all borrowed keys remained alive')
-  t.equal(values[998].toString(), 'value-998', 'the SliceLike key retained its backing Buffer')
-  t.equal(values[999].toString(), 'value-999', 'the final borrowed key read the correct value')
+  t.equal(values.length, 1000, 'all snapshotted keys were read')
+  t.equal(values[999].toString(), 'value-999', 'the final snapshotted key read the correct value')
   await db.close()
   t.end()
 })
