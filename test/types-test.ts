@@ -1,5 +1,5 @@
 import { Buffer } from 'node:buffer'
-import assert from 'node:assert'
+import { ok } from 'node:assert'
 
 import { AbstractLevel } from 'abstract-level'
 
@@ -49,7 +49,7 @@ expectType<RocksColumn | undefined>(missingColumn)
 expectType<RocksColumn>(missingColumn)
 
 const defaultColumn = db.columns.default
-assert(defaultColumn)
+ok(defaultColumn)
 expectType<RocksColumn>(defaultColumn)
 expectType<Promise<string>>(db.get('key', { column: defaultColumn }))
 
