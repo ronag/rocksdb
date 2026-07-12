@@ -458,6 +458,27 @@ test('getMany does not inspect symbols on user options', async function (t) {
   t.end()
 })
 
+test('getMany accepts missing, null and primitive options', async function (t) {
+  const db = testCommon.factory()
+  await db.open()
+
+  const cases = [
+    ['missing', undefined],
+    ['null', null],
+    ['number', 1],
+    ['string', 'ignored']
+  ]
+  for (const [name, options] of cases) {
+    const rows = options === undefined
+      ? await db.getMany(['missing'])
+      : await db.getMany(['missing'], options)
+    t.same(rows, [undefined], `${name} options preserve default behavior`)
+  }
+
+  await db.close()
+  t.end()
+})
+
 test('sublevel getMany preserves option accessor receivers', async function (t) {
   const db = testCommon.factory()
   await db.open()
