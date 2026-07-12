@@ -58,11 +58,11 @@ test('native query accepts utf8 and utf-8 encoding names', async function (t) {
     })
     t.same(sync.rows, ['key', 'value'], `${encoding} works in querySync()`)
 
-    const async = await db.query({
+    const asyncResult = await db.query({
       keyEncoding: encoding,
       valueEncoding: encoding
     })
-    t.same(async.rows, ['key', 'value'], `${encoding} works in query()`)
+    t.same(asyncResult.rows, ['key', 'value'], `${encoding} works in query()`)
   }
 
   await db.close()
