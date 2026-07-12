@@ -577,13 +577,18 @@ class RocksLevel extends AbstractLevel {
 
     let referenced = false
     try {
-      if (typeof options !== 'object' || options === null || Array.isArray(options)) {
-        throw new TypeError('flushWAL options must be an object')
-      }
+      let sync
+      if (typeof options === 'boolean') {
+        sync = options
+      } else {
+        if (typeof options !== 'object' || options === null || Array.isArray(options)) {
+          throw new TypeError('flushWAL options must be a boolean or object')
+        }
 
-      const sync = options.sync ?? false
-      if (typeof sync !== 'boolean') {
-        throw new TypeError('flushWAL options.sync must be a boolean')
+        sync = options.sync ?? false
+        if (typeof sync !== 'boolean') {
+          throw new TypeError('flushWAL options.sync must be a boolean')
+        }
       }
 
       this[kRef]()

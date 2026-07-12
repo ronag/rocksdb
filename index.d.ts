@@ -694,8 +694,10 @@ export class RocksLevel<KDefault = string, VDefault = string>
   compactRange (options: RocksCompactRangeOptions, callback: NodeCallback<void>): void
 
   flushWAL (): Promise<void>
+  flushWAL (sync: boolean): Promise<void>
   flushWAL (options: RocksFlushWALOptions): Promise<void>
   flushWAL (callback: NodeCallback<void>): void
+  flushWAL (sync: boolean, callback: NodeCallback<void>): void
   flushWAL (options: RocksFlushWALOptions, callback: NodeCallback<void>): void
 
   [Symbol.asyncDispose] (): Promise<void>

@@ -223,6 +223,10 @@ db.compactRange((err) => {
 db.flushWAL((err) => {
   expectType<Error | null | undefined>(err)
 })
+expectType<Promise<void>>(db.flushWAL(true))
+db.flushWAL(false, (err) => {
+  expectType<Error | null | undefined>(err)
+})
 
 class DerivedRocksLevel extends RocksLevel {
   get currentSequence (): number {
