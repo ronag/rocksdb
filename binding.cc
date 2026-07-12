@@ -2649,6 +2649,10 @@ NAPI_METHOD(db_clear) {
   std::optional<std::string> gte;
   NAPI_STATUS_THROWS(GetProperty(env, options, "gte", gte));
 
+  // Match abstract-level range precedence when both forms are present.
+  if (gte) gt.reset();
+  if (lte) lt.reset();
+
   bool sync = false;
   NAPI_STATUS_THROWS(GetProperty(env, options, "sync", sync));
 
