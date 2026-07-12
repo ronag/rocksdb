@@ -45,3 +45,26 @@ test('query() callback form without encodings works', async function (t) {
   await db.close()
   t.end()
 })
+
+test('native query accepts utf8 and utf-8 encoding names', async function (t) {
+  const db = testCommon.factory()
+  await db.open()
+  await db.put('key', 'value')
+
+  for (const encoding of ['utf8', 'utf-8']) {
+    const sync = db.querySync({
+      keyEncoding: encoding,
+      valueEncoding: encoding
+    })
+    t.same(sync.rows, ['key', 'value'], `${encoding} works in querySync()`)
+
+    const asyncResult = await db.query({
+      keyEncoding: encoding,
+      valueEncoding: encoding
+    })
+    t.same(asyncResult.rows, ['key', 'value'], `${encoding} works in query()`)
+  }
+
+  await db.close()
+  t.end()
+})
