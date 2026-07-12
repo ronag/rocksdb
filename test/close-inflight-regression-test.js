@@ -73,7 +73,8 @@ test('close() while an async iterator nextv is in flight', async function (t) {
     await seed(db, 200)
     const it = db.iterator()
     const p = it._nextvAsync(50, {})
-    await Promise.all([db.close(), p.catch(() => {})])
+    const [, result] = await Promise.all([db.close(), p])
+    t.equal(result.rows.length, 100, 'in-flight iterator read completed before close')
   }
   t.pass('survived iterator-nextv+close')
   t.end()
@@ -94,12 +95,9 @@ test('close() waits for in-flight getMany', async function (t) {
       reads.push(db.getMany(keys))
     }
     await db.close()
-    const results = await Promise.all(reads.map((p) => p.catch(() => null)))
-    // Every read ran against a live db: it either completed or was cleanly
-    // rejected, never crashed on freed memory.
-    for (const r of results) {
-      if (r != null) t.equal(r.length, 200, 'getMany returned all rows')
-    }
+    const results = await Promise.all(reads)
+    t.ok(results.every((r) => r.length === 200 && r[199] === 'v199'),
+      'all getMany calls returned complete, correct rows before close')
   }
   t.pass('survived getMany+close')
   t.end()
@@ -112,9 +110,28 @@ test('close() while an updates read is in flight', async function (t) {
     await seed(db, 3)
     const gen = db.updates()
     const np = gen.next()
-    await Promise.all([db.close(), np.catch(() => {})])
-    await gen.return().catch(() => {})
+    const [, next] = await Promise.all([db.close(), np])
+    t.equal(next.done, false, 'in-flight update completed before close')
+    t.ok(next.value.rows.includes('put'), 'update contains the seeded write')
+    await gen.return()
   }
   t.pass('survived updates+close')
+  t.end()
+})
+
+test('close() waits for in-flight query and clear', async function (t) {
+  const queryDb = testCommon.factory()
+  await queryDb.open()
+  await seed(queryDb, 200)
+  const querying = queryDb.query({ limit: 25 })
+  const [, query] = await Promise.all([queryDb.close(), querying])
+  t.equal(query.rows.length, 50, 'query completed with 50 flattened entries (25 key/value pairs)')
+
+  const clearDb = testCommon.factory()
+  await clearDb.open()
+  await seed(clearDb, 200)
+  const clearing = clearDb.clear({ limit: 200 })
+  await Promise.all([clearDb.close(), clearing])
+  t.pass('clear completed before close tore down the database')
   t.end()
 })

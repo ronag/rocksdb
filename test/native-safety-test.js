@@ -198,6 +198,33 @@ test('stale column handles and closed native iterators fail safely', async funct
   t.end()
 })
 
+test('native iterator seek clamps discarded-row credit without bypassing its limit', async function (t) {
+  const context = binding.db_init(tempy.directory())
+  await nativeOpen(context)
+  const batch = binding.batch_init(context)
+  for (let i = 0; i < 5; i++) {
+    binding.batch_put(batch, Buffer.from(`0${i}`), Buffer.from('value'), {})
+  }
+  binding.batch_write_sync(context, batch, {})
+
+  const iterator = binding.iterator_init_sync(context, {
+    limit: 3,
+    keyEncoding: 'buffer',
+    valueEncoding: 'buffer'
+  })
+  const first = binding.iterator_nextv_sync(iterator, 1, {})
+  binding.iterator_seek_sync(iterator, Buffer.from('00'), 0x80000000)
+  const remaining = binding.iterator_nextv_sync(iterator, 10, {})
+
+  t.equal(first.rows.length / 2, 1, 'first native read consumes one row')
+  t.equal(remaining.rows.length / 2, 3, 'oversized credit cannot create a negative limit count')
+
+  binding.iterator_close_sync(iterator)
+  binding.batch_clear(batch)
+  await nativeClose(context)
+  t.end()
+})
+
 test('column names are defined safely and preserve embedded NUL bytes', async function (t) {
   const columns = Object.create(null)
   columns.default = {}
@@ -255,6 +282,36 @@ test('native synchronous reads cannot race database teardown', async function (t
 
   await nativeClose(context)
   t.pass('repeated close/read races completed without accessing a torn-down DB')
+  t.end()
+})
+
+test('native SliceLike byte ranges require finite integers', async function (t) {
+  const context = binding.db_init(tempy.directory())
+  await nativeOpen(context)
+  const buffer = Buffer.from('key')
+
+  t.doesNotThrow(() => binding.db_get_many_sync(context, [{
+    buffer,
+    byteOffset: 0,
+    byteLength: buffer.byteLength
+  }], {}), 'a valid SliceLike key is accepted')
+
+  for (const [name, byteOffset, byteLength] of [
+    ['fractional offset', 0.5, 1],
+    ['fractional length', 0, 0.5],
+    ['NaN offset', NaN, 1],
+    ['NaN length', 0, NaN],
+    ['infinite offset', Infinity, 1],
+    ['infinite length', 0, Infinity]
+  ]) {
+    t.throws(() => binding.db_get_many_sync(context, [{
+      buffer,
+      byteOffset,
+      byteLength
+    }], {}), /failed|argument|invalid/i, `${name} is rejected`)
+  }
+
+  await nativeClose(context)
   t.end()
 })
 

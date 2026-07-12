@@ -104,6 +104,29 @@ static napi_value ToError(napi_env env, const rocksdb::Status& status) {
   return CreateError(env, {}, msg);
 }
 
+template <typename T>
+static napi_status GetIntegerValue(napi_env env, napi_value value, T& result) {
+  static_assert(std::is_integral_v<T>);
+  double numeric;
+  NAPI_STATUS_RETURN(napi_get_value_double(env, value, &numeric));
+  if (!std::isfinite(numeric) || std::trunc(numeric) != numeric) {
+    return napi_invalid_arg;
+  }
+
+  // Compare against exact power-of-two bounds before converting. Casting the
+  // rounded double representation of uint64_t::max (2^64) is undefined; using
+  // max() directly also fails on platforms where long double == double.
+  const auto exclusiveUpper = std::ldexp(1.0, std::numeric_limits<T>::digits);
+  if constexpr (std::is_signed_v<T>) {
+    if (numeric < -exclusiveUpper || numeric >= exclusiveUpper) return napi_invalid_arg;
+  } else {
+    if (numeric < 0 || numeric >= exclusiveUpper) return napi_invalid_arg;
+  }
+
+  result = static_cast<T>(numeric);
+  return napi_ok;
+}
+
 static napi_status GetString(napi_env env, napi_value from, rocksdb::Slice& to) {
   bool isBuffer;
   NAPI_STATUS_RETURN(napi_is_buffer(env, from, &isBuffer));
@@ -132,14 +155,14 @@ static napi_status GetString(napi_env env, napi_value from, rocksdb::Slice& to) 
     {
       napi_value property;
       NAPI_STATUS_RETURN(napi_get_named_property(env, from, "byteOffset", &property));
-      NAPI_STATUS_RETURN(napi_get_value_int64(env, property, &pos));
+      NAPI_STATUS_RETURN(GetIntegerValue(env, property, pos));
     }
 
     int64_t len = 0;
     {
       napi_value property;
       NAPI_STATUS_RETURN(napi_get_named_property(env, from, "byteLength", &property));
-      NAPI_STATUS_RETURN(napi_get_value_int64(env, property, &len));
+      NAPI_STATUS_RETURN(GetIntegerValue(env, property, len));
     }
 
     if (pos < 0 || len < 0 || static_cast<uint64_t>(pos) > length ||
@@ -205,29 +228,6 @@ enum class Encoding { Invalid, Buffer, String };
 
 static napi_status GetValue(napi_env env, napi_value value, bool& result) {
   return napi_get_value_bool(env, value, &result);
-}
-
-template <typename T>
-static napi_status GetIntegerValue(napi_env env, napi_value value, T& result) {
-  static_assert(std::is_integral_v<T>);
-  double numeric;
-  NAPI_STATUS_RETURN(napi_get_value_double(env, value, &numeric));
-  if (!std::isfinite(numeric) || std::trunc(numeric) != numeric) {
-    return napi_invalid_arg;
-  }
-
-  // Compare against exact power-of-two bounds before converting. Casting the
-  // rounded double representation of uint64_t::max (2^64) is undefined; using
-  // max() directly also fails on platforms where long double == double.
-  const auto exclusiveUpper = std::ldexp(1.0, std::numeric_limits<T>::digits);
-  if constexpr (std::is_signed_v<T>) {
-    if (numeric < -exclusiveUpper || numeric >= exclusiveUpper) return napi_invalid_arg;
-  } else {
-    if (numeric < 0 || numeric >= exclusiveUpper) return napi_invalid_arg;
-  }
-
-  result = static_cast<T>(numeric);
-  return napi_ok;
 }
 
 static napi_status GetValue(napi_env env, napi_value value, int& result) {

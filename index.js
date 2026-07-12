@@ -8,7 +8,7 @@ const { ChainedBatch } = require('./chained-batch')
 const { RocksCache } = require('./cache')
 const { RocksWriteBufferManager } = require('./write-buffer-manager')
 const { RocksStatistics, getStatisticsContext } = require('./statistics')
-const { Iterator } = require('./iterator')
+const { Iterator, kNoFieldsNext } = require('./iterator')
 const fs = require('node:fs')
 const assert = require('node:assert')
 
@@ -17,6 +17,10 @@ const kColumns = Symbol('columns')
 const kPromise = Symbol('promise')
 const kRefs = Symbol('refs')
 const kPendingClose = Symbol('pendingClose')
+const partialResults = new WeakMap()
+const noFieldsIterators = new WeakSet()
+const noFieldsNextOptions = Object.freeze({ [kNoFieldsNext]: true })
+const deferredPartialResults = new WeakSet()
 
 const { kRef, kUnref } = require('./util')
 
@@ -120,7 +124,7 @@ class RocksLevel extends AbstractLevel {
           options = { ...options, statistics: getStatisticsContext(options.statistics) }
         }
 
-        binding.db_open(this[kContext], options, (err, columns) => {
+        binding.db_open(this[kContext], inheritColumnOptions(options), (err, columns) => {
           if (err) {
             failOpen(err)
           } else {
@@ -176,9 +180,8 @@ class RocksLevel extends AbstractLevel {
     callback = fromCallback(callback, kPromise)
 
     try {
-      const batch = this.batch()
-      batch.put(key, value, options ?? kEmpty)
-      batch.write(callback)
+      const column = options?.column
+      this._batch([{ type: 'put', key, value, column }], options ?? kEmpty, callback)
     } catch (err) {
       process.nextTick(callback, err)
     }
@@ -199,38 +202,120 @@ class RocksLevel extends AbstractLevel {
       } else {
         callback(null, val[0])
       }
-    })
+    }, false)
 
     return callback[kPromise]
   }
 
-  _getMany (keys, options, callback) {
-    return this._getManyAsync(keys, options, callback)
+  _getMany (keys, options, callback, allowPartial) {
+    callback = fromCallback(callback, kPromise)
+
+    this._getManyAsync(keys, options, (err, values) => {
+      if (err) {
+        callback(err)
+        return
+      }
+
+      maskPartialResults(values)
+      callback(null, values)
+    }, allowPartial)
+
+    return callback[kPromise]
   }
 
-  _getManyAsync (keys, options, callback) {
+  _getManyAsync (keys, options, callback, allowPartial) {
     if (keys.some(key => typeof key === 'string')) {
       keys = keys.map(key => typeof key === 'string' ? Buffer.from(key) : key)
     }
 
     callback = fromCallback(callback, kPromise)
+    let referenced = false
+    let bindingOptions = options
 
     try {
+      if (allowPartial == null) {
+        allowPartial = false
+        if ((typeof options === 'object' && options !== null) || typeof options === 'function') {
+          bindingOptions = new Proxy(options, {
+            get (target, property) {
+              const value = Reflect.get(target, property, target)
+              if (property === 'timeout' && typeof value === 'number' && value > 0) {
+                allowPartial = true
+              } else if (property === 'highWaterMarkBytes' && value != null) {
+                allowPartial = true
+              }
+              return value
+            }
+          })
+        }
+      }
       this[kRef]()
-      binding.db_get_many(this[kContext], keys, options ?? kEmpty, (err, val) => {
+      referenced = true
+      binding.db_get_many(this[kContext], keys, bindingOptions ?? kEmpty, (err, val) => {
         this[kUnref]()
         if (err) {
           callback(err)
+          return
+        }
+
+        const indexes = []
+        for (let i = 0; i < val.length; i++) {
+          if (val[i] === null) indexes.push(i)
+        }
+
+        if (indexes.length === 0) {
+          callback(null, val)
+        } else if (!allowPartial) {
+          const message = keys.length === 1
+            ? 'Multi-get stopped before the value was read'
+            : 'Multi-get stopped before every value was read'
+          callback(new ModuleError(message, {
+            code: 'LEVEL_ABORTED'
+          }))
         } else {
+          partialResults.set(val, indexes)
           callback(null, val)
         }
       })
     } catch (err) {
-      this[kUnref]()
+      if (referenced) this[kUnref]()
       process.nextTick(callback, err)
     }
 
     return callback[kPromise]
+  }
+
+  getMany (keys, options, callback) {
+    if (typeof options === 'function') {
+      callback = options
+      options = undefined
+    }
+    callback = fromCallback(callback, kPromise)
+    const deferPartialResults = deferredPartialResults.has(options)
+
+    const done = (err, values) => {
+      if (deferPartialResults) deferredPartialResults.delete(options)
+      if (!err && !deferPartialResults) restorePartialResults(values)
+      callback(err, values)
+    }
+
+    if (options === undefined) {
+      super.getMany(keys, done)
+    } else {
+      super.getMany(keys, options, done)
+    }
+
+    return callback[kPromise]
+  }
+
+  _sublevel (name, options) {
+    return wrapSublevel(super._sublevel(name, options))
+  }
+
+  iterator (options) {
+    options = snapshotIteratorOptions(options)
+    const iterator = super.iterator(options)
+    return wrapNoFieldsIterator(iterator, hasNoFields(options))
   }
 
   _getManySync (keys, options) {
@@ -245,9 +330,8 @@ class RocksLevel extends AbstractLevel {
     callback = fromCallback(callback, kPromise)
 
     try {
-      const batch = this.batch()
-      batch.del(key, options ?? kEmpty)
-      batch.write(callback)
+      const column = options?.column
+      this._batch([{ type: 'del', key, column }], options ?? kEmpty, callback)
     } catch (err) {
       process.nextTick(callback, err)
     }
@@ -317,7 +401,9 @@ class RocksLevel extends AbstractLevel {
   }
 
   _iterator (options) {
-    return new Iterator(this, this[kContext], options ?? kEmpty)
+    options = snapshotIteratorOptions(options)
+    const iterator = new Iterator(this, this[kContext], options ?? kEmpty)
+    return wrapNoFieldsIterator(iterator, hasNoFields(options))
   }
 
   get identity () {
@@ -376,11 +462,27 @@ class RocksLevel extends AbstractLevel {
   }
 
   query (options, callback) {
+    if (typeof options === 'function') {
+      callback = options
+      options = kEmpty
+    }
     callback = fromCallback(callback, kPromise)
 
+    if (this.status !== 'open') {
+      process.nextTick(callback, new ModuleError('Database is not open', {
+        code: 'LEVEL_DATABASE_NOT_OPEN'
+      }))
+      return callback[kPromise]
+    }
+
     try {
-      process.nextTick(callback, null, this.querySync(options))
+      this[kRef]()
+      binding.db_query(this[kContext], options ?? kEmpty, (err, value) => {
+        this[kUnref]()
+        callback(err, value)
+      })
     } catch (err) {
+      this[kUnref]()
       process.nextTick(callback, err)
     }
 
@@ -394,7 +496,7 @@ class RocksLevel extends AbstractLevel {
       })
     }
 
-    return binding.db_query(this[kContext], options ?? kEmpty)
+    return binding.db_query_sync(this[kContext], options ?? kEmpty)
   }
 
   async * updates (options) {
@@ -432,12 +534,17 @@ class RocksLevel extends AbstractLevel {
   }
 
   compactRange (options = {}, callback) {
+    if (typeof options === 'function') {
+      callback = options
+      options = kEmpty
+    }
     callback = fromCallback(callback, kPromise)
 
     if (this.status !== 'open') {
-      throw new ModuleError('Database is not open', {
+      process.nextTick(callback, new ModuleError('Database is not open', {
         code: 'LEVEL_DATABASE_NOT_OPEN'
-      })
+      }))
+      return callback[kPromise]
     }
 
     this[kRef]()
@@ -455,12 +562,17 @@ class RocksLevel extends AbstractLevel {
   }
 
   flushWAL (options = {}, callback) {
+    if (typeof options === 'function') {
+      callback = options
+      options = kEmpty
+    }
     callback = fromCallback(callback, kPromise)
 
     if (this.status !== 'open') {
-      throw new ModuleError('Database is not open', {
+      process.nextTick(callback, new ModuleError('Database is not open', {
         code: 'LEVEL_DATABASE_NOT_OPEN'
-      })
+      }))
+      return callback[kPromise]
     }
 
     this[kRef]()
@@ -476,6 +588,188 @@ class RocksLevel extends AbstractLevel {
 
     return callback[kPromise]
   }
+}
+
+function maskPartialResults (values) {
+  const indexes = partialResults.get(values)
+  if (indexes !== undefined) {
+    for (const index of indexes) values[index] = undefined
+  }
+}
+
+function restorePartialResults (values) {
+  const indexes = partialResults.get(values)
+  if (indexes !== undefined) {
+    partialResults.delete(values)
+    for (const index of indexes) values[index] = null
+  }
+}
+
+function snapshotIteratorOptions (options) {
+  if ((typeof options !== 'object' || options === null) && typeof options !== 'function') {
+    return options
+  }
+
+  const cache = new Map()
+  return new Proxy(options, {
+    get (target, property) {
+      if (!cache.has(property)) {
+        cache.set(property, Reflect.get(target, property, target))
+      }
+      return cache.get(property)
+    }
+  })
+}
+
+function hasNoFields (options) {
+  if (options === null || options === undefined) return false
+
+  const keys = Object.getOwnPropertyDescriptor(options, 'keys')
+  const values = Object.getOwnPropertyDescriptor(options, 'values')
+  return keys?.enumerable === true && values?.enumerable === true &&
+    options.keys === false && options.values === false
+}
+
+function wrapNoFieldsIterator (iterator, noFields) {
+  if (!noFields || noFieldsIterators.has(iterator)) return iterator
+
+  const next = iterator.next
+  Object.defineProperty(iterator, 'next', {
+    configurable: true,
+    writable: true,
+    value: function (callback) {
+      // AbstractIterator reserves undefined/undefined callback values as its
+      // end sentinel. nextv carries row boundaries explicitly, so route public
+      // promise iteration through it when both fields are disabled.
+      if (callback === undefined) {
+        return new Promise((resolve, reject) => {
+          this.nextv(1, noFieldsNextOptions, (err, entries) => {
+            if (err) reject(err)
+            else resolve(entries[0])
+          })
+        })
+      }
+
+      if (typeof callback !== 'function') return next.call(this, callback)
+
+      this.nextTick(callback, new TypeError(
+        'Callback-style next() is ambiguous when keys and values are disabled; ' +
+        'use promise-style next(), nextv() or all()'
+      ))
+    }
+  })
+
+  noFieldsIterators.add(iterator)
+  return iterator
+}
+
+function wrapSublevel (db) {
+  const getMany = db.getMany
+  Object.defineProperty(db, 'getMany', {
+    configurable: true,
+    writable: true,
+    value: function (keys, options, callback) {
+      if (typeof options === 'function') {
+        callback = options
+        options = undefined
+      }
+      callback = fromCallback(callback, kPromise)
+
+      getMany.call(this, keys, options, (err, values) => {
+        if (!err) restorePartialResults(values)
+        callback(err, values)
+      })
+
+      return callback[kPromise]
+    }
+  })
+
+  const getManyInternal = db._getMany
+  Object.defineProperty(db, '_getMany', {
+    configurable: true,
+    writable: true,
+    value: function (keys, options, callback) {
+      if ((typeof options !== 'object' || options === null) && typeof options !== 'function') {
+        return getManyInternal.call(this, keys, options, callback)
+      }
+
+      const marked = new Proxy(options, {
+        get (target, property) {
+          return Reflect.get(target, property, target)
+        }
+      })
+      deferredPartialResults.add(marked)
+      return getManyInternal.call(this, keys, marked, callback)
+    }
+  })
+
+  const iterator = db.iterator
+  Object.defineProperty(db, 'iterator', {
+    configurable: true,
+    writable: true,
+    value: function (options) {
+      options = snapshotIteratorOptions(options)
+      const result = iterator.call(this, options)
+      return wrapNoFieldsIterator(result, hasNoFields(options))
+    }
+  })
+
+  const sublevel = db._sublevel
+  Object.defineProperty(db, '_sublevel', {
+    configurable: true,
+    writable: true,
+    value: function (name, options) {
+      return wrapSublevel(sublevel.call(this, name, options))
+    }
+  })
+
+  return db
+}
+
+function inheritColumnOptions (options) {
+  let source
+  let inherited
+
+  return new Proxy(Object.create(options), {
+    get (target, property) {
+      const value = Reflect.get(options, property, options)
+      if (property !== 'columns' ||
+          ((typeof value !== 'object' || value === null) && typeof value !== 'function')) {
+        return value
+      }
+
+      if (value !== source) {
+        source = value
+        inherited = createInheritedColumns(value, options)
+      }
+      return inherited
+    }
+  })
+}
+
+function createInheritedColumns (columns, defaults) {
+  const inherited = new WeakMap()
+
+  return new Proxy(Object.create(columns), {
+    get (target, property) {
+      const column = Reflect.get(columns, property, columns)
+      if (typeof column !== 'object' || column === null) return column
+
+      let result = inherited.get(column)
+      if (result === undefined) {
+        result = new Proxy(Object.create(column), {
+          get (target, property) {
+            const value = Reflect.get(column, property, column)
+            return value !== undefined || Reflect.has(column, property)
+              ? value
+              : Reflect.get(defaults, property, defaults)
+          }
+        })
+        inherited.set(column, result)
+      }
+      return result
+    }
+  })
 }
 
 exports.RocksLevel = RocksLevel
