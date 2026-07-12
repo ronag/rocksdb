@@ -58,6 +58,10 @@ test('async getMany snapshots Buffer and SliceLike keys before queueing', functi
     timeout: 20000
   })
 
-  t.equal(result.status, 0, result.stderr || 'child completed successfully')
+  t.equal(
+    result.status,
+    0,
+    result.error ? result.error.message : result.stderr || 'child completed successfully'
+  )
   t.end()
 })
