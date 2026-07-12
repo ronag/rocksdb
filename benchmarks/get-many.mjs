@@ -44,8 +44,8 @@ try {
     const label = size < 1024 ? `${size} B` : `${size / 1024} KiB`
     const keys = []
     for (let n = 0; n < 256; n++) {
-      const key = `${n}-${size}`
-      keys.push(Buffer.from(key))
+      const key = Buffer.from(`${n}-${size}`)
+      keys.push(key)
       await db.put(key, Buffer.alloc(size, 0x5a))
     }
     const warmed = db._getManySync(keys, getOpts)
