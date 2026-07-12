@@ -1,10 +1,12 @@
 import { Buffer } from 'node:buffer'
+import { ok } from 'node:assert'
 
 import { AbstractLevel } from 'abstract-level'
 
 import {
   RocksCache,
   RocksBatchSlice,
+  RocksColumn,
   RocksFormat,
   RocksGetManyOptions,
   RocksLevel,
@@ -41,6 +43,16 @@ const db = new RocksLevel('/tmp/rocks-level-types')
 expectType<AbstractLevel<RocksFormat, string, string>>(db)
 expectType<Promise<RocksLevel<string, string>>>(RocksLevel.open('/tmp/rocks-level-types'))
 expectType<boolean | null>(ioUringAvailable())
+
+const missingColumn = db.columns.missing
+expectType<RocksColumn | undefined>(missingColumn)
+// @ts-expect-error A dynamic column lookup must be narrowed before use as a handle
+expectType<RocksColumn>(missingColumn)
+
+const defaultColumn = db.columns.default
+ok(defaultColumn)
+expectType<RocksColumn>(defaultColumn)
+expectType<Promise<string>>(db.get('key', { column: defaultColumn }))
 
 const cache = new RocksCache({ capacity: 1024 })
 expectType<bigint>(cache.handle)
@@ -85,6 +97,14 @@ expectType<Array<Buffer>>(query.rows)
 expectType<Array<string>>(
   db.querySync({ keyEncoding: 'utf8', valueEncoding: 'utf8' }).rows
 )
+expectType<Array<string>>(
+  db.querySync({ keyEncoding: 'utf-8', valueEncoding: 'utf-8' }).rows
+)
+expectType<Promise<{
+  readonly rows: Array<string>
+  readonly finished: boolean
+  readonly limited: boolean
+}>>(db.query({ keyEncoding: 'utf-8', valueEncoding: 'utf-8' }))
 expectType<Array<Buffer | undefined>>(
   db.querySync({ keys: false, values: true }).rows
 )
@@ -225,6 +245,10 @@ db.compactRange((err) => {
 })
 
 db.flushWAL((err) => {
+  expectType<Error | null | undefined>(err)
+})
+expectType<Promise<void>>(db.flushWAL(true))
+db.flushWAL(false, (err) => {
   expectType<Error | null | undefined>(err)
 })
 

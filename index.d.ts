@@ -38,9 +38,9 @@ export type RocksSlice = RocksFormat
 export type RocksSlicePart = Buffer | SliceLike
 export type RocksSliceParts = readonly RocksSlicePart[]
 export type RocksBatchSlice = RocksSlicePart | RocksSliceParts
-export type RocksNativeEncoding = 'buffer' | 'view' | 'utf8'
+export type RocksNativeEncoding = 'buffer' | 'view' | 'utf8' | 'utf-8'
 export type RocksNativeValue = string | Buffer
-export type RocksDecoded<E extends RocksNativeEncoding> = E extends 'utf8' ? string : Buffer
+export type RocksDecoded<E extends RocksNativeEncoding> = E extends 'utf8' | 'utf-8' ? string : Buffer
 
 declare const columnHandleBrand: unique symbol
 declare const cacheHandleBrand: unique symbol
@@ -509,7 +509,7 @@ export class RocksLevel<KDefault = string, VDefault = string>
   ): Promise<RocksLevel<KDefault, VDefault>>
 
   get sequence (): number
-  get columns (): Readonly<Record<string, RocksColumn>>
+  get columns (): Readonly<Record<string, RocksColumn | undefined>>
   get handle (): bigint
   get location (): string
   get identity (): string
@@ -699,8 +699,10 @@ export class RocksLevel<KDefault = string, VDefault = string>
   compactRange (options: RocksCompactRangeOptions, callback: NodeCallback<void>): void
 
   flushWAL (): Promise<void>
+  flushWAL (sync: boolean): Promise<void>
   flushWAL (options: RocksFlushWALOptions): Promise<void>
   flushWAL (callback: NodeCallback<void>): void
+  flushWAL (sync: boolean, callback: NodeCallback<void>): void
   flushWAL (options: RocksFlushWALOptions, callback: NodeCallback<void>): void
 
   [Symbol.asyncDispose] (): Promise<void>
