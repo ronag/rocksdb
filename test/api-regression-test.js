@@ -288,6 +288,46 @@ test('getMany reports option accessor failures asynchronously', async function (
   t.end()
 })
 
+test('raw getMany reads bounded option accessors once', async function (t) {
+  const db = testCommon.factory()
+  await db.open()
+  let timeoutReads = 0
+  let highWaterMarkReads = 0
+  const options = {}
+  Object.defineProperties(options, {
+    valueEncoding: {
+      get () {
+        if (this !== options) throw new Error('invalid option receiver')
+        return 'buffer'
+      }
+    },
+    timeout: {
+      get: () => {
+        timeoutReads++
+        return 0
+      }
+    },
+    highWaterMarkBytes: {
+      get: () => {
+        highWaterMarkReads++
+        return 0
+      }
+    }
+  })
+
+  await db._getManyAsync(['missing'], options)
+  t.equal(timeoutReads, 1, 'timeout getter is evaluated once')
+  t.equal(highWaterMarkReads, 1, 'high-water-mark getter is evaluated once')
+
+  const callableOptions = () => {}
+  callableOptions.highWaterMarkBytes = 0
+  const callableErr = await rejection(db._getManyAsync(['missing'], callableOptions))
+  t.ok(callableErr, 'callable options remain invalid')
+
+  await db.close()
+  t.end()
+})
+
 test('put and del report option spread failures asynchronously', async function (t) {
   const db = testCommon.factory()
   await db.open()

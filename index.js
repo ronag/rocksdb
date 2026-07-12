@@ -228,14 +228,39 @@ class RocksLevel extends AbstractLevel {
 
     callback = fromCallback(callback, kPromise)
     let referenced = false
+    let bindingOptions = options
 
     try {
-      allowPartial ??= options != null && (
-        options.timeout > 0 || options.highWaterMarkBytes != null
-      )
+      if (allowPartial == null) {
+        if (options == null) {
+          allowPartial = false
+        } else {
+          const timeout = options.timeout
+          let highWaterMarkBytes
+          let hasHighWaterMark = false
+
+          if (timeout > 0) {
+            allowPartial = true
+          } else {
+            highWaterMarkBytes = options.highWaterMarkBytes
+            hasHighWaterMark = true
+            allowPartial = highWaterMarkBytes != null
+          }
+
+          if (typeof options === 'object' || typeof options === 'function') {
+            bindingOptions = new Proxy(options, {
+              get (target, property) {
+                if (property === 'timeout') return timeout
+                if (hasHighWaterMark && property === 'highWaterMarkBytes') return highWaterMarkBytes
+                return Reflect.get(target, property, target)
+              }
+            })
+          }
+        }
+      }
       this[kRef]()
       referenced = true
-      binding.db_get_many(this[kContext], keys, options ?? kEmpty, (err, val) => {
+      binding.db_get_many(this[kContext], keys, bindingOptions ?? kEmpty, (err, val) => {
         this[kUnref]()
         if (err) {
           callback(err)
