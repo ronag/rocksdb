@@ -23,6 +23,7 @@
 #include <re2/re2.h>
 
 #include <algorithm>
+#include <array>
 #include <atomic>
 #include <cmath>
 #include <condition_variable>

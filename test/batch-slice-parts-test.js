@@ -29,7 +29,7 @@ test('batch put concatenates Buffer and SliceLike parts synchronously', async fu
   const batch = db.batch()
   batch._putParts(keyParts, valueParts)
 
-  // WriteBatch owns the concatenated bytes as soon as _put() returns.
+  // WriteBatch owns the concatenated bytes as soon as _putParts() returns.
   keyTail.fill(0)
   valueMiddle.fill(0)
   valueParts[0].fill(0)
