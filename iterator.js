@@ -448,6 +448,59 @@ class Iterator extends AbstractIterator {
     })
   }
 
+  _nextvPackedAsync (size, options, callback) {
+    assert(this[kContext])
+    assert(!this[kBusy])
+
+    callback = fromCallback(callback, kPromise)
+
+    if (this[kPosition] < this[kCache].length) {
+      process.nextTick(callback, new ModuleError(
+        'Cannot read packed rows while prefetched iterator rows remain',
+        { code: 'LEVEL_NOT_SUPPORTED' }
+      ))
+      return callback[kPromise]
+    }
+
+    if (this[kFinished]) {
+      process.nextTick(callback, null, {
+        buffer: Buffer.alloc(0),
+        offsets: new Uint32Array([0]),
+        count: 0,
+        finished: true,
+        limited: false
+      })
+      return callback[kPromise]
+    }
+
+    let referenced = false
+    try {
+      this[kDB][kRef]()
+      referenced = true
+      this[kBusy] = true
+      binding.iterator_nextv_packed(this[kContext], size, options, (err, result) => {
+        this[kBusy] = false
+        this[kDB][kUnref]()
+
+        try {
+          if (err) {
+            callback(err)
+          } else {
+            this[kFinished] = result.finished
+            callback(null, result)
+          }
+        } finally {
+          this._flushPendingClose()
+        }
+      })
+    } catch (err) {
+      if (referenced) this[kDB][kUnref]()
+      this._deferNextResult(callback, err)
+    }
+
+    return callback[kPromise]
+  }
+
   _closeSync () {
     assert(!this[kBusy])
 
