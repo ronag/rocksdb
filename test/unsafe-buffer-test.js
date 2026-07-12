@@ -102,7 +102,7 @@ test('packed iterator arena survives iterator close and forced GC', async functi
   t.end()
 })
 
-test('async getMany retains borrowed key buffers through forced GC', async function (t) {
+test('async getMany snapshots key buffers through forced GC', async function (t) {
   if (!global.gc) {
     t.pass('forced-GC variant runs through test/gc.js')
     t.end()
@@ -113,19 +113,19 @@ test('async getMany retains borrowed key buffers through forced GC', async funct
   await db.open()
   await db.batch(Array.from({ length: 1000 }, (_, i) => ({
     type: 'put',
-    key: Buffer.from('borrowed-' + String(i).padStart(4, '0')),
+    key: Buffer.from('snapshot-' + String(i).padStart(4, '0')),
     value: Buffer.from('value-' + i)
   })))
 
   let keys = Array.from({ length: 1000 }, (_, i) =>
-    Buffer.from('borrowed-' + String(i).padStart(4, '0')))
+    Buffer.from('snapshot-' + String(i).padStart(4, '0')))
   const pending = db._getMany(keys, { valueEncoding: 'buffer' })
   keys = null
   for (let i = 0; i < 4; i++) global.gc()
 
   const values = await pending
-  t.equal(values.length, 1000, 'all borrowed keys remained alive')
-  t.equal(values[999].toString(), 'value-999', 'the final borrowed key read the correct value')
+  t.equal(values.length, 1000, 'all snapshotted keys were read')
+  t.equal(values[999].toString(), 'value-999', 'the final snapshotted key read the correct value')
   await db.close()
   t.end()
 })
