@@ -132,14 +132,17 @@ expectTrue<Equal<
 const publicNoFieldsIterator = db.iterator({ keys: false, values: false })
 const publicNoFieldsNext = publicNoFieldsIterator.next()
 const publicNoFieldsAll = publicNoFieldsIterator.all()
-expectTrue<Equal<Awaited<typeof publicNoFieldsNext>, undefined>>()
+expectTrue<Equal<
+  Awaited<typeof publicNoFieldsNext>,
+  [undefined, undefined] | undefined
+>>()
 expectTrue<Equal<
   Awaited<typeof publicNoFieldsAll>,
   Array<[undefined, undefined]>
 >>()
 expectTrue<Equal<
   ReturnType<typeof publicNoFieldsIterator[typeof Symbol.asyncIterator]>,
-  AsyncGenerator<never, void, unknown>
+  AsyncGenerator<[undefined, undefined], void, unknown>
 >>()
 
 const valuesOnlyIterator = db._iterator({

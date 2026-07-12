@@ -310,9 +310,8 @@ export type RocksRows<
 
 export type RocksIteratorKey<K, Keys extends boolean> = Keys extends false ? undefined : K
 export type RocksIteratorValue<V, Values extends boolean> = Values extends false ? undefined : V
-// AbstractIterator reserves an undefined/undefined single entry as its end sentinel.
 export type RocksIteratorEntry<K, V, Keys extends boolean, Values extends boolean> = Keys extends false
-  ? Values extends false ? never : [undefined, V]
+  ? Values extends false ? [undefined, undefined] : [undefined, V]
   : Values extends false ? [K, undefined] : [K, V]
 
 export interface RocksRawIteratorResult<
