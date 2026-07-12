@@ -87,14 +87,10 @@ class Iterator extends AbstractIterator {
 
     if (typeof callback !== 'function') return super.next(callback)
 
-    this.nextv(1, (err, entries) => {
-      if (err) {
-        callback(err)
-      } else {
-        const entry = entries[0]
-        callback(null, entry?.[0], entry?.[1])
-      }
-    })
+    process.nextTick(callback, new TypeError(
+      'Callback-style next() is ambiguous when keys and values are disabled; ' +
+      'use promise-style next(), nextv() or all()'
+    ))
   }
 
   _next (callback) {

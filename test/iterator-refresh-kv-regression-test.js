@@ -71,29 +71,18 @@ test('iterator with keys:false and values:false yields undefined pairs', async f
   await nextIterator.close()
 
   const callbackIterator = db.iterator({ keys: false, values: false })
-  await new Promise((resolve, reject) => {
-    callbackIterator.next((err, key, value) => {
-      if (err) return reject(err)
-      t.is(key, undefined, 'callback next omits the disabled key')
-      t.is(value, undefined, 'callback next omits the disabled value')
+  await new Promise((resolve) => {
+    callbackIterator.next((err) => {
+      t.ok(err instanceof TypeError, 'callback next rejects the ambiguous result')
+      t.match(err.message, /use promise-style next\(\), nextv\(\) or all\(\)/,
+        'callback error points to unambiguous alternatives')
       resolve()
     })
   })
-  t.is(callbackIterator.count, 1, 'callback next still consumes one entry')
+  t.is(callbackIterator.count, 0, 'rejected callback next does not consume an entry')
+  t.same(await callbackIterator.next(), [undefined, undefined],
+    'promise next can still consume the first entry')
   await callbackIterator.close()
-
-  const exhaustedCallbackIterator = db.iterator({ keys: false, values: false, limit: 0 })
-  await new Promise((resolve, reject) => {
-    exhaustedCallbackIterator.next(function (err, key, value) {
-      if (err) return reject(err)
-      t.is(arguments.length, 3, 'exhausted callback preserves next callback arity')
-      t.is(err, null, 'exhausted callback uses a null error')
-      t.is(key, undefined, 'exhausted callback omits the key')
-      t.is(value, undefined, 'exhausted callback omits the value')
-      resolve()
-    })
-  })
-  await exhaustedCallbackIterator.close()
 
   let iterated = 0
   for await (const entry of db.iterator({ keys: false, values: false })) {
