@@ -154,10 +154,7 @@ class Iterator extends AbstractIterator {
       if (this[kPosition] < this[kCache].length || this[kFinished]) {
         this._nextvAsync(size, null, done)
       } else {
-        // Native limit accounting includes prefetched rows. Keep finite-limit
-        // reads one-at-a-time so seek() cannot discard rows that AbstractLevel
-        // still expects to be deliverable under its own limit counter.
-        const prefetch = this[kFirst] || this.limit < Infinity ? 1 : 1000
+        const prefetch = this[kFirst] ? 1 : 1000
         this[kFirst] = false
 
         this._nextvAsync(prefetch, null, (err, result) => {
@@ -200,12 +197,13 @@ class Iterator extends AbstractIterator {
       throw new Error('cannot seek() to an empty target')
     }
 
+    const discardedCount = (this[kCache].length - this[kPosition]) / 2
     this[kFirst] = true
     this[kCache] = kEmpty
     this[kFinished] = false
     this[kPosition] = 0
 
-    binding.iterator_seek_sync(this[kContext], target)
+    binding.iterator_seek_sync(this[kContext], target, discardedCount)
   }
 
   _seekAsync (target, callback) {
@@ -214,6 +212,7 @@ class Iterator extends AbstractIterator {
 
     callback = fromCallback(callback, kPromise)
 
+    const discardedCount = (this[kCache].length - this[kPosition]) / 2
     this[kFirst] = true
     this[kCache] = kEmpty
     this[kFinished] = false
@@ -222,7 +221,7 @@ class Iterator extends AbstractIterator {
     try {
       this[kDB][kRef]()
       this[kBusy] = true
-      binding.iterator_seek(this[kContext], target, (err) => {
+      binding.iterator_seek(this[kContext], target, discardedCount, (err) => {
         this[kBusy] = false
         this[kDB][kUnref]()
 
