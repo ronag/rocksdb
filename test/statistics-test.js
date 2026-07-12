@@ -214,7 +214,10 @@ test('statistics resource: exact ticker shape and strict options', (t) => {
   t.equal(statistics.setStatisticsEnabled(true), true, 'resource can enable collection')
   t.equal(statistics.setStatisticsEnabled(false), true, 'resource can disable collection')
 
-  const invalidToggleError = new TypeError("The 'enabled' argument must be a boolean")
+  const invalidToggleError = {
+    name: 'TypeError',
+    message: "The 'enabled' argument must be a boolean"
+  }
   t.throws(() => statistics.setStatisticsEnabled(), invalidToggleError, 'toggle rejects an omitted argument')
   for (const [label, enabled] of [
     ['null', null],
