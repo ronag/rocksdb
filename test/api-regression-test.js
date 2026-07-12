@@ -176,6 +176,7 @@ test('raw bounded getMany preserves partial markers', async function (t) {
 
   try {
     binding.db_get_many = (context, keys, options, callback) => {
+      t.equal(options.highWaterMarkBytes, 0, 'stub observes the native bound')
       process.nextTick(callback, null, [Buffer.from('value'), undefined, null])
     }
 
@@ -323,6 +324,157 @@ test('raw getMany reads bounded option accessors once', async function (t) {
   callableOptions.highWaterMarkBytes = 0
   const callableErr = await rejection(db._getManyAsync(['missing'], callableOptions))
   t.ok(callableErr, 'callable options remain invalid')
+
+  await db.close()
+  t.end()
+})
+
+test('raw getMany observes bounded options in native order', async function (t) {
+  const db = testCommon.factory()
+  await db.open()
+  const dbGetMany = binding.db_get_many
+  let timeout = 0
+  const reads = []
+  const options = {}
+  Object.defineProperties(options, {
+    column: {
+      get () {
+        reads.push('column')
+        return undefined
+      }
+    },
+    valueEncoding: {
+      get () {
+        reads.push('valueEncoding')
+        timeout = 1
+        return 'buffer'
+      }
+    },
+    timeout: {
+      get () {
+        reads.push(`timeout:${timeout}`)
+        return timeout
+      }
+    },
+    unsafe: {
+      get () {
+        reads.push('unsafe')
+        return false
+      }
+    },
+    fillCache: {
+      get () {
+        reads.push('fillCache')
+        return false
+      }
+    },
+    asyncIO: {
+      get () {
+        reads.push('asyncIO')
+        return false
+      }
+    },
+    optimizeMultigetForIO: {
+      get () {
+        reads.push('optimizeMultigetForIO')
+        return true
+      }
+    },
+    highWaterMarkBytes: {
+      get () {
+        reads.push('highWaterMarkBytes')
+        return undefined
+      }
+    }
+  })
+
+  try {
+    binding.db_get_many = (context, keys, nativeOptions, callback) => {
+      const observed = [
+        nativeOptions.column,
+        nativeOptions.valueEncoding,
+        nativeOptions.timeout,
+        nativeOptions.unsafe,
+        nativeOptions.fillCache,
+        nativeOptions.asyncIO,
+        nativeOptions.optimizeMultigetForIO,
+        nativeOptions.highWaterMarkBytes
+      ]
+      t.equal(observed.length, 8, 'stub reads every native getMany option')
+      process.nextTick(callback, null, [null])
+    }
+
+    const rows = await db._getManyAsync([Buffer.from('key')], options)
+    t.same(reads, [
+      'column',
+      'valueEncoding',
+      'timeout:1',
+      'unsafe',
+      'fillCache',
+      'asyncIO',
+      'optimizeMultigetForIO',
+      'highWaterMarkBytes'
+    ], 'bounded-read inference follows native option access order')
+    t.same(rows, [null], 'the observed timeout enables a partial result')
+  } finally {
+    binding.db_get_many = dbGetMany
+    await db.close()
+  }
+  t.end()
+})
+
+test('getMany does not inspect symbols on user options', async function (t) {
+  const db = testCommon.factory()
+  await db.open()
+  let symbolReads = 0
+  const options = new Proxy({}, {
+    get (target, property, receiver) {
+      if (typeof property === 'symbol') {
+        symbolReads++
+        throw new Error('private symbol read')
+      }
+      return Reflect.get(target, property, receiver)
+    }
+  })
+
+  await new Promise((resolve) => {
+    let synchronous = true
+    try {
+      db.getMany([], options, (err, rows) => {
+        t.notOk(synchronous, 'callback is asynchronous')
+        t.error(err)
+        t.same(rows, [])
+        resolve()
+      })
+    } catch (err) {
+      t.fail(`threw synchronously: ${err.message}`)
+      resolve()
+    }
+    synchronous = false
+  })
+  t.equal(symbolReads, 0, 'user options are not probed with private symbols')
+
+  await db.close()
+  t.end()
+})
+
+test('sublevel getMany preserves option accessor receivers', async function (t) {
+  const db = testCommon.factory()
+  await db.open()
+  const sublevel = db.sublevel('sublevel')
+  const options = { keyEncoding: 'utf8', valueEncoding: 'utf8' }
+  let reads = 0
+  Object.defineProperty(options, 'timeout', {
+    enumerable: true,
+    get () {
+      t.equal(this, options, 'accessor receiver is the original options object')
+      reads++
+      return 0
+    }
+  })
+
+  t.same(await sublevel.getMany(['missing'], options), [undefined])
+  t.equal(reads, 1, 'bounded option accessor is read once')
 
   await db.close()
   t.end()

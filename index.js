@@ -17,10 +17,10 @@ const kColumns = Symbol('columns')
 const kPromise = Symbol('promise')
 const kRefs = Symbol('refs')
 const kPendingClose = Symbol('pendingClose')
-const kDeferPartialResults = Symbol('deferPartialResults')
 const partialResults = new WeakMap()
 const noFieldsIterators = new WeakSet()
 const noFieldsNextOptions = Object.freeze({ [kNoFieldsNext]: true })
+const deferredPartialResults = new WeakSet()
 
 const { kRef, kUnref } = require('./util')
 
@@ -234,30 +234,19 @@ class RocksLevel extends AbstractLevel {
 
     try {
       if (allowPartial == null) {
-        if (options == null) {
-          allowPartial = false
-        } else {
-          const timeout = options.timeout
-          let highWaterMarkBytes
-          let hasHighWaterMark = false
-
-          if (timeout > 0) {
-            allowPartial = true
-          } else {
-            highWaterMarkBytes = options.highWaterMarkBytes
-            hasHighWaterMark = true
-            allowPartial = highWaterMarkBytes != null
-          }
-
-          if (typeof options === 'object' || typeof options === 'function') {
-            bindingOptions = new Proxy(options, {
-              get (target, property) {
-                if (property === 'timeout') return timeout
-                if (hasHighWaterMark && property === 'highWaterMarkBytes') return highWaterMarkBytes
-                return Reflect.get(target, property, target)
+        allowPartial = false
+        if ((typeof options === 'object' && options !== null) || typeof options === 'function') {
+          bindingOptions = new Proxy(options, {
+            get (target, property) {
+              const value = Reflect.get(target, property, target)
+              if (property === 'timeout' && typeof value === 'number' && value > 0) {
+                allowPartial = true
+              } else if (property === 'highWaterMarkBytes' && value != null) {
+                allowPartial = true
               }
-            })
-          }
+              return value
+            }
+          })
         }
       }
       this[kRef]()
@@ -302,9 +291,10 @@ class RocksLevel extends AbstractLevel {
       options = undefined
     }
     callback = fromCallback(callback, kPromise)
-    const deferPartialResults = options != null && options[kDeferPartialResults] === true
+    const deferPartialResults = deferredPartialResults.has(options)
 
     const done = (err, values) => {
+      if (deferPartialResults) deferredPartialResults.delete(options)
       if (!err && !deferPartialResults) restorePartialResults(values)
       callback(err, values)
     }
@@ -615,23 +605,6 @@ function restorePartialResults (values) {
   }
 }
 
-function markSublevelOptions (options) {
-  if (options === undefined || options === null) {
-    return { [kDeferPartialResults]: true }
-  }
-  if (typeof options !== 'object') return options
-
-  const marked = Object.create(
-    Object.getPrototypeOf(options),
-    Object.getOwnPropertyDescriptors(options)
-  )
-  Object.defineProperty(marked, kDeferPartialResults, {
-    value: true,
-    enumerable: true
-  })
-  return marked
-}
-
 function snapshotIteratorOptions (options) {
   if ((typeof options !== 'object' || options === null) && typeof options !== 'function') {
     return options
@@ -702,12 +675,31 @@ function wrapSublevel (db) {
       }
       callback = fromCallback(callback, kPromise)
 
-      getMany.call(this, keys, markSublevelOptions(options), (err, values) => {
+      getMany.call(this, keys, options, (err, values) => {
         if (!err) restorePartialResults(values)
         callback(err, values)
       })
 
       return callback[kPromise]
+    }
+  })
+
+  const getManyInternal = db._getMany
+  Object.defineProperty(db, '_getMany', {
+    configurable: true,
+    writable: true,
+    value: function (keys, options, callback) {
+      if ((typeof options !== 'object' || options === null) && typeof options !== 'function') {
+        return getManyInternal.call(this, keys, options, callback)
+      }
+
+      const marked = new Proxy(options, {
+        get (target, property) {
+          return Reflect.get(target, property, target)
+        }
+      })
+      deferredPartialResults.add(marked)
+      return getManyInternal.call(this, keys, marked, callback)
     }
   })
 
