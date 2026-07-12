@@ -8,7 +8,7 @@ const { ChainedBatch } = require('./chained-batch')
 const { RocksCache } = require('./cache')
 const { RocksWriteBufferManager } = require('./write-buffer-manager')
 const { RocksStatistics, getStatisticsContext } = require('./statistics')
-const { Iterator } = require('./iterator')
+const { Iterator, kNoFieldsNext } = require('./iterator')
 const fs = require('node:fs')
 const assert = require('node:assert')
 
@@ -19,6 +19,8 @@ const kRefs = Symbol('refs')
 const kPendingClose = Symbol('pendingClose')
 const kDeferPartialResults = Symbol('deferPartialResults')
 const partialResults = new WeakMap()
+const noFieldsIterators = new WeakSet()
+const noFieldsNextOptions = Object.freeze({ [kNoFieldsNext]: true })
 
 const { kRef, kUnref } = require('./util')
 
@@ -320,6 +322,12 @@ class RocksLevel extends AbstractLevel {
     return wrapSublevel(super._sublevel(name, options))
   }
 
+  iterator (options) {
+    options = snapshotIteratorOptions(options)
+    const iterator = super.iterator(options)
+    return wrapNoFieldsIterator(iterator, hasNoFields(options))
+  }
+
   _getManySync (keys, options) {
     if (keys.some(key => typeof key === 'string')) {
       keys = keys.map(key => typeof key === 'string' ? Buffer.from(key) : key)
@@ -403,7 +411,9 @@ class RocksLevel extends AbstractLevel {
   }
 
   _iterator (options) {
-    return new Iterator(this, this[kContext], options ?? kEmpty)
+    options = snapshotIteratorOptions(options)
+    const iterator = new Iterator(this, this[kContext], options ?? kEmpty)
+    return wrapNoFieldsIterator(iterator, hasNoFields(options))
   }
 
   get identity () {
@@ -622,6 +632,64 @@ function markSublevelOptions (options) {
   return marked
 }
 
+function snapshotIteratorOptions (options) {
+  if ((typeof options !== 'object' || options === null) && typeof options !== 'function') {
+    return options
+  }
+
+  const cache = new Map()
+  return new Proxy(options, {
+    get (target, property) {
+      if (!cache.has(property)) {
+        cache.set(property, Reflect.get(target, property, target))
+      }
+      return cache.get(property)
+    }
+  })
+}
+
+function hasNoFields (options) {
+  if (options === null || options === undefined) return false
+
+  const keys = Object.getOwnPropertyDescriptor(options, 'keys')
+  const values = Object.getOwnPropertyDescriptor(options, 'values')
+  return keys?.enumerable === true && values?.enumerable === true &&
+    options.keys === false && options.values === false
+}
+
+function wrapNoFieldsIterator (iterator, noFields) {
+  if (!noFields || noFieldsIterators.has(iterator)) return iterator
+
+  const next = iterator.next
+  Object.defineProperty(iterator, 'next', {
+    configurable: true,
+    writable: true,
+    value: function (callback) {
+      // AbstractIterator reserves undefined/undefined callback values as its
+      // end sentinel. nextv carries row boundaries explicitly, so route public
+      // promise iteration through it when both fields are disabled.
+      if (callback === undefined) {
+        return new Promise((resolve, reject) => {
+          this.nextv(1, noFieldsNextOptions, (err, entries) => {
+            if (err) reject(err)
+            else resolve(entries[0])
+          })
+        })
+      }
+
+      if (typeof callback !== 'function') return next.call(this, callback)
+
+      this.nextTick(callback, new TypeError(
+        'Callback-style next() is ambiguous when keys and values are disabled; ' +
+        'use promise-style next(), nextv() or all()'
+      ))
+    }
+  })
+
+  noFieldsIterators.add(iterator)
+  return iterator
+}
+
 function wrapSublevel (db) {
   const getMany = db.getMany
   Object.defineProperty(db, 'getMany', {
@@ -640,6 +708,17 @@ function wrapSublevel (db) {
       })
 
       return callback[kPromise]
+    }
+  })
+
+  const iterator = db.iterator
+  Object.defineProperty(db, 'iterator', {
+    configurable: true,
+    writable: true,
+    value: function (options) {
+      options = snapshotIteratorOptions(options)
+      const result = iterator.call(this, options)
+      return wrapNoFieldsIterator(result, hasNoFields(options))
     }
   })
 
