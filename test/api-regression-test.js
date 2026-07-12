@@ -112,6 +112,60 @@ test('query, compactRange and flushWAL support callback-only overloads', async f
   t.end()
 })
 
+test('flushWAL validates options instead of silently weakening sync', async function (t) {
+  const db = testCommon.factory()
+  await db.open()
+
+  for (const [name, options] of [
+    ['null', null],
+    ['boolean', true],
+    ['number', 1],
+    ['string', 'sync'],
+    ['array', []],
+    ['invalid sync', { sync: 1 }]
+  ]) {
+    const err = await rejection(db.flushWAL(options))
+    t.ok(err instanceof TypeError, `${name} options reject with TypeError`)
+  }
+
+  await new Promise((resolve) => {
+    let synchronous = true
+    db.flushWAL(true, (err) => {
+      t.notOk(synchronous, 'invalid callback options reject asynchronously')
+      t.ok(err instanceof TypeError, 'callback receives the validation error')
+      resolve()
+    })
+    synchronous = false
+  })
+
+  const options = {}
+  let reads = 0
+  Object.defineProperty(options, 'sync', {
+    get () {
+      t.equal(this, options, 'sync accessor receiver is the original options object')
+      reads++
+      return true
+    }
+  })
+
+  let nativeSync
+  const originalFlushWAL = binding.db_flush_wal
+  binding.db_flush_wal = function (context, sync, callback) {
+    nativeSync = sync
+    return originalFlushWAL(context, sync, callback)
+  }
+  try {
+    await db.flushWAL(options)
+  } finally {
+    binding.db_flush_wal = originalFlushWAL
+  }
+  t.equal(reads, 1, 'sync is read exactly once')
+  t.equal(nativeSync, true, 'sync:true reaches the native binding')
+
+  await db.close()
+  t.end()
+})
+
 test('array batch reports a foreign column through its callback', async function (t) {
   const first = testCommon.factory()
   const second = testCommon.factory()
