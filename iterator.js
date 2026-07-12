@@ -17,7 +17,7 @@ const kPosition = Symbol('position')
 const kBusy = Symbol('busy')
 const kPendingClose = Symbol('pendingClose')
 const kHasFilter = Symbol('hasFilter')
-const kNoFields = Symbol('noFields')
+const kNoFieldsNext = Symbol('noFieldsNext')
 
 const kEmpty = Object.freeze([])
 
@@ -35,7 +35,6 @@ class Iterator extends AbstractIterator {
     this[kBusy] = false
     this[kPendingClose] = null
     this[kHasFilter] = options.keyFilter != null || options.valueFilter != null
-    this[kNoFields] = options.keys === false && options.values === false
   }
 
   [Symbol.asyncDispose] () {
@@ -73,24 +72,6 @@ class Iterator extends AbstractIterator {
   // Undocumented, exposed for tests only
   get cached () {
     return (this[kCache].length - this[kPosition]) / 2
-  }
-
-  // AbstractIterator reserves an undefined/undefined _next callback as its end
-  // sentinel. The already-correct nextv path carries an explicit entries array,
-  // so use that when both fields are intentionally disabled.
-  next (callback) {
-    if (!this[kNoFields]) return super.next(callback)
-
-    if (callback === undefined) {
-      return this.nextv(1).then((entries) => entries[0])
-    }
-
-    if (typeof callback !== 'function') return super.next(callback)
-
-    process.nextTick(callback, new TypeError(
-      'Callback-style next() is ambiguous when keys and values are disabled; ' +
-      'use promise-style next(), nextv() or all()'
-    ))
   }
 
   _next (callback) {
@@ -154,7 +135,7 @@ class Iterator extends AbstractIterator {
 
     callback = fromCallback(callback, kPromise)
 
-    this._nextvAsync(size, options, (err, val) => {
+    const done = (err, val) => {
       if (err) {
         callback(err)
       } else {
@@ -167,7 +148,32 @@ class Iterator extends AbstractIterator {
 
         callback(null, entries, finished, limited)
       }
-    })
+    }
+
+    if (options?.[kNoFieldsNext] === true) {
+      if (this[kPosition] < this[kCache].length || this[kFinished]) {
+        this._nextvAsync(size, null, done)
+      } else {
+        // Native limit accounting includes prefetched rows. Keep finite-limit
+        // reads one-at-a-time so seek() cannot discard rows that AbstractLevel
+        // still expects to be deliverable under its own limit counter.
+        const prefetch = this[kFirst] || this.limit < Infinity ? 1 : 1000
+        this[kFirst] = false
+
+        this._nextvAsync(prefetch, null, (err, result) => {
+          if (err) return done(err)
+
+          this[kCache] = result.rows
+          this[kFinished] = result.finished
+          this[kPosition] = 0
+          done(null, this._nextvCached(size))
+        })
+      }
+
+      return callback[kPromise]
+    }
+
+    this._nextvAsync(size, options, done)
 
     return callback[kPromise]
   }
@@ -329,3 +335,4 @@ class Iterator extends AbstractIterator {
 }
 
 exports.Iterator = Iterator
+exports.kNoFieldsNext = kNoFieldsNext
