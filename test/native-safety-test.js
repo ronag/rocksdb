@@ -285,6 +285,36 @@ test('native synchronous reads cannot race database teardown', async function (t
   t.end()
 })
 
+test('native SliceLike byte ranges require finite integers', async function (t) {
+  const context = binding.db_init(tempy.directory())
+  await nativeOpen(context)
+  const buffer = Buffer.from('key')
+
+  t.doesNotThrow(() => binding.db_get_many_sync(context, [{
+    buffer,
+    byteOffset: 0,
+    byteLength: buffer.byteLength
+  }], {}), 'a valid SliceLike key is accepted')
+
+  for (const [name, byteOffset, byteLength] of [
+    ['fractional offset', 0.5, 1],
+    ['fractional length', 0, 0.5],
+    ['NaN offset', NaN, 1],
+    ['NaN length', 0, NaN],
+    ['infinite offset', Infinity, 1],
+    ['infinite length', 0, Infinity]
+  ]) {
+    t.throws(() => binding.db_get_many_sync(context, [{
+      buffer,
+      byteOffset,
+      byteLength
+    }], {}), /failed|argument|invalid/i, `${name} is rejected`)
+  }
+
+  await nativeClose(context)
+  t.end()
+})
+
 test('GC cannot deadlock a raw native operation finalizer', function (t) {
   const location = tempy.directory()
   const bindingPath = JSON.stringify(require.resolve('../binding'))

@@ -278,3 +278,262 @@ test('seek preserves the remaining finite iterator limit after prefetch', async 
   await db.close()
   t.end()
 })
+
+test('empty SliceLike seek targets reject without discarding iterator state', async function (t) {
+  const db = testCommon.factory()
+  await db.open()
+  await db.batch([
+    { type: 'put', key: 'a', value: '1' },
+    { type: 'put', key: 'b', value: '2' },
+    { type: 'put', key: 'c', value: '3' }
+  ])
+
+  const iterator = db.iterator()
+  await iterator.next()
+  await iterator.next()
+  t.is(iterator.cached, 1, 'precondition: one entry is prefetched')
+
+  const emptySlice = {
+    buffer: Buffer.alloc(4),
+    byteOffset: 2,
+    byteLength: 0
+  }
+  t.throws(() => iterator._seekSync(emptySlice), /empty target/,
+    'sync seek validates SliceLike byteLength')
+  t.is(iterator.cached, 1, 'failed sync seek preserves the prefetched entry')
+
+  const promiseError = await iterator._seekAsync(Buffer.alloc(0)).then(
+    () => null,
+    (err) => err
+  )
+  t.match(promiseError && promiseError.message, /empty target/,
+    'promise seek validates an empty Buffer')
+  t.is(iterator.cached, 1, 'failed promise seek preserves the prefetched entry')
+
+  const malformedError = await iterator._seekAsync({}).then(
+    () => null,
+    (err) => err
+  )
+  t.ok(malformedError, 'malformed async target rejects')
+  t.is(iterator.cached, 1, 'malformed async target preserves the prefetched entry')
+
+  const accessorError = new Error('target byteLength failed')
+  const throwingTarget = {}
+  Object.defineProperty(throwingTarget, 'byteLength', {
+    get () { throw accessorError }
+  })
+  await new Promise((resolve) => {
+    let synchronous = true
+    iterator._seekAsync(throwingTarget, (err) => {
+      t.notOk(synchronous, 'target accessor error is asynchronous')
+      t.is(err, accessorError, 'target accessor error is preserved')
+      resolve()
+    })
+    synchronous = false
+  })
+  t.is(iterator.cached, 1, 'target accessor failure preserves the prefetched entry')
+
+  await new Promise((resolve) => {
+    let synchronous = true
+    iterator._seekAsync(emptySlice, (err) => {
+      t.notOk(synchronous, 'async empty-target error is asynchronous')
+      t.match(err && err.message, /empty target/, 'async seek validates SliceLike byteLength')
+      resolve()
+    })
+    synchronous = false
+  })
+  t.is(iterator.cached, 1, 'failed async seek preserves the prefetched entry')
+  t.same(await iterator.next(), ['c', '3'], 'iteration resumes from the preserved cache')
+
+  await iterator.close()
+  await db.close()
+  t.end()
+})
+
+test('seek target validation uses intrinsic lengths and serializes accessors', async function (t) {
+  const db = testCommon.factory()
+  await db.open()
+  await db.batch([
+    { type: 'put', key: 'a', value: '1' },
+    { type: 'put', key: 'b', value: '2' },
+    { type: 'put', key: 'c', value: '3' }
+  ])
+
+  const emptyBuffer = Buffer.alloc(0)
+  Object.defineProperty(emptyBuffer, 'byteLength', { value: 1 })
+  const stateIterator = db.iterator()
+  await stateIterator.next()
+  await stateIterator.next()
+  t.throws(() => stateIterator._seekSync(emptyBuffer), /empty target/,
+    'an own property cannot disguise an empty Buffer')
+  t.is(stateIterator.cached, 1, 'disguised empty Buffer preserves cached state')
+
+  const shadowedBuffer = Buffer.from('b')
+  Object.defineProperty(shadowedBuffer, 'byteLength', { value: 0 })
+  stateIterator._seekSync(shadowedBuffer)
+  t.same(await stateIterator.next(), ['b', '2'], 'an own property cannot hide Buffer bytes')
+
+  const sliceIterator = db.iterator()
+  const sliceBuffer = Buffer.from('xbx')
+  Object.defineProperty(sliceBuffer, 'byteLength', { value: 0 })
+  sliceIterator._seekSync({ buffer: sliceBuffer, byteOffset: 1, byteLength: 1 })
+  t.same(await sliceIterator.next(), ['b', '2'],
+    'SliceLike bounds use the intrinsic backing Buffer length')
+
+  const stringIterator = db.iterator()
+  const stringPrototype = Object.getPrototypeOf('')
+  const originalStringByteLength = Object.getOwnPropertyDescriptor(stringPrototype, 'byteLength')
+  Object.defineProperty(stringPrototype, 'byteLength', { value: 0, configurable: true })
+  try {
+    stringIterator._seekSync('b')
+  } finally {
+    if (originalStringByteLength) {
+      Object.defineProperty(stringPrototype, 'byteLength', originalStringByteLength)
+    } else {
+      delete stringPrototype.byteLength
+    }
+  }
+  t.same(await stringIterator.next(), ['b', '2'],
+    'String prototype properties do not affect primitive target length')
+
+  const snapshotIterator = db.iterator()
+  const reads = { buffer: 0, byteOffset: 0, byteLength: 0 }
+  let reentrantNext
+  const target = {
+    get buffer () {
+      reads.buffer++
+      reentrantNext = snapshotIterator.next().then(
+        () => null,
+        (err) => err
+      )
+      return Buffer.from('b')
+    },
+    get byteOffset () {
+      reads.byteOffset++
+      return 0
+    },
+    get byteLength () {
+      reads.byteLength++
+      return 1
+    }
+  }
+  await snapshotIterator._seekAsync(target)
+  t.same(reads, { buffer: 1, byteOffset: 1, byteLength: 1 },
+    'SliceLike accessors are snapshotted once')
+  const reentryError = await reentrantNext
+  t.equal(reentryError && reentryError.code, 'LEVEL_ITERATOR_BUSY',
+    'a SliceLike accessor gets a normal busy error for a concurrent iterator operation')
+  t.same(await snapshotIterator.next(), ['b', '2'], 'the snapshotted SliceLike target is used')
+
+  const nextvIterator = db.iterator()
+  let reentrantNextv
+  await nextvIterator._seekAsync({
+    get buffer () {
+      reentrantNextv = nextvIterator.nextv(1).then(
+        () => null,
+        (err) => err
+      )
+      return Buffer.from('b')
+    },
+    byteOffset: 0,
+    byteLength: 1
+  })
+  const nextvError = await reentrantNextv
+  t.equal(nextvError && nextvError.code, 'LEVEL_ITERATOR_BUSY',
+    'a reentrant public nextv unwinds its abstract iterator state')
+  t.same(await nextvIterator.next(), ['b', '2'], 'nextv busy handling leaves the iterator usable')
+
+  for (const style of ['promise', 'callback']) {
+    const allIterator = db.iterator()
+    let reentrantAll
+    await allIterator._seekAsync({
+      get buffer () {
+        if (style === 'promise') {
+          reentrantAll = allIterator.all().then(
+            () => null,
+            (err) => err
+          )
+        } else {
+          reentrantAll = new Promise((resolve) => {
+            let synchronous = true
+            allIterator.all((err) => {
+              t.notOk(synchronous, 'reentrant all callback is asynchronous')
+              resolve(err)
+            })
+            synchronous = false
+          })
+        }
+        return Buffer.from('b')
+      },
+      byteOffset: 0,
+      byteLength: 1
+    })
+    const allError = await reentrantAll
+    t.equal(allError && allError.code, 'LEVEL_ITERATOR_BUSY',
+      `reentrant all (${style}) reports a normal busy error`)
+    t.same(await allIterator.next(), ['b', '2'],
+      `reentrant all (${style}) leaves the iterator open and usable`)
+    await allIterator.close()
+  }
+
+  for (const style of ['promise', 'callback']) {
+    const closingAllIterator = db.iterator()
+    let closing
+    const seeking = closingAllIterator._seekAsync({
+      get buffer () {
+        closing = closingAllIterator.close()
+        return Buffer.from('b')
+      },
+      byteOffset: 0,
+      byteLength: 1
+    })
+    let closedAll
+    if (style === 'promise') {
+      closedAll = closingAllIterator.all().then(
+        () => null,
+        (err) => err
+      )
+    } else {
+      closedAll = new Promise((resolve) => {
+        let synchronous = true
+        closingAllIterator.all((err) => {
+          t.notOk(synchronous, 'closing all callback is asynchronous')
+          resolve(err)
+        })
+        synchronous = false
+      })
+    }
+    const closedAllError = await closedAll
+    t.equal(closedAllError && closedAllError.code, 'LEVEL_ITERATOR_NOT_OPEN',
+      `all (${style}) preserves closing precedence over busy`)
+    await seeking
+    await closing
+  }
+
+  const closingIterator = db.iterator()
+  const accessorError = new Error('target offset failed')
+  let closing
+  const failingTarget = {
+    get buffer () {
+      closing = closingIterator.close()
+      return Buffer.from('b')
+    },
+    get byteOffset () { throw accessorError },
+    byteLength: 1
+  }
+  const seekError = await closingIterator._seekAsync(failingTarget).then(
+    () => null,
+    (err) => err
+  )
+  t.is(seekError, accessorError, 'reentrant close does not replace the validation error')
+  await closing
+  t.pass('a close queued during failed validation is flushed')
+
+  await stringIterator.close()
+  await sliceIterator.close()
+  await stateIterator.close()
+  await snapshotIterator.close()
+  await nextvIterator.close()
+  await db.close()
+  t.end()
+})
