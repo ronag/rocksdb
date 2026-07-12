@@ -2,7 +2,9 @@
 
 const { fromCallback } = require('catering')
 const { AbstractIterator } = require('abstract-level')
+const ModuleError = require('module-error')
 const assert = require('node:assert')
+const { Buffer } = require('node:buffer')
 const { kRef, kUnref } = require('./util')
 
 const binding = require('./binding')
@@ -16,10 +18,58 @@ const kFirst = Symbol('first')
 const kPosition = Symbol('position')
 const kBusy = Symbol('busy')
 const kPendingClose = Symbol('pendingClose')
+const kCloseRequested = Symbol('closeRequested')
+const kPublicSeek = Symbol('publicSeek')
 const kHasFilter = Symbol('hasFilter')
 const kNoFieldsNext = Symbol('noFieldsNext')
 
 const kEmpty = Object.freeze([])
+
+const getTypedArrayByteLength = Object.getOwnPropertyDescriptor(
+  Object.getPrototypeOf(Object.getPrototypeOf(Buffer.prototype)),
+  'byteLength'
+).get
+
+function normalizeSeekTarget (target) {
+  if (typeof target === 'string') {
+    if (target.length === 0) throw new Error('cannot seek() to an empty target')
+    return target
+  }
+
+  if (Buffer.isBuffer(target)) {
+    if (getTypedArrayByteLength.call(target) === 0) {
+      throw new Error('cannot seek() to an empty target')
+    }
+    return target
+  }
+
+  if (typeof target !== 'object' || target === null) {
+    throw new TypeError('seek target must be a string, Buffer or SliceLike')
+  }
+
+  const buffer = target.buffer
+  const byteOffset = target.byteOffset
+  const byteLength = target.byteLength
+  if (!Buffer.isBuffer(buffer)) {
+    throw new TypeError('SliceLike.buffer must be a Buffer')
+  }
+  const bufferByteLength = getTypedArrayByteLength.call(buffer)
+  if (!Number.isSafeInteger(byteOffset) || !Number.isSafeInteger(byteLength) ||
+      byteOffset < 0 || byteLength < 0 || byteOffset > bufferByteLength ||
+      byteLength > bufferByteLength - byteOffset) {
+    throw new RangeError('SliceLike byte range is invalid')
+  }
+  if (byteLength === 0) throw new Error('cannot seek() to an empty target')
+
+  return { buffer, byteOffset, byteLength }
+}
+
+function iteratorBusyError (operation) {
+  return new ModuleError(
+    `Iterator is busy: cannot call ${operation}() until the previous operation has completed`,
+    { code: 'LEVEL_ITERATOR_BUSY' }
+  )
+}
 
 class Iterator extends AbstractIterator {
   constructor (db, context, options) {
@@ -34,6 +84,8 @@ class Iterator extends AbstractIterator {
     this[kDB] = db
     this[kBusy] = false
     this[kPendingClose] = null
+    this[kCloseRequested] = false
+    this[kPublicSeek] = false
     this[kHasFilter] = options.keyFilter != null || options.valueFilter != null
   }
 
@@ -41,7 +93,38 @@ class Iterator extends AbstractIterator {
     return this.close()
   }
 
+  all (options, callback) {
+    if (!this[kBusy] || this[kCloseRequested]) return super.all(options, callback)
+
+    callback = fromCallback(typeof options === 'function' ? options : callback, kPromise)
+    process.nextTick(callback, iteratorBusyError('all'))
+    return callback[kPromise]
+  }
+
+  seek (target, options) {
+    if (this[kCloseRequested]) return super.seek(target, options)
+    if (this[kBusy]) throw iteratorBusyError('seek')
+
+    this[kBusy] = true
+    this[kPublicSeek] = true
+    try {
+      return super.seek(target, options)
+    } finally {
+      this[kPublicSeek] = false
+      this[kBusy] = false
+      this._flushPendingClose()
+    }
+  }
+
+  close (callback) {
+    const result = super.close(callback)
+    this[kCloseRequested] = true
+    return result
+  }
+
   _seek (target) {
+    if (this[kCloseRequested]) return
+    if (this[kPublicSeek]) return this._seekSyncOwned(target)
     this._seekSync(target)
   }
 
@@ -76,7 +159,10 @@ class Iterator extends AbstractIterator {
 
   _next (callback) {
     assert(this[kContext])
-    assert(!this[kBusy])
+    if (this[kBusy]) {
+      process.nextTick(callback, iteratorBusyError('next'))
+      return this
+    }
 
     if (this[kPosition] < this[kCache].length) {
       const key = this[kCache][this[kPosition]++]
@@ -131,9 +217,12 @@ class Iterator extends AbstractIterator {
 
   _nextv (size, options, callback) {
     assert(this[kContext])
-    assert(!this[kBusy])
 
     callback = fromCallback(callback, kPromise)
+    if (this[kBusy]) {
+      process.nextTick(callback, iteratorBusyError('nextv'))
+      return callback[kPromise]
+    }
 
     const done = (err, val) => {
       if (err) {
@@ -191,11 +280,20 @@ class Iterator extends AbstractIterator {
 
   _seekSync (target) {
     assert(this[kContext])
-    assert(!this[kBusy])
+    if (this[kBusy]) throw iteratorBusyError('seek')
 
-    if (target.length === 0) {
-      throw new Error('cannot seek() to an empty target')
+    this[kBusy] = true
+    try {
+      this._seekSyncOwned(target)
+    } finally {
+      this[kBusy] = false
+      this._flushPendingClose()
     }
+  }
+
+  _seekSyncOwned (target) {
+    target = normalizeSeekTarget(target)
+    if (this[kCloseRequested]) return
 
     const discardedCount = (this[kCache].length - this[kPosition]) / 2
     this[kFirst] = true
@@ -208,38 +306,67 @@ class Iterator extends AbstractIterator {
 
   _seekAsync (target, callback) {
     assert(this[kContext])
-    assert(!this[kBusy])
 
     callback = fromCallback(callback, kPromise)
+    if (this[kBusy]) {
+      process.nextTick(callback, iteratorBusyError('seek'))
+      return callback[kPromise]
+    }
 
-    const discardedCount = (this[kCache].length - this[kPosition]) / 2
-    this[kFirst] = true
-    this[kCache] = kEmpty
-    this[kFinished] = false
-    this[kPosition] = 0
-
+    // SliceLike fields may be accessors. Claim the iterator before reading
+    // them so user code cannot schedule a second operation during validation.
+    this[kBusy] = true
+    let referenced = false
     try {
+      target = normalizeSeekTarget(target)
+      if (this[kCloseRequested]) {
+        this._deferSeekResult(callback)
+        return callback[kPromise]
+      }
+
+      const discardedCount = (this[kCache].length - this[kPosition]) / 2
       this[kDB][kRef]()
-      this[kBusy] = true
+      referenced = true
       binding.iterator_seek(this[kContext], target, discardedCount, (err) => {
         this[kBusy] = false
         this[kDB][kUnref]()
 
-        if (err) {
-          callback(err)
-        } else {
-          callback(null)
+        try {
+          if (err) {
+            callback(err)
+          } else {
+            callback(null)
+          }
+        } finally {
+          this._flushPendingClose()
         }
-
-        this._flushPendingClose()
       })
+
+      // Keep cached state intact if native argument validation throws before
+      // the seek is scheduled. Once scheduled, no iterator operation can run
+      // until this async seek completes.
+      this[kFirst] = true
+      this[kCache] = kEmpty
+      this[kFinished] = false
+      this[kPosition] = 0
     } catch (err) {
-      this[kBusy] = false
-      this[kDB][kUnref]()
-      process.nextTick(callback, err)
+      if (referenced) this[kDB][kUnref]()
+      this._deferSeekResult(callback, err)
     }
 
     return callback[kPromise]
+  }
+
+  _deferSeekResult (callback, err) {
+    process.nextTick(() => {
+      this[kBusy] = false
+      try {
+        if (err) callback(err)
+        else callback(null)
+      } finally {
+        this._flushPendingClose()
+      }
+    })
   }
 
   _nextvCached (size) {
