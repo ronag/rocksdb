@@ -2552,22 +2552,16 @@ NAPI_METHOD(db_get_many) {
 
   auto callback = argv[3];
 
-  std::vector<rocksdb::Slice> keys(count);
   std::vector<std::string> ownedKeys(count);
-  auto keysReference = std::make_shared<Reference>();
-  NAPI_STATUS_THROWS(Reference::Create(env, argv[1], *keysReference));
 
   for (uint32_t n = 0; n < count; n++) {
     napi_value element;
     NAPI_STATUS_THROWS(napi_get_element(env, argv[1], n, &element));
-    napi_valuetype type;
-    NAPI_STATUS_THROWS(napi_typeof(env, element, &type));
-    if (type == napi_string) {
-      NAPI_STATUS_THROWS(GetValue(env, element, ownedKeys[n]));
-      keys[n] = ownedKeys[n];
-    } else {
-      NAPI_STATUS_THROWS(GetValue(env, element, keys[n]));
-    }
+    // Async work must not borrow Buffer or SliceLike storage. The caller can
+    // mutate a Buffer, replace an array element / SliceLike.buffer, or release
+    // the original object as soon as this method returns. Snapshot every key
+    // while still on the JS thread so the worker observes call-time bytes.
+    NAPI_STATUS_THROWS(GetValue(env, element, ownedKeys[n]));
   }
 
   rocksdb::ReadOptions readOptions;
@@ -2599,15 +2593,18 @@ NAPI_METHOD(db_get_many) {
 
   NAPI_STATUS_THROWS(runAsyncKeepAlive<State>(
       resourceName, env, callback, argv[0],
-      [=, keys = std::move(keys), ownedKeys = std::move(ownedKeys),
-       readOptions = std::move(readOptions)](auto& state) {
+      [=, ownedKeys = std::move(ownedKeys), readOptions = std::move(readOptions)](auto& state) {
         // MultiGet can return slices pinned to RocksDB cache memory. Retain the
         // operation through JS conversion (the async worker owns this functor
         // until Complete) so safe conversion performs only its one required
         // copy and raw db_close cannot tear down the cache first.
         (void)databaseOperation;
-        (void)keysReference;
-        (void)ownedKeys;
+
+        std::vector<rocksdb::Slice> keys;
+        keys.reserve(ownedKeys.size());
+        for (const auto& key : ownedKeys) {
+          keys.emplace_back(key);
+        }
 
         state.statuses.resize(count);
         state.values.resize(count);
