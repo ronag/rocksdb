@@ -9,6 +9,7 @@ import {
   RocksFormat,
   RocksGetManyOptions,
   RocksLevel,
+  RocksPackedIteratorResult,
   RocksStatistics,
   RocksUpdate,
   RocksWriteBufferManager,
@@ -124,6 +125,7 @@ expectType<Promise<void>>(iterator._seekAsync(slice))
 expectType<Promise<{ readonly rows: Array<Buffer>; readonly finished: boolean; readonly limited?: boolean }>>(
   iterator._nextvAsync(10)
 )
+expectType<Promise<RocksPackedIteratorResult>>(iterator._nextvPackedAsync(10))
 expectType<Promise<void>>(iterator[Symbol.asyncDispose]())
 
 const publicValuesOnlyIterator = db.iterator({ keys: false, values: true })

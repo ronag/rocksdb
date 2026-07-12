@@ -333,6 +333,19 @@ export interface RocksRawIteratorResult<
   readonly limited?: boolean
 }
 
+export interface RocksPackedIteratorResult {
+  /** Concatenated raw key/value bytes for this batch. */
+  readonly buffer: Buffer
+  /**
+   * Cumulative field boundaries, starting at zero. Fields are stored in
+   * key-then-value order according to the iterator's keys/values options.
+   */
+  readonly offsets: Uint32Array
+  readonly count: number
+  readonly finished: boolean
+  readonly limited: boolean
+}
+
 export interface RocksIteratorNative<
   KRaw,
   VRaw,
@@ -351,6 +364,12 @@ export interface RocksIteratorNative<
     size: number,
     options: { timeout?: number } | undefined,
     callback: NodeCallback<RocksRawIteratorResult<KRaw, VRaw, Keys, Values>>
+  ): void
+  _nextvPackedAsync (size: number, options?: { timeout?: number }): Promise<RocksPackedIteratorResult>
+  _nextvPackedAsync (
+    size: number,
+    options: { timeout?: number } | undefined,
+    callback: NodeCallback<RocksPackedIteratorResult>
   ): void
   _closeSync (): void
   _closeAsync (): Promise<void>
