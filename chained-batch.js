@@ -11,6 +11,7 @@ const kPromise = Symbol('promise')
 const kBatchContext = Symbol('batchContext')
 const kDbContext = Symbol('dbContext')
 const kBusy = Symbol('busy')
+const kLength = Symbol('length')
 
 const EMPTY = {}
 
@@ -21,6 +22,7 @@ class ChainedBatch extends AbstractChainedBatch {
     this[kDbContext] = context
     this[kBatchContext] = binding.batch_init(context)
     this[kBusy] = false
+    this[kLength] = 0
   }
 
   [Symbol.asyncDispose] () {
@@ -28,9 +30,10 @@ class ChainedBatch extends AbstractChainedBatch {
   }
 
   get length () {
-    assert(this[kBatchContext])
-
-    return binding.batch_count(this[kBatchContext])
+    if (this[kBatchContext]) {
+      this[kLength] = binding.batch_count(this[kBatchContext])
+    }
+    return this[kLength]
   }
 
   _put (key, value, options) {
@@ -61,7 +64,7 @@ class ChainedBatch extends AbstractChainedBatch {
 
     if (blob === null || blob === undefined) {
       throw new ModuleError('Blob cannot be null or undefined', {
-        code: 'LEVEL_INVALID_KEY'
+        code: 'LEVEL_INVALID_VALUE'
       })
     }
 
@@ -142,6 +145,7 @@ class ChainedBatch extends AbstractChainedBatch {
     assert(this[kBatchContext])
     assert(!this[kBusy])
 
+    this[kLength] = binding.batch_count(this[kBatchContext])
     binding.batch_clear(this[kBatchContext])
     this[kBatchContext] = null
   }

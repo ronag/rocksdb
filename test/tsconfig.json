@@ -1,0 +1,12 @@
+{
+  "compilerOptions": {
+    "strict": true,
+    "noEmit": true,
+    "module": "NodeNext",
+    "moduleResolution": "NodeNext",
+    "target": "ES2024",
+    "types": ["node"],
+    "skipLibCheck": false
+  },
+  "files": ["types-test.ts"]
+}

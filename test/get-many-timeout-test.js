@@ -41,6 +41,19 @@ test('getMany with a tight timeout never returns garbage and never throws', asyn
   t.end()
 })
 
+test('async getMany with a tight timeout returns values or partial markers', async function (t) {
+  const db = testCommon.factory({ valueEncoding: 'utf8' })
+  await db.open()
+  const keys = await seed(db, 4000)
+
+  const rows = await db.getMany(keys, { timeout: 1, valueEncoding: 'utf8' })
+  t.equal(rows.length, keys.length, 'returns one slot per requested key')
+  t.ok(rows.every((row) => row === null || row === VALUE), 'each slot is a value or an explicit partial marker')
+
+  await db.close()
+  t.end()
+})
+
 test('getMany with no timeout returns every value', async function (t) {
   const db = testCommon.factory({ valueEncoding: 'utf8' })
   await db.open()

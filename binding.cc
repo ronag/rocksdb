@@ -1103,10 +1103,17 @@ struct BaseIterator : public Closable {
     return Refresh();
   }
 
-  rocksdb::Status SeekSafe(const rocksdb::Slice& target) {
+  rocksdb::Status SeekSafe(const rocksdb::Slice& target, const uint32_t discardedCount) {
     std::lock_guard operationLock(operationMutex_);
     if (!iterator_) {
       return rocksdb::Status::InvalidArgument("Iterator is not open");
+    }
+    // Native limit accounting includes rows prefetched into the JS cache. Give
+    // back only the undelivered rows that seek is about to discard, preserving
+    // all public, raw and decode-failed reads that were already consumed.
+    if (limit_ >= 0) {
+      const auto credit = std::min(static_cast<uint32_t>(count_), discardedCount);
+      count_ -= static_cast<int>(credit);
     }
     Seek(target);
     return Status();
@@ -1119,7 +1126,10 @@ struct BaseIterator : public Closable {
 
   bool Increment() {
     assert(iterator_);
-    return limit_ < 0 || ++count_ <= limit_;
+    if (limit_ < 0) return true;
+    if (count_ >= limit_) return false;
+    count_++;
+    return true;
   }
 
   void Next() {
@@ -1751,7 +1761,7 @@ NAPI_METHOD(db_get_location) {
   return result;
 }
 
-NAPI_METHOD(db_query) {
+NAPI_METHOD(db_query_sync) {
   NAPI_ARGV(2);
 
   try {
@@ -1764,6 +1774,21 @@ NAPI_METHOD(db_query) {
       return nullptr;
     }
     return iterator->nextv(env, std::numeric_limits<uint32_t>::max());
+  } catch (const std::exception& e) {
+    napi_throw_error(env, nullptr, e.what());
+    return nullptr;
+  }
+}
+
+NAPI_METHOD(db_query) {
+  NAPI_ARGV(3);
+
+  try {
+    auto iterator = Iterator::create(env, argv[0], argv[1]);
+    if (!iterator) {
+      return nullptr;
+    }
+    return iterator->nextv(env, std::numeric_limits<uint32_t>::max(), 0, argv[2]);
   } catch (const std::exception& e) {
     napi_throw_error(env, nullptr, e.what());
     return nullptr;
@@ -3013,7 +3038,7 @@ NAPI_METHOD(iterator_refresh_sync) {
 }
 
 NAPI_METHOD(iterator_seek) {
-  NAPI_ARGV(3);
+  NAPI_ARGV(4);
 
   try {
     std::shared_ptr<Iterator> iterator;
@@ -3022,7 +3047,10 @@ NAPI_METHOD(iterator_seek) {
     rocksdb::PinnableSlice target;
     NAPI_STATUS_THROWS(GetValue(env, argv[1], target));
 
-    auto callback = argv[2];
+    uint32_t discardedCount = 0;
+    NAPI_STATUS_THROWS(GetValue(env, argv[2], discardedCount));
+
+    auto callback = argv[3];
 
     napi_value resourceName;
     NAPI_STATUS_THROWS(GetResourceName(env, ResourceLeveldownIteratorSeek, resourceName));
@@ -3031,9 +3059,10 @@ NAPI_METHOD(iterator_seek) {
         BeginDatabaseOperation(env, iterator->database_, iterator->reference_, databaseOperation));
 
     NAPI_STATUS_THROWS(runAsync(resourceName, env, callback,
-                                [iterator, databaseOperation, target = std::move(target)](auto& state) {
+                                [iterator, databaseOperation, target = std::move(target),
+                                 discardedCount](auto& state) {
                                   const DatabaseOperationScope operationScope(databaseOperation);
-                                  return iterator->SeekSafe(target);
+                                  return iterator->SeekSafe(target, discardedCount);
                                 }));
   } catch (const std::exception& e) {
     napi_throw_error(env, nullptr, e.what());
@@ -3044,7 +3073,7 @@ NAPI_METHOD(iterator_seek) {
 }
 
 NAPI_METHOD(iterator_seek_sync) {
-  NAPI_ARGV(2);
+  NAPI_ARGV(3);
 
   try {
     std::shared_ptr<Iterator> iterator;
@@ -3056,7 +3085,10 @@ NAPI_METHOD(iterator_seek_sync) {
     rocksdb::PinnableSlice target;
     NAPI_STATUS_THROWS(GetValue(env, argv[1], target));
 
-    ROCKS_STATUS_THROWS_NAPI(iterator->SeekSafe(target));
+    uint32_t discardedCount = 0;
+    NAPI_STATUS_THROWS(GetValue(env, argv[2], discardedCount));
+
+    ROCKS_STATUS_THROWS_NAPI(iterator->SeekSafe(target, discardedCount));
   } catch (const std::exception& e) {
     napi_throw_error(env, nullptr, e.what());
     return nullptr;
@@ -3853,6 +3885,7 @@ NAPI_INIT() {
   NAPI_EXPORT_FUNCTION(db_get_statistics);
   NAPI_EXPORT_FUNCTION(db_get_latest_sequence);
   NAPI_EXPORT_FUNCTION(db_query);
+  NAPI_EXPORT_FUNCTION(db_query_sync);
   NAPI_EXPORT_FUNCTION(db_compact_range_sync);
   NAPI_EXPORT_FUNCTION(db_compact_range);
   NAPI_EXPORT_FUNCTION(db_flush_wal);

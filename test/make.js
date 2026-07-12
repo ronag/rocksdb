@@ -27,7 +27,9 @@ function makeTest (name, testFn) {
         { type: 'put', key: 'three', value: '3' }
       ], function (err) {
         t.ifError(err, 'no error from batch()')
-        testFn(db, t, done)
+        Promise.resolve()
+          .then(() => testFn(db, t, done))
+          .catch(done)
       })
     })
   })
