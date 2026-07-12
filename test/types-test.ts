@@ -1,9 +1,11 @@
 import { Buffer } from 'node:buffer'
+import assert from 'node:assert'
 
 import { AbstractLevel } from 'abstract-level'
 
 import {
   RocksCache,
+  RocksColumn,
   RocksFormat,
   RocksGetManyOptions,
   RocksLevel,
@@ -40,6 +42,16 @@ const db = new RocksLevel('/tmp/rocks-level-types')
 expectType<AbstractLevel<RocksFormat, string, string>>(db)
 expectType<Promise<RocksLevel<string, string>>>(RocksLevel.open('/tmp/rocks-level-types'))
 expectType<boolean | null>(ioUringAvailable())
+
+const missingColumn = db.columns.missing
+expectType<RocksColumn | undefined>(missingColumn)
+// @ts-expect-error A dynamic column lookup must be narrowed before use as a handle
+expectType<RocksColumn>(missingColumn)
+
+const defaultColumn = db.columns.default
+assert(defaultColumn)
+expectType<RocksColumn>(defaultColumn)
+expectType<Promise<string>>(db.get('key', { column: defaultColumn }))
 
 const cache = new RocksCache({ capacity: 1024 })
 expectType<bigint>(cache.handle)
