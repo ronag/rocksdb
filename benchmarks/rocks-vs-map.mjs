@@ -10,10 +10,8 @@ const location = await mkdtemp(join(tmpdir(), 'rocks-vs-map-'))
 let db
 
 try {
-  const values = []
-  for (let x = 0; x < 1e3; x++) {
-    values.push(Buffer.from(Math.random().toString(36).repeat(4)))
-  }
+  const values = Array.from({ length: 1e3 }, (_, i) =>
+    Buffer.from(i.toString(36).padStart(12, '0').repeat(4)))
   const stringKeys = values.map((value) => value.toString())
 
   db = new RocksLevel(location, {
