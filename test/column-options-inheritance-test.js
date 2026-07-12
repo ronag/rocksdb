@@ -2,6 +2,7 @@
 
 const test = require('tape')
 const testCommon = require('./common')
+const { RocksLevel } = require('..')
 
 function makeVersion (value) {
   const bytes = Buffer.from(value)
@@ -108,5 +109,50 @@ test('virtual per-column options override inherited defaults', async function (t
   t.deepEqual(accesses, ['get'], 'the option is read before and without a presence check')
 
   await db.close()
+  t.end()
+})
+
+test('explicit empty per-column options suppress inherited defaults', async function (t) {
+  const db = testCommon.factory({
+    mergeOperator: 'maxRev',
+    columns: {
+      default: {},
+      undefined: { mergeOperator: undefined },
+      null: { mergeOperator: null },
+      inherited: Object.create({ mergeOperator: '' })
+    }
+  })
+  await db.open()
+
+  for (const name of ['undefined', 'null', 'inherited']) {
+    const batch = db._chainedBatch()
+    batch._merge('key', makeVersion('1-value'), { column: db.columns[name] })
+    const err = await rejection(batch.write())
+    t.match(err && err.message, /merge/i, `${name} suppresses the inherited merge operator`)
+  }
+
+  await db.close()
+  t.end()
+})
+
+test('failed inherited-option reads release the database lock', async function (t) {
+  const db = testCommon.factory()
+  const location = db.location
+  const expected = new Error('column option failed')
+  const column = new Proxy({}, {
+    get (target, property, receiver) {
+      if (property === 'compression') throw expected
+      return Reflect.get(target, property, receiver)
+    }
+  })
+
+  const err = await rejection(db.open({ columns: { default: column } }))
+  t.equal(err && err.code, 'LEVEL_DATABASE_NOT_OPEN', 'the open failure is normalized')
+  t.equal(err && err.cause, expected, 'the original accessor error is preserved as the cause')
+
+  const reopened = new RocksLevel(location)
+  await reopened.open()
+  t.pass('the same location can be reopened after option validation fails')
+  await reopened.close()
   t.end()
 })
