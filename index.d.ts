@@ -313,6 +313,14 @@ export type RocksIteratorValue<V, Values extends boolean> = Values extends false
 export type RocksIteratorEntry<K, V, Keys extends boolean, Values extends boolean> = Keys extends false
   ? Values extends false ? [undefined, undefined] : [undefined, V]
   : Values extends false ? [K, undefined] : [K, V]
+export type RocksIteratorNextCallback<K, V, Keys extends boolean, Values extends boolean> =
+  [Keys, Values] extends [false, false]
+    ? never
+    : (
+        err: Error | undefined | null,
+        key?: RocksIteratorKey<K, Keys>,
+        value?: RocksIteratorValue<V, Values>
+      ) => void
 
 export interface RocksRawIteratorResult<
   K = Buffer,
@@ -366,11 +374,7 @@ export type RocksIterator<
   'seek' | 'next' | typeof Symbol.asyncIterator
 > & RocksIteratorNative<KRaw, VRaw, Keys, Values> & {
   next (): Promise<RocksIteratorEntry<K, V, Keys, Values> | undefined>
-  next (callback: (
-    err: Error | undefined | null,
-    key?: RocksIteratorKey<K, Keys>,
-    value?: RocksIteratorValue<V, Values>
-  ) => void): void
+  next (callback: RocksIteratorNextCallback<K, V, Keys, Values>): void
   [Symbol.asyncIterator] (): AsyncGenerator<RocksIteratorEntry<K, V, Keys, Values>, void, unknown>
   seek (target: K): void
   seek<TTarget = K> (target: TTarget, options: AbstractSeekOptions<TTarget>): void

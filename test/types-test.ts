@@ -132,6 +132,8 @@ expectTrue<Equal<
 const publicNoFieldsIterator = db.iterator({ keys: false, values: false })
 const publicNoFieldsNext = publicNoFieldsIterator.next()
 const publicNoFieldsAll = publicNoFieldsIterator.all()
+// @ts-expect-error Callback next cannot distinguish a no-field row from exhaustion
+publicNoFieldsIterator.next(() => {})
 expectTrue<Equal<
   Awaited<typeof publicNoFieldsNext>,
   [undefined, undefined] | undefined
