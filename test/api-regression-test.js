@@ -2,6 +2,7 @@
 
 const test = require('tape')
 const testCommon = require('./common')
+const binding = require('../binding')
 
 async function rejection (promise) {
   try {
@@ -193,14 +194,25 @@ test('bounded sublevel getMany preserves partial markers across nested decoding'
 test('single get never returns a partial marker', async function (t) {
   const db = testCommon.factory()
   await db.open()
-  const getManyAsync = db._getManyAsync
-  db._getManyAsync = (keys, options, callback) => process.nextTick(callback, null, [null])
+  const dbGetMany = binding.db_get_many
 
-  const err = await rejection(db.get('key', { timeout: 1 }))
-  t.equal(err && err.code, 'LEVEL_ABORTED', 'partial single-key reads reject')
+  try {
+    binding.db_get_many = (context, keys, options, callback) => {
+      process.nextTick(callback, null, keys.map(() => null))
+    }
 
-  db._getManyAsync = getManyAsync
-  await db.close()
+    const err = await rejection(db.get('key', { timeout: 1 }))
+    t.equal(err && err.code, 'LEVEL_ABORTED', 'partial single-key reads reject')
+    t.equal(err && err.message, 'Multi-get stopped before the value was read',
+      'single-key aborts use the singular message')
+
+    const manyErr = await rejection(db.getMany(['one', 'two']))
+    t.equal(manyErr && manyErr.message, 'Multi-get stopped before every value was read',
+      'multi-key aborts keep the plural message')
+  } finally {
+    binding.db_get_many = dbGetMany
+    await db.close()
+  }
   t.end()
 })
 

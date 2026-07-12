@@ -246,7 +246,10 @@ class RocksLevel extends AbstractLevel {
         if (indexes.length === 0) {
           callback(null, val)
         } else if (!allowPartial) {
-          callback(new ModuleError('Multi-get stopped before every value was read', {
+          const message = keys.length === 1
+            ? 'Multi-get stopped before the value was read'
+            : 'Multi-get stopped before every value was read'
+          callback(new ModuleError(message, {
             code: 'LEVEL_ABORTED'
           }))
         } else {
