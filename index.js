@@ -206,7 +206,19 @@ class RocksLevel extends AbstractLevel {
   }
 
   _getMany (keys, options, callback, allowPartial) {
-    return this._getManyAsync(keys, options, callback, allowPartial)
+    callback = fromCallback(callback, kPromise)
+
+    this._getManyAsync(keys, options, (err, values) => {
+      if (err) {
+        callback(err)
+        return
+      }
+
+      maskPartialResults(values)
+      callback(null, values)
+    }, allowPartial)
+
+    return callback[kPromise]
   }
 
   _getManyAsync (keys, options, callback, allowPartial) {
@@ -232,12 +244,7 @@ class RocksLevel extends AbstractLevel {
 
         const indexes = []
         for (let i = 0; i < val.length; i++) {
-          if (val[i] === null) {
-            indexes.push(i)
-            if (allowPartial) {
-              val[i] = undefined
-            }
-          }
+          if (val[i] === null) indexes.push(i)
         }
 
         if (indexes.length === 0) {
@@ -555,6 +562,13 @@ class RocksLevel extends AbstractLevel {
     }
 
     return callback[kPromise]
+  }
+}
+
+function maskPartialResults (values) {
+  const indexes = partialResults.get(values)
+  if (indexes !== undefined) {
+    for (const index of indexes) values[index] = undefined
   }
 }
 

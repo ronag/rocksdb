@@ -169,6 +169,29 @@ test('public getMany allows explicitly bounded partial results', async function 
   t.end()
 })
 
+test('raw bounded getMany preserves partial markers', async function (t) {
+  const db = testCommon.factory()
+  await db.open()
+  const dbGetMany = binding.db_get_many
+
+  try {
+    binding.db_get_many = (context, keys, options, callback) => {
+      process.nextTick(callback, null, [Buffer.from('value'), undefined, null])
+    }
+
+    const rows = await db._getManyAsync(['found', 'missing', 'partial'], {
+      highWaterMarkBytes: 0
+    })
+    t.equal(rows[0].toString(), 'value', 'found values remain buffers')
+    t.equal(rows[1], undefined, 'missing keys remain undefined')
+    t.equal(rows[2], null, 'partial reads remain null for raw callers')
+  } finally {
+    binding.db_get_many = dbGetMany
+    await db.close()
+  }
+  t.end()
+})
+
 test('bounded getMany preserves partial markers across value decoding', async function (t) {
   const db = testCommon.factory({ valueEncoding: 'hex' })
   await db.open()
