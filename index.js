@@ -124,7 +124,7 @@ class RocksLevel extends AbstractLevel {
           options = { ...options, statistics: getStatisticsContext(options.statistics) }
         }
 
-        binding.db_open(this[kContext], options, (err, columns) => {
+        binding.db_open(this[kContext], inheritColumnOptions(options), (err, columns) => {
           if (err) {
             failOpen(err)
           } else {
@@ -732,6 +732,52 @@ function wrapSublevel (db) {
   })
 
   return db
+}
+
+function inheritColumnOptions (options) {
+  let source
+  let inherited
+
+  return new Proxy(Object.create(options), {
+    get (target, property) {
+      const value = Reflect.get(options, property, options)
+      if (property !== 'columns' ||
+          ((typeof value !== 'object' || value === null) && typeof value !== 'function')) {
+        return value
+      }
+
+      if (value !== source) {
+        source = value
+        inherited = createInheritedColumns(value, options)
+      }
+      return inherited
+    }
+  })
+}
+
+function createInheritedColumns (columns, defaults) {
+  const inherited = new WeakMap()
+
+  return new Proxy(Object.create(columns), {
+    get (target, property) {
+      const column = Reflect.get(columns, property, columns)
+      if (typeof column !== 'object' || column === null) return column
+
+      let result = inherited.get(column)
+      if (result === undefined) {
+        result = new Proxy(Object.create(column), {
+          get (target, property) {
+            const value = Reflect.get(column, property, column)
+            return value !== undefined || Reflect.has(column, property)
+              ? value
+              : Reflect.get(defaults, property, defaults)
+          }
+        })
+        inherited.set(column, result)
+      }
+      return result
+    }
+  })
 }
 
 exports.RocksLevel = RocksLevel
