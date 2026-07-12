@@ -504,7 +504,7 @@ export class RocksLevel<KDefault = string, VDefault = string>
   ): Promise<RocksLevel<KDefault, VDefault>>
 
   get sequence (): number
-  get columns (): Readonly<Record<string, RocksColumn>>
+  get columns (): Readonly<Record<string, RocksColumn | undefined>>
   get handle (): bigint
   get location (): string
   get identity (): string
