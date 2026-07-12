@@ -2675,6 +2675,8 @@ NAPI_METHOD(db_clear) {
         rocksdb::WriteOptions writeOptions;
         writeOptions.sync = sync;
         writeOptions.low_pri = lowPriority;
+        rocksdb::ReadOptions readOptions;
+        readOptions.fill_cache = false;
         const auto* comparator = column->GetComparator();
 
         // An unlimited bytewise range can be represented by one range tombstone.
@@ -2696,7 +2698,7 @@ NAPI_METHOD(db_clear) {
           } else if (lt) {
             end = *lt;
           } else {
-            std::unique_ptr<rocksdb::Iterator> iterator(database->db->NewIterator({}, column));
+            std::unique_ptr<rocksdb::Iterator> iterator(database->db->NewIterator(readOptions, column));
             iterator->SeekToLast();
             ROCKS_STATUS_RETURN(iterator->status());
             if (!iterator->Valid()) {
@@ -2714,7 +2716,7 @@ NAPI_METHOD(db_clear) {
 
         // Limited clears and custom comparators cannot safely synthesize an
         // exclusive successor. Delete concrete keys in bounded write batches.
-        std::unique_ptr<rocksdb::Iterator> iterator(database->db->NewIterator({}, column));
+        std::unique_ptr<rocksdb::Iterator> iterator(database->db->NewIterator(readOptions, column));
         const auto equal = [comparator](const rocksdb::Slice& a, const std::string& b) {
           return comparator->Compare(a, b) == 0;
         };
