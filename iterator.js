@@ -17,6 +17,7 @@ const kPosition = Symbol('position')
 const kBusy = Symbol('busy')
 const kPendingClose = Symbol('pendingClose')
 const kHasFilter = Symbol('hasFilter')
+const kNoFields = Symbol('noFields')
 
 const kEmpty = Object.freeze([])
 
@@ -34,6 +35,7 @@ class Iterator extends AbstractIterator {
     this[kBusy] = false
     this[kPendingClose] = null
     this[kHasFilter] = options.keyFilter != null || options.valueFilter != null
+    this[kNoFields] = options.keys === false && options.values === false
   }
 
   [Symbol.asyncDispose] () {
@@ -71,6 +73,28 @@ class Iterator extends AbstractIterator {
   // Undocumented, exposed for tests only
   get cached () {
     return (this[kCache].length - this[kPosition]) / 2
+  }
+
+  // AbstractIterator reserves an undefined/undefined _next callback as its end
+  // sentinel. The already-correct nextv path carries an explicit entries array,
+  // so use that when both fields are intentionally disabled.
+  next (callback) {
+    if (!this[kNoFields]) return super.next(callback)
+
+    if (callback === undefined) {
+      return this.nextv(1).then((entries) => entries[0])
+    }
+
+    if (typeof callback !== 'function') return super.next(callback)
+
+    this.nextv(1, (err, entries) => {
+      if (err) {
+        callback(err)
+      } else {
+        const entry = entries[0]
+        callback(null, entry?.[0], entry?.[1])
+      }
+    })
   }
 
   _next (callback) {

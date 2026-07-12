@@ -62,6 +62,46 @@ test('iterator with keys:false and values:false yields undefined pairs', async f
   t.is(nextved.length, 3, 'nextv returns all entries')
   await it.close()
 
+  const nextIterator = db.iterator({ keys: false, values: false })
+  for (let i = 0; i < 3; i++) {
+    t.same(await nextIterator.next(), [undefined, undefined], `next returns entry ${i + 1}`)
+  }
+  t.is(await nextIterator.next(), undefined, 'next signals natural exhaustion')
+  t.is(nextIterator.count, 3, 'next counts entries with no fields')
+  await nextIterator.close()
+
+  const callbackIterator = db.iterator({ keys: false, values: false })
+  await new Promise((resolve, reject) => {
+    callbackIterator.next((err, key, value) => {
+      if (err) return reject(err)
+      t.is(key, undefined, 'callback next omits the disabled key')
+      t.is(value, undefined, 'callback next omits the disabled value')
+      resolve()
+    })
+  })
+  t.is(callbackIterator.count, 1, 'callback next still consumes one entry')
+  await callbackIterator.close()
+
+  const exhaustedCallbackIterator = db.iterator({ keys: false, values: false, limit: 0 })
+  await new Promise((resolve, reject) => {
+    exhaustedCallbackIterator.next(function (err, key, value) {
+      if (err) return reject(err)
+      t.is(arguments.length, 3, 'exhausted callback preserves next callback arity')
+      t.is(err, null, 'exhausted callback uses a null error')
+      t.is(key, undefined, 'exhausted callback omits the key')
+      t.is(value, undefined, 'exhausted callback omits the value')
+      resolve()
+    })
+  })
+  await exhaustedCallbackIterator.close()
+
+  let iterated = 0
+  for await (const entry of db.iterator({ keys: false, values: false })) {
+    t.same(entry, [undefined, undefined], `async iterator returns entry ${iterated + 1}`)
+    iterated++
+  }
+  t.is(iterated, 3, 'async iterator yields every entry')
+
   await db.close()
   t.end()
 })
