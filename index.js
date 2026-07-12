@@ -193,10 +193,6 @@ class RocksLevel extends AbstractLevel {
     this._getMany([key], options ?? kEmpty, (err, val) => {
       if (err) {
         callback(err)
-      } else if (val[0] === null) {
-        callback(new ModuleError('Multi-get stopped before the value was read', {
-          code: 'LEVEL_ABORTED'
-        }))
       } else if (val[0] === undefined) {
         callback(Object.assign(new Error('not found'), {
           code: 'LEVEL_NOT_FOUND'
