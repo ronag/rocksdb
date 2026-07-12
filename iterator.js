@@ -182,21 +182,22 @@ class Iterator extends AbstractIterator {
             this[kBusy] = false
             this[kDB][kUnref]()
 
-            if (err) {
-              callback(err)
-            } else {
-              this[kCache] = result.rows
-              this[kFinished] = result.finished
-              this[kPosition] = 0
-              this._next(callback)
+            try {
+              if (err) {
+                callback(err)
+              } else {
+                this[kCache] = result.rows
+                this[kFinished] = result.finished
+                this[kPosition] = 0
+                this._next(callback)
+              }
+            } finally {
+              this._flushPendingClose()
             }
-
-            this._flushPendingClose()
           })
         } catch (err) {
-          this[kBusy] = false
           this[kDB][kUnref]()
-          process.nextTick(callback, err)
+          this._deferNextResult(callback, err)
         }
       } else {
         try {
@@ -416,23 +417,35 @@ class Iterator extends AbstractIterator {
           this[kBusy] = false
           this[kDB][kUnref]()
 
-          if (err) {
-            callback(err)
-          } else {
-            this[kFinished] = result.finished
-            callback(null, result)
+          try {
+            if (err) {
+              callback(err)
+            } else {
+              this[kFinished] = result.finished
+              callback(null, result)
+            }
+          } finally {
+            this._flushPendingClose()
           }
-
-          this._flushPendingClose()
         })
       }
     } catch (err) {
-      this[kBusy] = false
       this[kDB][kUnref]()
-      process.nextTick(callback, err)
+      this._deferNextResult(callback, err)
     }
 
     return callback[kPromise]
+  }
+
+  _deferNextResult (callback, err) {
+    process.nextTick(() => {
+      this[kBusy] = false
+      try {
+        callback(err)
+      } finally {
+        this._flushPendingClose()
+      }
+    })
   }
 
   _closeSync () {

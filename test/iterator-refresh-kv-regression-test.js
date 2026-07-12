@@ -730,6 +730,42 @@ test('public seek serializes key encoding hooks', async function (t) {
   await throwingClose
   t.pass('a thrown native seek callback still flushes its queued close')
 
+  const throwingNextvIterator = db.iterator()
+  const nextvCallbackError = new Error('nextv callback failed')
+  let nativeNextvCompletion
+  const originalNextvAsync = binding.iterator_nextv
+  binding.iterator_nextv = function (...args) {
+    nativeNextvCompletion = args.at(-1)
+  }
+  try {
+    throwingNextvIterator._nextvAsync(1, {}, () => {
+      throw nextvCallbackError
+    })
+  } finally {
+    binding.iterator_nextv = originalNextvAsync
+  }
+  const throwingNextvClose = throwingNextvIterator.close()
+  t.throws(() => nativeNextvCompletion(null, { rows: [], finished: true }), nextvCallbackError,
+    'a native nextv completion preserves a thrown user callback error')
+  await throwingNextvClose
+  t.pass('a thrown native nextv callback still flushes its queued close')
+
+  const failingNextvIterator = db.iterator()
+  const optionsError = new Error('nextv options failed')
+  let failingNextvClose
+  const nextvError = await failingNextvIterator._nextvAsync(1, {
+    get timeout () {
+      failingNextvClose = failingNextvIterator.close()
+      throw optionsError
+    }
+  }).then(
+    () => null,
+    (err) => err
+  )
+  t.is(nextvError, optionsError, 'a synchronous nextv options error is preserved')
+  await failingNextvClose
+  t.pass('a synchronous nextv options error still flushes its queued close')
+
   await optionsIterator.close()
   await rawIterator.close()
   await nextIterator.close()
