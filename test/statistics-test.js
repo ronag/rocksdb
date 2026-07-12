@@ -213,7 +213,26 @@ test('statistics resource: exact ticker shape and strict options', (t) => {
 
   t.equal(statistics.setStatisticsEnabled(true), true, 'resource can enable collection')
   t.equal(statistics.setStatisticsEnabled(false), true, 'resource can disable collection')
-  t.throws(() => statistics.setStatisticsEnabled('true'), TypeError, 'toggle rejects non-booleans')
+
+  const invalidToggleError = {
+    name: 'TypeError',
+    message: "The 'enabled' argument must be a boolean"
+  }
+  t.throws(() => statistics.setStatisticsEnabled(), invalidToggleError, 'toggle rejects an omitted argument')
+  for (const [label, enabled] of [
+    ['null', null],
+    ['a number', 1],
+    ['a string', 'true'],
+    ['an object', {}],
+    ['an array', []]
+  ]) {
+    t.throws(
+      () => statistics.setStatisticsEnabled(enabled),
+      invalidToggleError,
+      `toggle rejects ${label}`
+    )
+  }
+
   t.throws(() => new RocksStatistics({ enabled: 1 }), TypeError, 'enabled option rejects non-booleans')
   t.throws(() => new RocksStatistics(null), TypeError, 'null options reject')
   t.throws(() => new RocksStatistics(true), TypeError, 'primitive options reject')
