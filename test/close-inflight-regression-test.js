@@ -125,7 +125,7 @@ test('close() waits for in-flight query and clear', async function (t) {
   await seed(queryDb, 200)
   const querying = queryDb.query({ limit: 25 })
   const [, query] = await Promise.all([queryDb.close(), querying])
-  t.equal(query.rows.length, 50, 'query completed with 25 key/value rows')
+  t.equal(query.rows.length, 50, 'query completed with 50 flattened entries (25 key/value pairs)')
 
   const clearDb = testCommon.factory()
   await clearDb.open()
