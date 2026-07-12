@@ -41,6 +41,23 @@ test('getMany with a tight timeout never returns garbage and never throws', asyn
   t.end()
 })
 
+test('async getMany with a tight timeout either completes or reports LEVEL_ABORTED', async function (t) {
+  const db = testCommon.factory({ valueEncoding: 'utf8' })
+  await db.open()
+  const keys = await seed(db, 4000)
+
+  try {
+    const rows = await db.getMany(keys, { timeout: 1, valueEncoding: 'utf8' })
+    t.equal(rows.length, keys.length, 'completed read returns one value per key')
+    t.ok(rows.every((row) => row === VALUE), 'completed read contains no partial or garbage values')
+  } catch (err) {
+    t.equal(err.code, 'LEVEL_ABORTED', 'a partial timeout is surfaced explicitly')
+  }
+
+  await db.close()
+  t.end()
+})
+
 test('getMany with no timeout returns every value', async function (t) {
   const db = testCommon.factory({ valueEncoding: 'utf8' })
   await db.open()

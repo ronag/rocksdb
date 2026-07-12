@@ -173,17 +173,7 @@ class RocksLevel extends AbstractLevel {
   }
 
   _put (key, value, options, callback) {
-    callback = fromCallback(callback, kPromise)
-
-    try {
-      const batch = this.batch()
-      batch.put(key, value, options ?? kEmpty)
-      batch.write(callback)
-    } catch (err) {
-      process.nextTick(callback, err)
-    }
-
-    return callback[kPromise]
+    return this._batch([{ ...options, type: 'put', key, value }], options ?? kEmpty, callback)
   }
 
   _get (key, options, callback) {
@@ -221,6 +211,10 @@ class RocksLevel extends AbstractLevel {
         this[kUnref]()
         if (err) {
           callback(err)
+        } else if (val.includes(null)) {
+          callback(new ModuleError('Multi-get stopped before every value was read', {
+            code: 'LEVEL_ABORTED'
+          }))
         } else {
           callback(null, val)
         }
@@ -242,17 +236,7 @@ class RocksLevel extends AbstractLevel {
   }
 
   _del (key, options, callback) {
-    callback = fromCallback(callback, kPromise)
-
-    try {
-      const batch = this.batch()
-      batch.del(key, options ?? kEmpty)
-      batch.write(callback)
-    } catch (err) {
-      process.nextTick(callback, err)
-    }
-
-    return callback[kPromise]
+    return this._batch([{ ...options, type: 'del', key }], options ?? kEmpty, callback)
   }
 
   _clear (options, callback) {
@@ -376,11 +360,27 @@ class RocksLevel extends AbstractLevel {
   }
 
   query (options, callback) {
+    if (typeof options === 'function') {
+      callback = options
+      options = kEmpty
+    }
     callback = fromCallback(callback, kPromise)
 
+    if (this.status !== 'open') {
+      process.nextTick(callback, new ModuleError('Database is not open', {
+        code: 'LEVEL_DATABASE_NOT_OPEN'
+      }))
+      return callback[kPromise]
+    }
+
     try {
-      process.nextTick(callback, null, this.querySync(options))
+      this[kRef]()
+      binding.db_query(this[kContext], options ?? kEmpty, (err, value) => {
+        this[kUnref]()
+        callback(err, value)
+      })
     } catch (err) {
+      this[kUnref]()
       process.nextTick(callback, err)
     }
 
@@ -394,7 +394,7 @@ class RocksLevel extends AbstractLevel {
       })
     }
 
-    return binding.db_query(this[kContext], options ?? kEmpty)
+    return binding.db_query_sync(this[kContext], options ?? kEmpty)
   }
 
   async * updates (options) {
@@ -432,12 +432,17 @@ class RocksLevel extends AbstractLevel {
   }
 
   compactRange (options = {}, callback) {
+    if (typeof options === 'function') {
+      callback = options
+      options = kEmpty
+    }
     callback = fromCallback(callback, kPromise)
 
     if (this.status !== 'open') {
-      throw new ModuleError('Database is not open', {
+      process.nextTick(callback, new ModuleError('Database is not open', {
         code: 'LEVEL_DATABASE_NOT_OPEN'
-      })
+      }))
+      return callback[kPromise]
     }
 
     this[kRef]()
@@ -455,12 +460,17 @@ class RocksLevel extends AbstractLevel {
   }
 
   flushWAL (options = {}, callback) {
+    if (typeof options === 'function') {
+      callback = options
+      options = kEmpty
+    }
     callback = fromCallback(callback, kPromise)
 
     if (this.status !== 'open') {
-      throw new ModuleError('Database is not open', {
+      process.nextTick(callback, new ModuleError('Database is not open', {
         code: 'LEVEL_DATABASE_NOT_OPEN'
-      })
+      }))
+      return callback[kPromise]
     }
 
     this[kRef]()

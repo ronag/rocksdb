@@ -23,3 +23,21 @@ make('querySync HWM', function (db, t, done) {
     t.end()
   })
 })
+
+make('async query matches sync HWM and limit semantics', async function (db, t, done) {
+  const value = 'x'.repeat(128)
+  await db.batch(['a', 'b', 'c', 'd'].map((key) => ({ type: 'put', key, value })))
+
+  const options = { gte: 'a', lte: 'd', highWaterMarkBytes: 10 }
+  const sync = db.querySync(options)
+  const asyncResult = await db.query(options)
+  t.same(asyncResult, sync, 'promise query matches querySync at the high-water mark')
+  t.equal(asyncResult.finished, false, 'high-water mark leaves the query unfinished')
+  t.equal(asyncResult.limited, true, 'high-water mark reports a limited result')
+
+  const limited = await db.query({ gte: 'a', lte: 'd', limit: 2 })
+  t.equal(limited.rows.length, 4, 'limit returns two key/value rows')
+  t.equal(limited.finished, true, 'limit is terminal')
+  t.equal(limited.limited, true, 'limit is reported separately from exhaustion')
+  done()
+})

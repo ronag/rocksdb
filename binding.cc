@@ -1751,7 +1751,7 @@ NAPI_METHOD(db_get_location) {
   return result;
 }
 
-NAPI_METHOD(db_query) {
+NAPI_METHOD(db_query_sync) {
   NAPI_ARGV(2);
 
   try {
@@ -1764,6 +1764,21 @@ NAPI_METHOD(db_query) {
       return nullptr;
     }
     return iterator->nextv(env, std::numeric_limits<uint32_t>::max());
+  } catch (const std::exception& e) {
+    napi_throw_error(env, nullptr, e.what());
+    return nullptr;
+  }
+}
+
+NAPI_METHOD(db_query) {
+  NAPI_ARGV(3);
+
+  try {
+    auto iterator = Iterator::create(env, argv[0], argv[1]);
+    if (!iterator) {
+      return nullptr;
+    }
+    return iterator->nextv(env, std::numeric_limits<uint32_t>::max(), 0, argv[2]);
   } catch (const std::exception& e) {
     napi_throw_error(env, nullptr, e.what());
     return nullptr;
@@ -3853,6 +3868,7 @@ NAPI_INIT() {
   NAPI_EXPORT_FUNCTION(db_get_statistics);
   NAPI_EXPORT_FUNCTION(db_get_latest_sequence);
   NAPI_EXPORT_FUNCTION(db_query);
+  NAPI_EXPORT_FUNCTION(db_query_sync);
   NAPI_EXPORT_FUNCTION(db_compact_range_sync);
   NAPI_EXPORT_FUNCTION(db_compact_range);
   NAPI_EXPORT_FUNCTION(db_flush_wal);
