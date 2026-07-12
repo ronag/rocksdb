@@ -44,6 +44,25 @@ test('batch put concatenates Buffer and SliceLike parts synchronously', async fu
   t.end()
 })
 
+test('batch put supports more parts than the inline native storage', async function (t) {
+  const keyParts = Array.from({ length: 9 }, (_, index) => Buffer.from(String(index)))
+  const valueParts = Array.from({ length: 10 }, (_, index) => Buffer.from(`part-${index};`))
+  const expectedKey = Buffer.concat(keyParts)
+  const expectedValue = Buffer.concat(valueParts)
+
+  const batch = db.batch()
+  batch._putParts(keyParts, valueParts)
+
+  // Exercise the overflow vector's synchronous ownership contract too.
+  for (const part of keyParts) part.fill(0)
+  for (const part of valueParts) part.fill(0)
+
+  await batch.write()
+  t.same(await db.get(expectedKey), expectedValue,
+    'overflow parts are concatenated and owned by the batch')
+  t.end()
+})
+
 test('batch merge compares a revision split across parts', async function (t) {
   const batch = db.batch()
   const key = Buffer.from('merged')
