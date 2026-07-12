@@ -134,6 +134,7 @@ make('updates surface clear range tombstones', async function (db, t, done) {
   const rows = updates.flatMap((update) => update.rows)
   const clear = rows.indexOf('clear')
   t.ok(clear >= 0, 'range deletion is reported as clear')
+  if (clear < 0) return done()
   t.same(rows[clear + 1], Buffer.from('one'), 'clear includes its exact lower key bound')
   t.same(rows[clear + 2], Buffer.from('three'), 'clear includes its exact upper key bound despite values:false')
   done()
