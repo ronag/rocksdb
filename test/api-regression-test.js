@@ -179,6 +179,11 @@ test('bounded sublevel getMany preserves partial markers across nested decoding'
     t.ok(rows.includes(null), `${name} exposes at least one partial marker`)
     t.ok(rows.every((row) => row === null || row === 'ff'.repeat(1024)),
       `${name} leaves partial markers intact`)
+
+    for (const primitive of [1, 'ignored']) {
+      const complete = await target.getMany(['key0', 'key1', 'key2'], primitive)
+      t.equal(complete.length, 3, `${name} preserves primitive-options defaulting`)
+    }
   }
 
   await db.close()

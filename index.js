@@ -230,23 +230,27 @@ class RocksLevel extends AbstractLevel {
         this[kUnref]()
         if (err) {
           callback(err)
-        } else if (val.includes(null)) {
-          if (!allowPartial) {
-            callback(new ModuleError('Multi-get stopped before every value was read', {
-              code: 'LEVEL_ABORTED'
-            }))
-          } else {
-            const indexes = []
-            for (let i = 0; i < val.length; i++) {
-              if (val[i] === null) {
-                indexes.push(i)
-                val[i] = undefined
-              }
+          return
+        }
+
+        const indexes = []
+        for (let i = 0; i < val.length; i++) {
+          if (val[i] === null) {
+            indexes.push(i)
+            if (allowPartial) {
+              val[i] = undefined
             }
-            partialResults.set(val, indexes)
-            callback(null, val)
           }
+        }
+
+        if (indexes.length === 0) {
+          callback(null, val)
+        } else if (!allowPartial) {
+          callback(new ModuleError('Multi-get stopped before every value was read', {
+            code: 'LEVEL_ABORTED'
+          }))
         } else {
+          partialResults.set(val, indexes)
           callback(null, val)
         }
       })
@@ -562,9 +566,10 @@ function restorePartialResults (values) {
 }
 
 function markSublevelOptions (options) {
-  if (typeof options !== 'object' || options === null) {
+  if (options === undefined || options === null) {
     return { [kDeferPartialResults]: true }
   }
+  if (typeof options !== 'object') return options
 
   const marked = Object.create(
     Object.getPrototypeOf(options),
