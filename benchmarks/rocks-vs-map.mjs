@@ -5,9 +5,11 @@ import { mkdtemp, rm } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import assert from 'node:assert/strict'
+import { cleanupAfterBenchmark } from './cleanup.mjs'
 
 const location = await mkdtemp(join(tmpdir(), 'rocks-vs-map-'))
 let db
+let failed = false
 
 try {
   const values = Array.from({ length: 1e3 }, (_, i) =>
@@ -57,7 +59,7 @@ try {
 
   const warmed = await db._getMany(values, getOpts)
   assert.equal(warmed.length, values.length)
-  assert(warmed.every((row, index) => row.equals(values[index])))
+  assert(warmed.every((row, index) => Buffer.isBuffer(row) && row.equals(values[index])))
 
   bench('rocks async', async () => {
     consume(await db._getMany(values, getOpts))
@@ -81,10 +83,12 @@ try {
 
   await run()
   console.log(x)
+} catch (err) {
+  failed = true
+  throw err
 } finally {
-  try {
-    if (db) await db.close()
-  } finally {
-    await rm(location, { recursive: true, force: true })
-  }
+  await cleanupAfterBenchmark(failed, [
+    async () => { if (db) await db.close() },
+    () => rm(location, { recursive: true, force: true })
+  ])
 }

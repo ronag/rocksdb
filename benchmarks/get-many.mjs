@@ -4,9 +4,11 @@ import { mkdtemp, rm } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import assert from 'node:assert/strict'
+import { cleanupAfterBenchmark } from './cleanup.mjs'
 
 const location = await mkdtemp(join(tmpdir(), 'rocks-get-many-'))
 let db
+let failed = false
 
 try {
   db = new RocksLevel(location, {
@@ -48,7 +50,7 @@ try {
     }
     const warmed = db._getManySync(keys, getOpts)
     assert.equal(warmed.length, keys.length)
-    assert(warmed.every((row) => row.byteLength === size && row[0] === 0x5a))
+    assert(warmed.every((row) => Buffer.isBuffer(row) && row.byteLength === size && row[0] === 0x5a))
 
     group(() => {
       bench('_getManySync ' + label, () => {
@@ -63,10 +65,12 @@ try {
 
   await run()
   console.log(checksum)
+} catch (err) {
+  failed = true
+  throw err
 } finally {
-  try {
-    if (db) await db.close()
-  } finally {
-    await rm(location, { recursive: true, force: true })
-  }
+  await cleanupAfterBenchmark(failed, [
+    async () => { if (db) await db.close() },
+    () => rm(location, { recursive: true, force: true })
+  ])
 }
