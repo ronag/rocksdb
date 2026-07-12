@@ -94,13 +94,15 @@ test('test chained-batch 2', async function (t) {
     batch.put('_bar', 'val4')
 
     const arr1 = batch.toArray({ column })
+    t.equal(arr1.length, 8, 'column filter returns both column operations')
     for (let n = 0; n < arr1.length; n += 4) {
-      t.ok(arr1[1][0] !== '_')
+      t.ok(arr1[n + 1][0] !== '_')
     }
 
     const arr2 = batch.toArray({ column: db.columns.default })
+    t.equal(arr2.length, 8, 'default filter returns both default operations')
     for (let n = 0; n < arr2.length; n += 4) {
-      t.ok(arr2[1][0] === '_')
+      t.ok(arr2[n + 1][0] === '_')
     }
 
     t.same([...batch], [
@@ -125,13 +127,14 @@ test('test chained-batch 2', async function (t) {
     const batch = db.batch()
     batch.del('foo', { column })
     batch.del('bar', { column })
+    const rows = [...batch]
+    t.equal(rows.length, 2, 'batch exposes both deletes before write closes it')
+    for (const { key } of rows) {
+      t.ok(key[0] !== '_')
+    }
     await batch.write()
     t.same(await db.getMany(['foo', 'bar'], { column }), [undefined, undefined])
     t.same(await db.getMany(['_foo', '_bar']), ['val3', 'val4'])
-
-    for (const { key } of batch) {
-      t.ok(key[0] !== '_')
-    }
   }
 
   await db.close()

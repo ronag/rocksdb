@@ -9,9 +9,13 @@
 #include <rocksdb/status.h>
 
 #include <array>
+#include <cmath>
+#include <limits>
 #include <memory>
 #include <optional>
 #include <string>
+#include <string_view>
+#include <type_traits>
 
 #define NAPI_STATUS_RETURN(call) \
   {                              \
@@ -124,29 +128,22 @@ static napi_status GetString(napi_env env, napi_value from, rocksdb::Slice& to) 
     size_t length = 0;
     NAPI_STATUS_RETURN(napi_get_buffer_info(env, value, reinterpret_cast<void**>(&buf), &length));
 
-    int pos = 0;
+    int64_t pos = 0;
     {
       napi_value property;
       NAPI_STATUS_RETURN(napi_get_named_property(env, from, "byteOffset", &property));
-      NAPI_STATUS_RETURN(napi_get_value_int32(env, property, &pos));
+      NAPI_STATUS_RETURN(napi_get_value_int64(env, property, &pos));
     }
 
-    if (pos < 0 || pos > length) {
-      return napi_invalid_arg;
-    }
-
-    int len = length;
+    int64_t len = 0;
     {
       napi_value property;
       NAPI_STATUS_RETURN(napi_get_named_property(env, from, "byteLength", &property));
-      NAPI_STATUS_RETURN(napi_get_value_int32(env, property, &len));
+      NAPI_STATUS_RETURN(napi_get_value_int64(env, property, &len));
     }
 
-    if (len < 0 || len > length) {
-      return napi_invalid_arg;
-    }
-
-    if (pos + len > length) {
+    if (pos < 0 || len < 0 || static_cast<uint64_t>(pos) > length ||
+        static_cast<uint64_t>(len) > length - static_cast<uint64_t>(pos)) {
       return napi_invalid_arg;
     }
 
@@ -165,12 +162,14 @@ static napi_status GetString(napi_env env, napi_value from, std::string& to) {
   if (type == napi_string) {
     size_t length = 0;
     NAPI_STATUS_RETURN(napi_get_value_string_utf8(env, from, nullptr, 0, &length));
-    napi_status status = napi_ok;
-    to.resize_and_overwrite(length, [&](char* buf, size_t count) {
-      status = napi_get_value_string_utf8(env, from, buf, length + 1, &length);
-      return status == napi_ok ? length : 0;
-    });
-    NAPI_STATUS_RETURN(status);
+    // N-API writes a trailing NUL when the buffer has room. Allocate that byte
+    // explicitly; passing length + 1 to resize_and_overwrite(length) writes one
+    // byte past the writable range, even though most std::string
+    // implementations happen to keep terminator storage there.
+    to.resize(length + 1);
+    size_t written = 0;
+    NAPI_STATUS_RETURN(napi_get_value_string_utf8(env, from, to.data(), to.size(), &written));
+    to.resize(written);
   } else {
     rocksdb::Slice slice;
     NAPI_STATUS_RETURN(GetString(env, from, slice));
@@ -187,12 +186,11 @@ static napi_status GetString(napi_env env, napi_value from, rocksdb::PinnableSli
   if (type == napi_string) {
     size_t length = 0;
     NAPI_STATUS_RETURN(napi_get_value_string_utf8(env, from, nullptr, 0, &length));
-    napi_status status = napi_ok;
-    to.GetSelf()->resize_and_overwrite(length, [&](char* buf, size_t count) {
-      status = napi_get_value_string_utf8(env, from, buf, length + 1, &length);
-      return status == napi_ok ? length : 0;
-    });
-    NAPI_STATUS_RETURN(status);
+    auto* storage = to.GetSelf();
+    storage->resize(length + 1);
+    size_t written = 0;
+    NAPI_STATUS_RETURN(napi_get_value_string_utf8(env, from, storage->data(), storage->size(), &written));
+    storage->resize(written);
     to.PinSelf();
   } else {
     rocksdb::Slice slice;
@@ -209,46 +207,51 @@ static napi_status GetValue(napi_env env, napi_value value, bool& result) {
   return napi_get_value_bool(env, value, &result);
 }
 
-static napi_status GetValue(napi_env env, napi_value value, int& result) {
-  int64_t result2;
-  NAPI_STATUS_RETURN(napi_get_value_int64(env, value, &result2));
-  result = static_cast<int>(result2);
+template <typename T>
+static napi_status GetIntegerValue(napi_env env, napi_value value, T& result) {
+  static_assert(std::is_integral_v<T>);
+  double numeric;
+  NAPI_STATUS_RETURN(napi_get_value_double(env, value, &numeric));
+  if (!std::isfinite(numeric) || std::trunc(numeric) != numeric) {
+    return napi_invalid_arg;
+  }
+
+  // Compare against exact power-of-two bounds before converting. Casting the
+  // rounded double representation of uint64_t::max (2^64) is undefined; using
+  // max() directly also fails on platforms where long double == double.
+  const auto exclusiveUpper = std::ldexp(1.0, std::numeric_limits<T>::digits);
+  if constexpr (std::is_signed_v<T>) {
+    if (numeric < -exclusiveUpper || numeric >= exclusiveUpper) return napi_invalid_arg;
+  } else {
+    if (numeric < 0 || numeric >= exclusiveUpper) return napi_invalid_arg;
+  }
+
+  result = static_cast<T>(numeric);
   return napi_ok;
+}
+
+static napi_status GetValue(napi_env env, napi_value value, int& result) {
+  return GetIntegerValue(env, value, result);
 }
 
 static napi_status GetValue(napi_env env, napi_value value, long& result) {
-  int64_t result2;
-  NAPI_STATUS_RETURN(napi_get_value_int64(env, value, &result2));
-  result = static_cast<long>(result2);
-  return napi_ok;
+  return GetIntegerValue(env, value, result);
 }
 
 static napi_status GetValue(napi_env env, napi_value value, long long& result) {
-  int64_t result2;
-  NAPI_STATUS_RETURN(napi_get_value_int64(env, value, &result2));
-  result = static_cast<long long>(result2);
-  return napi_ok;
+  return GetIntegerValue(env, value, result);
 }
 
 static napi_status GetValue(napi_env env, napi_value value, unsigned int& result) {
-  int64_t result2;
-  NAPI_STATUS_RETURN(napi_get_value_int64(env, value, &result2));
-  result = static_cast<unsigned int>(result2);
-  return napi_ok;
+  return GetIntegerValue(env, value, result);
 }
 
 static napi_status GetValue(napi_env env, napi_value value, unsigned long& result) {
-  int64_t result2;
-  NAPI_STATUS_RETURN(napi_get_value_int64(env, value, &result2));
-  result = static_cast<unsigned long>(result2);
-  return napi_ok;
+  return GetIntegerValue(env, value, result);
 }
 
 static napi_status GetValue(napi_env env, napi_value value, unsigned long long& result) {
-  int64_t result2;
-  NAPI_STATUS_RETURN(napi_get_value_int64(env, value, &result2));
-  result = static_cast<unsigned long long>(result2);
-  return napi_ok;
+  return GetIntegerValue(env, value, result);
 }
 
 static napi_status GetValue(napi_env env, napi_value value, double& result) {
@@ -277,13 +280,15 @@ static napi_status GetValue(napi_env env, napi_value value, std::shared_ptr<rock
 }
 
 static napi_status GetValue(napi_env env, napi_value value, Encoding& result) {
-  size_t size;
-  NAPI_STATUS_RETURN(napi_get_value_string_utf8(env, value, nullptr, 0, &size));
+  char buffer[8] = {};
+  size_t size = 0;
+  NAPI_STATUS_RETURN(napi_get_value_string_utf8(env, value, buffer, sizeof(buffer), &size));
 
-  if (size == 6) {
+  const std::string_view encoding(buffer, size);
+  if (encoding == "buffer" || encoding == "view") {
     result = Encoding::Buffer;
     return napi_ok;
-  } else {
+  } else if (encoding == "utf8") {
     result = Encoding::String;
     return napi_ok;
   }
@@ -437,9 +442,17 @@ napi_status Convert(napi_env env,
                     rocksdb::PinnableSlice&& s,
                     Encoding encoding,
                     napi_value& result,
-                    bool unsafe = false) {
+                    bool unsafe = false,
+                    bool transferable = true) {
   if (encoding == Encoding::Buffer) {
-    if (unsafe) {
+    // External-buffer ownership/finalizers cost more than a small memcpy. The
+    // measured crossover on Node 26 is around the KiB range, so keep small
+    // values on the normal copy path and reserve `unsafe` for values where it
+    // actually wins.
+    if (unsafe && transferable && s.size() >= 1024 && !s.IsPinned()) {
+      // Cache-pinned MultiGet results cannot safely outlive db.close(); those
+      // stay on the copy path below. Iterator results use PinSelf() and can be
+      // transferred directly to an external Buffer without retaining RocksDB.
       // The heap PinnableSlice is owned by the finalizer, which N-API only
       // registers when the external buffer is created successfully. Hold it in a
       // unique_ptr and release ownership only on success, so a failed
@@ -453,10 +466,14 @@ napi_status Convert(napi_env env,
       }
       return status;
     } else {
-      return napi_create_buffer_copy(env, s.size(), s.data(), nullptr, &result);
+      const auto status = napi_create_buffer_copy(env, s.size(), s.data(), nullptr, &result);
+      s.Reset();
+      return status;
     }
   } else if (encoding == Encoding::String) {
-    return napi_create_string_utf8(env, s.data(), s.size(), &result);
+    const auto status = napi_create_string_utf8(env, s.data(), s.size(), &result);
+    s.Reset();
+    return status;
   } else {
     return napi_invalid_arg;
   }
@@ -549,7 +566,12 @@ class HandleScope {
 };
 
 template <typename State, typename T1, typename T2>
-napi_status runAsync(napi_value asyncResourceName, napi_env env, napi_value callback, T1&& execute, T2&& then) {
+napi_status runAsyncKeepAlive(napi_value asyncResourceName,
+                              napi_env env,
+                              napi_value callback,
+                              napi_value keepAlive,
+                              T1&& execute,
+                              T2&& then) {
   struct Worker final {
     static void Execute(napi_env env, void* data) {
       auto worker = reinterpret_cast<Worker*>(data);
@@ -585,10 +607,20 @@ napi_status runAsync(napi_value asyncResourceName, napi_env env, napi_value call
       if (!worker->status.ok()) {
         argv[0] = ToError(env, worker->status);
       } else if (worker->then(worker->state, env, &argv[1]) != napi_ok) {
-        const napi_extended_error_info* errInfo = nullptr;
-        NAPI_STATUS_THROWS_VOID(napi_get_last_error_info(env, &errInfo));
-        argv[0] = CreateError(env, std::nullopt,
-                              !errInfo || !errInfo->error_message ? "empty error message" : errInfo->error_message);
+        bool pending = false;
+        NAPI_STATUS_THROWS_VOID(napi_is_exception_pending(env, &pending));
+        if (pending) {
+          // A conversion helper may have thrown while returning a failing
+          // napi_status. Claim that exception and deliver it to the callback;
+          // otherwise the pending exception prevents the callback call and
+          // leaves the JS promise permanently unsettled.
+          NAPI_STATUS_THROWS_VOID(napi_get_and_clear_last_exception(env, &argv[0]));
+        } else {
+          const napi_extended_error_info* errInfo = nullptr;
+          NAPI_STATUS_THROWS_VOID(napi_get_last_error_info(env, &errInfo));
+          argv[0] = CreateError(env, std::nullopt,
+                                !errInfo || !errInfo->error_message ? "empty error message" : errInfo->error_message);
+        }
       }
 
       napi_call_function(env, global, callback, argv.size(), argv.data(), nullptr);
@@ -598,6 +630,10 @@ napi_status runAsync(napi_value asyncResourceName, napi_env env, napi_value call
       if (ref) {
         napi_delete_reference(env, ref);
         ref = nullptr;
+      }
+      if (keepAliveRef) {
+        napi_delete_reference(env, keepAliveRef);
+        keepAliveRef = nullptr;
       }
       if (asyncWork) {
         napi_delete_async_work(env, asyncWork);
@@ -613,6 +649,7 @@ napi_status runAsync(napi_value asyncResourceName, napi_env env, napi_value call
     State state;
 
     napi_ref ref = nullptr;
+    napi_ref keepAliveRef = nullptr;
     napi_async_work asyncWork = nullptr;
     rocksdb::Status status = rocksdb::Status::OK();
   };
@@ -620,6 +657,9 @@ napi_status runAsync(napi_value asyncResourceName, napi_env env, napi_value call
   auto worker = std::unique_ptr<Worker>(new Worker{env, std::forward<T1>(execute), std::forward<T2>(then)});
 
   NAPI_STATUS_RETURN(napi_create_reference(env, callback, 1, &worker->ref));
+  if (keepAlive) {
+    NAPI_STATUS_RETURN(napi_create_reference(env, keepAlive, 1, &worker->keepAliveRef));
+  }
   NAPI_STATUS_RETURN(napi_create_async_work(env, callback, asyncResourceName, Worker::Execute, Worker::Complete,
                                             worker.get(), &worker->asyncWork));
 
@@ -628,6 +668,27 @@ napi_status runAsync(napi_value asyncResourceName, napi_env env, napi_value call
   worker.release();
 
   return napi_ok;
+}
+
+template <typename State, typename T1, typename T2>
+napi_status runAsync(napi_value asyncResourceName, napi_env env, napi_value callback, T1&& execute, T2&& then) {
+  return runAsyncKeepAlive<State>(asyncResourceName, env, callback, nullptr, std::forward<T1>(execute),
+                                  std::forward<T2>(then));
+}
+
+template <typename State, typename T1>
+napi_status runAsyncKeepAlive(
+    napi_value asyncResourceName, napi_env env, napi_value callback, napi_value keepAlive, T1&& execute) {
+  return runAsyncKeepAlive<State>(asyncResourceName, env, callback, keepAlive, std::forward<T1>(execute),
+                                  [](auto& state, auto env, auto result) { return napi_ok; });
+}
+
+template <typename T1>
+napi_status runAsyncKeepAlive(
+    napi_value asyncResourceName, napi_env env, napi_value callback, napi_value keepAlive, T1&& execute) {
+  return runAsyncKeepAlive<std::nullptr_t>(asyncResourceName, env, callback, keepAlive,
+                                           std::forward<T1>(execute),
+                                           [](auto& state, auto env, auto result) { return napi_ok; });
 }
 
 template <typename State, typename T1>

@@ -21,7 +21,10 @@ test('highWaterMarkBytes limits byte length of nextv() entries', async function 
   }
 
   t.same(await hwm(0), [['a', '0']], 'accepts 0')
-  t.same(await hwm(Infinity), [['a', '0']], 'Infinity is interpreted as 0 (by Node-API)')
+  await hwm(Infinity).then(
+    () => t.fail('Infinity should be rejected'),
+    () => t.pass('Infinity is rejected')
+  )
   t.same(await hwm(1), [['a', '0']], 'is limited')
   t.same(await hwm(2), [['a', '0'], ['b', '1']], 'highWaterMarkBytes must be exceeded, not met')
 })
@@ -42,7 +45,10 @@ test('highWaterMarkBytes limits byte length of internal next() cache', async fun
   }
 
   t.is(await hwm(0), 2, 'accepts 0')
-  t.is(await hwm(Infinity), 2, 'Infinity is interpreted as 0 (by Node-API)')
+  await hwm(Infinity).then(
+    () => t.fail('Infinity should be rejected'),
+    () => t.pass('Infinity is rejected')
+  )
   t.is(await hwm(1), 2, 'is limited')
   t.is(await hwm(2), 4, 'highWaterMarkBytes must be exceeded, not met')
   t.is(await hwm(9), 6, 'double-check that previous test did apply a limit')
