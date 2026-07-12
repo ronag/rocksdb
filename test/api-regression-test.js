@@ -43,6 +43,32 @@ test('put and del forward write options', async function (t) {
   t.end()
 })
 
+test('put and del read write option accessors once', async function (t) {
+  const db = testCommon.factory()
+  await db.open()
+
+  for (const [name, property, invoke] of [
+    ['put', 'sync', (options) => db.put('key', 'value', options)],
+    ['del', 'lowPriority', (options) => db.del('key', options)]
+  ]) {
+    let reads = 0
+    const options = {}
+    Object.defineProperty(options, property, {
+      enumerable: true,
+      get: () => {
+        reads++
+        return false
+      }
+    })
+
+    await invoke(options)
+    t.equal(reads, 1, `${name} reads ${property} only for the write`)
+  }
+
+  await db.close()
+  t.end()
+})
+
 test('query, compactRange and flushWAL support callback-only overloads', async function (t) {
   const db = testCommon.factory()
   await db.open()

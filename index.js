@@ -178,7 +178,8 @@ class RocksLevel extends AbstractLevel {
     callback = fromCallback(callback, kPromise)
 
     try {
-      this._batch([{ ...options, type: 'put', key, value }], options ?? kEmpty, callback)
+      const column = options?.column
+      this._batch([{ type: 'put', key, value, column }], options ?? kEmpty, callback)
     } catch (err) {
       process.nextTick(callback, err)
     }
@@ -303,7 +304,8 @@ class RocksLevel extends AbstractLevel {
     callback = fromCallback(callback, kPromise)
 
     try {
-      this._batch([{ ...options, type: 'del', key }], options ?? kEmpty, callback)
+      const column = options?.column
+      this._batch([{ type: 'del', key, column }], options ?? kEmpty, callback)
     } catch (err) {
       process.nextTick(callback, err)
     }
