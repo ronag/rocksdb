@@ -2,6 +2,7 @@
 
 const test = require('tape')
 const tempy = require('tempy')
+const { spawnSync } = require('node:child_process')
 const binding = require('../binding')
 const { RocksLevel, RocksCache, RocksWriteBufferManager, RocksStatistics } = require('..')
 
@@ -254,5 +255,53 @@ test('native synchronous reads cannot race database teardown', async function (t
 
   await nativeClose(context)
   t.pass('repeated close/read races completed without accessing a torn-down DB')
+  t.end()
+})
+
+test('GC cannot deadlock a raw native operation finalizer', function (t) {
+  const location = tempy.directory()
+  const bindingPath = JSON.stringify(require.resolve('../binding'))
+  const script = `
+    'use strict'
+    const binding = require(${bindingPath})
+    const open = (context) => new Promise((resolve, reject) => {
+      binding.db_open(context, { createIfMissing: true }, (err) => err ? reject(err) : resolve())
+    })
+    const write = (context, batch) => new Promise((resolve, reject) => {
+      binding.batch_write(context, batch, {}, (err) => err ? reject(err) : resolve())
+    })
+    ;(async () => {
+      let context = binding.db_init(${JSON.stringify(location)})
+      await open(context)
+      let batch = binding.batch_init(context)
+      for (let i = 0; i < 50000; i++) {
+        binding.batch_put(batch, Buffer.from(String(i).padStart(8, '0')), Buffer.alloc(32), {})
+      }
+      await write(context, batch)
+      batch = null
+      const clearing = new Promise((resolve, reject) => {
+        binding.db_clear(context, { limit: 50000 }, (err) => err ? reject(err) : resolve())
+      })
+      // Drop the caller's reference; runAsyncKeepAlive retains the context
+      // until the native operation completes.
+      context = null
+      for (let i = 0; i < 20; i++) {
+        global.gc()
+        await new Promise(setImmediate)
+      }
+      await clearing
+      console.log('completed')
+    })().catch((err) => {
+      console.error(err)
+      process.exitCode = 1
+    })
+  `
+
+  const result = spawnSync(process.execPath, ['--expose-gc', '-e', script], {
+    encoding: 'utf8',
+    timeout: 30000
+  })
+  t.equal(result.status, 0, result.error ? result.error.message : result.stderr)
+  t.match(result.stdout, /completed/, 'the operation completed after the caller dropped its context reference and forced GC')
   t.end()
 })
