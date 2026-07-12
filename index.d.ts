@@ -35,9 +35,9 @@ export interface SliceLike {
 
 export type RocksFormat = string | Buffer | SliceLike
 export type RocksSlice = RocksFormat
-export type RocksNativeEncoding = 'buffer' | 'view' | 'utf8'
+export type RocksNativeEncoding = 'buffer' | 'view' | 'utf8' | 'utf-8'
 export type RocksNativeValue = string | Buffer
-export type RocksDecoded<E extends RocksNativeEncoding> = E extends 'utf8' ? string : Buffer
+export type RocksDecoded<E extends RocksNativeEncoding> = E extends 'utf8' | 'utf-8' ? string : Buffer
 
 declare const columnHandleBrand: unique symbol
 declare const cacheHandleBrand: unique symbol

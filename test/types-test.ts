@@ -84,6 +84,9 @@ expectType<Array<Buffer>>(query.rows)
 expectType<Array<string>>(
   db.querySync({ keyEncoding: 'utf8', valueEncoding: 'utf8' }).rows
 )
+expectType<Array<string>>(
+  db.querySync({ keyEncoding: 'utf-8', valueEncoding: 'utf-8' }).rows
+)
 expectType<Array<Buffer | undefined>>(
   db.querySync({ keys: false, values: true }).rows
 )
