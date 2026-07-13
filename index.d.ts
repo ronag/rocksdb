@@ -310,7 +310,7 @@ export interface RocksRawGetManyOptions<
   E extends RocksNativeEncoding = RocksNativeEncoding,
   Packed extends RocksPackedReadMode = false
 > extends RocksReadOptions {
-  valueEncoding?: Packed extends true | 'auto' ? 'buffer' : E
+  valueEncoding?: [Packed] extends [false] ? E : 'buffer'
   packed?: Packed
 }
 

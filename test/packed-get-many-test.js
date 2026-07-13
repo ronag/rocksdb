@@ -134,6 +134,34 @@ test('auto getMany packs values up to the 8 KiB average threshold', async functi
   t.end()
 })
 
+test('auto getMany observes valueEncoding once and preserves raw buffers', async function (t) {
+  const db = testCommon.factory({ keyEncoding: 'buffer', valueEncoding: 'buffer' })
+  await db.open()
+  await db.put('large', Buffer.alloc(8 * 1024 + 1, 0x61))
+
+  for (const [name, read] of [
+    ['sync', (options) => db._getManySync(['large'], options)],
+    ['async', (options) => db._getManyAsync(['large'], options)]
+  ]) {
+    let reads = 0
+    const options = { packed: 'auto' }
+    Object.defineProperty(options, 'valueEncoding', {
+      get () {
+        reads += 1
+        return reads === 1 ? 'buffer' : 'utf8'
+      }
+    })
+
+    const result = await read(options)
+    t.equal(reads, 1, `${name} snapshots valueEncoding once`)
+    t.equal(result.packed, false, `${name} selects unpacked mode for the large value`)
+    t.ok(Buffer.isBuffer(result[0]), `${name} preserves the validated buffer encoding`)
+  }
+
+  await db.close()
+  t.end()
+})
+
 test('async getMany callback reports the selected packed mode', async function (t) {
   const db = testCommon.factory({ keyEncoding: 'buffer', valueEncoding: 'buffer' })
   await db.open()

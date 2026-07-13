@@ -2728,7 +2728,7 @@ static napi_value db_get_many_sync_impl(napi_env env, napi_callback_info info, c
   NAPI_STATUS_THROWS(GetColumnProperty(env, argv[2], database, column));
 
   Encoding valueEncoding = Encoding::Buffer;
-  if (mode != PackedMode::Packed) {
+  if (mode == PackedMode::Unpacked) {
     NAPI_STATUS_THROWS(GetProperty(env, argv[2], "valueEncoding", valueEncoding));
   }
 
@@ -2837,7 +2837,7 @@ static napi_value db_get_many_impl(napi_env env, napi_callback_info info, const 
   NAPI_STATUS_THROWS(GetColumnProperty(env, argv[2], database, column));
 
   Encoding valueEncoding = Encoding::Buffer;
-  if (mode != PackedMode::Packed) {
+  if (mode == PackedMode::Unpacked) {
     NAPI_STATUS_THROWS(GetProperty(env, argv[2], "valueEncoding", valueEncoding));
   }
 
