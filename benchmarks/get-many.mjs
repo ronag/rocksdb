@@ -66,8 +66,8 @@ try {
         consume(db._getManySync(keys, getOpts))
       })
 
-      bench('_getMany ' + label, async () => {
-        consume(await db._getMany(keys, getOpts))
+      bench('_getManyAsync ' + label, async () => {
+        consume(await db._getManyAsync(keys, getOpts))
       })
 
       bench('_getManySync packed ' + label, () => {
