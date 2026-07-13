@@ -5,7 +5,7 @@ const { AbstractIterator } = require('abstract-level')
 const ModuleError = require('module-error')
 const assert = require('node:assert')
 const { Buffer } = require('node:buffer')
-const { kRef, kUnref } = require('./util')
+const { getPackedMode, kRef, kUnref, setPackedResult } = require('./util')
 
 const binding = require('./binding')
 
@@ -407,24 +407,27 @@ class Iterator extends AbstractIterator {
     try {
       this[kDB][kRef]()
       referenced = true
-      const packed = options?.packed === true
+      const packed = getPackedMode(options)
 
       if (this[kPosition] < this[kCache].length) {
-        if (packed) throw packedCacheError()
-        return this._nextvCached(size)
+        if (packed === true) throw packedCacheError()
+        return setPackedResult(this._nextvCached(size), false)
       }
 
       if (this[kFinished]) {
-        return packed ? emptyPackedResult() : { rows: [], finished: true }
+        const result = packed === true ? emptyPackedResult() : { rows: [], finished: true }
+        return setPackedResult(result, packed === true)
       }
 
-      const nextv = packed
+      const nextv = packed === true
         ? binding.iterator_nextv_packed_sync
-        : binding.iterator_nextv_sync
+        : packed === 'auto'
+          ? binding.iterator_nextv_auto_sync
+          : binding.iterator_nextv_sync
       const result = nextv(this[kContext], size, options)
       this[kFinished] = result.finished
 
-      return result
+      return setPackedResult(result, !('rows' in result))
     } finally {
       this[kBusy] = false
       if (referenced) this[kDB][kUnref]()
@@ -443,23 +446,25 @@ class Iterator extends AbstractIterator {
       this[kDB][kRef]()
       referenced = true
       this[kBusy] = true
-      const packed = options?.packed === true
+      const packed = getPackedMode(options)
 
       if (this[kPosition] < this[kCache].length) {
-        if (packed) throw packedCacheError()
+        if (packed === true) throw packedCacheError()
         const result = this._nextvCached(size)
         this[kDB][kUnref]()
         referenced = false
-        this._deferNextResult(callback, null, result)
+        this._deferNextResult(callback, null, result, false)
       } else if (this[kFinished]) {
-        const result = packed ? emptyPackedResult() : { rows: [], finished: true }
+        const result = packed === true ? emptyPackedResult() : { rows: [], finished: true }
         this[kDB][kUnref]()
         referenced = false
-        this._deferNextResult(callback, null, result)
+        this._deferNextResult(callback, null, result, packed === true)
       } else {
-        const nextv = packed
+        const nextv = packed === true
           ? binding.iterator_nextv_packed
-          : binding.iterator_nextv
+          : packed === 'auto'
+            ? binding.iterator_nextv_auto
+            : binding.iterator_nextv
         nextv(this[kContext], size, options, (err, result) => {
           this[kBusy] = false
           this[kDB][kUnref]()
@@ -469,7 +474,9 @@ class Iterator extends AbstractIterator {
               callback(err)
             } else {
               this[kFinished] = result.finished
-              callback(null, result)
+              const packedResult = !('rows' in result)
+              setPackedResult(result, packedResult)
+              callback(null, result, packedResult)
             }
           } finally {
             this._flushPendingClose()
@@ -484,11 +491,16 @@ class Iterator extends AbstractIterator {
     return callback[kPromise]
   }
 
-  _deferNextResult (callback, err, result) {
+  _deferNextResult (callback, err, result, packed) {
     process.nextTick(() => {
       this[kBusy] = false
       try {
-        callback(err, result)
+        if (err) {
+          callback(err)
+        } else {
+          setPackedResult(result, packed)
+          callback(null, result, packed)
+        }
       } finally {
         this._flushPendingClose()
       }

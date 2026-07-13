@@ -29,6 +29,7 @@ test('packed nextv returns one byte arena and cumulative field offsets', async f
   const iterator = db._iterator({ keyEncoding: 'buffer', valueEncoding: 'buffer' })
   const first = await iterator._nextvAsync(2, { packed: true })
 
+  t.equal(first.packed, true, 'async result exposes the selected packed mode')
   t.equal(first.count, 2, 'reports logical row count')
   t.same(first.offsets, new Uint32Array([0, 1, 4, 5, 8]),
     'offsets delimit alternating key/value fields')
@@ -53,6 +54,7 @@ test('packed nextv supports synchronous reads', async function (t) {
   const iterator = db._iterator({ keyEncoding: 'buffer', valueEncoding: 'buffer' })
   const result = iterator._nextvSync(2, { packed: true })
 
+  t.equal(result.packed, true, 'sync result exposes the selected packed mode')
   t.equal(result.count, 2, 'reports logical row count')
   t.same(result.offsets, new Uint32Array([0, 1, 4, 5, 8]),
     'sync offsets delimit alternating key/value fields')
@@ -83,6 +85,65 @@ test('packed nextv supports values-only and no-field iterators', async function 
   t.end()
 })
 
+test('auto nextv packs values up to the 8 KiB threshold', async function (t) {
+  const autoDb = testCommon.factory({ keyEncoding: 'buffer', valueEncoding: 'buffer' })
+  await autoDb.open()
+  await autoDb.batch([
+    { type: 'put', key: 'small', value: Buffer.alloc(8 * 1024, 0x61) },
+    { type: 'put', key: 'large', value: Buffer.alloc(8 * 1024 + 1, 0x62) }
+  ])
+
+  for (const [name, read] of [
+    ['sync', (iterator) => iterator._nextvSync(1, { packed: 'auto' })],
+    ['async', (iterator) => iterator._nextvAsync(1, { packed: 'auto' })]
+  ]) {
+    const smallIterator = autoDb._iterator({
+      gte: Buffer.from('small'),
+      lte: Buffer.from('small'),
+      keyEncoding: 'buffer',
+      valueEncoding: 'buffer'
+    })
+    const small = await read(smallIterator)
+    t.equal(small.packed, true, `${name} identifies the packed result`)
+    t.notOk(Array.isArray(small.rows), `${name} packs an 8 KiB value`)
+    t.equal(small.buffer.byteLength, 8 * 1024 + 5, `${name} packs the key and value bytes`)
+    await smallIterator.close()
+
+    const largeIterator = autoDb._iterator({
+      gte: Buffer.from('large'),
+      lte: Buffer.from('large'),
+      keyEncoding: 'buffer',
+      valueEncoding: 'buffer'
+    })
+    const large = await read(largeIterator)
+    t.equal(large.packed, false, `${name} identifies the unpacked result`)
+    t.ok(Array.isArray(large.rows), `${name} leaves a value above 8 KiB unpacked`)
+    t.equal(large.rows[1].byteLength, 8 * 1024 + 1, `${name} retains the unpacked value`)
+    await largeIterator.close()
+  }
+
+  await autoDb.close()
+  t.end()
+})
+
+test('async nextv callback reports the selected packed mode', async function (t) {
+  for (const packed of [false, true, 'auto']) {
+    const iterator = db._iterator({ keyEncoding: 'buffer', valueEncoding: 'buffer' })
+    const { result, selected } = await new Promise((resolve, reject) => {
+      iterator._nextvAsync(1, { packed }, (err, result, selected) => {
+        if (err) reject(err)
+        else resolve({ result, selected })
+      })
+    })
+
+    t.equal(selected, result.packed, `${packed} callback and result agree`)
+    t.equal(selected, packed !== false, `${packed} reports the expected mode for a small value`)
+    await iterator.close()
+  }
+
+  t.end()
+})
+
 test('packed nextv rejects prefetched rows instead of changing their encoding', async function (t) {
   const iterator = db.iterator({ keyEncoding: 'buffer', valueEncoding: 'buffer' })
   await iterator.next()
@@ -94,6 +155,9 @@ test('packed nextv rejects prefetched rows instead of changing their encoding', 
     (err) => err
   )
   t.equal(err && err.code, 'LEVEL_NOT_SUPPORTED', 'prefetched rows are rejected explicitly')
+
+  const auto = await iterator._nextvAsync(1, { packed: 'auto' })
+  t.ok(Array.isArray(auto.rows), 'auto mode preserves prefetched decoded rows')
 
   await iterator.close()
   t.end()

@@ -30,9 +30,11 @@ try {
 
   const getOpts = {
     valueEncoding: 'buffer',
-    fillCache: true
+    fillCache: true,
+    packed: false
   }
   const packedGetOpts = { ...getOpts, packed: true }
+  const autoGetOpts = { ...getOpts, packed: 'auto' }
 
   let checksum = 0
   function consume (rows) {
@@ -45,6 +47,11 @@ try {
     checksum += result.buffer.byteLength + result.statuses[0]
   }
 
+  function consumeResult (result) {
+    if (result.packed) consumePacked(result)
+    else consume(result)
+  }
+
   for (const size of [64, 1024, 4096, 16 * 1024]) {
     const label = size < 1024 ? `${size} B` : `${size / 1024} KiB`
     const keys = []
@@ -54,28 +61,40 @@ try {
       await db.put(key, Buffer.alloc(size, 0x5a))
     }
     const warmed = db._getManySync(keys, getOpts)
+    assert.equal(warmed.packed, false)
     assert.equal(warmed.length, keys.length)
     assert(warmed.every((row) => Buffer.isBuffer(row) && row.byteLength === size && row[0] === 0x5a))
     const warmedPacked = db._getManySync(keys, packedGetOpts)
+    assert.equal(warmedPacked.packed, true)
     assert.equal(warmedPacked.count, keys.length)
     assert.equal(warmedPacked.buffer.byteLength, keys.length * size)
     assert(warmedPacked.statuses.every((status) => status === 0))
+    const warmedAuto = db._getManySync(keys, autoGetOpts)
+    assert.equal(warmedAuto.packed, size <= 8 * 1024)
 
     group(() => {
-      bench('_getManySync ' + label, () => {
-        consume(db._getManySync(keys, getOpts))
+      bench('_getManySync packed=false ' + label, () => {
+        consumeResult(db._getManySync(keys, getOpts))
       })
 
-      bench('_getManyAsync ' + label, async () => {
-        consume(await db._getManyAsync(keys, getOpts))
+      bench('_getManyAsync packed=false ' + label, async () => {
+        consumeResult(await db._getManyAsync(keys, getOpts))
       })
 
-      bench('_getManySync packed ' + label, () => {
-        consumePacked(db._getManySync(keys, packedGetOpts))
+      bench('_getManySync packed=true ' + label, () => {
+        consumeResult(db._getManySync(keys, packedGetOpts))
       })
 
-      bench('_getManyAsync packed ' + label, async () => {
-        consumePacked(await db._getManyAsync(keys, packedGetOpts))
+      bench('_getManyAsync packed=true ' + label, async () => {
+        consumeResult(await db._getManyAsync(keys, packedGetOpts))
+      })
+
+      bench('_getManySync packed=auto ' + label, () => {
+        consumeResult(db._getManySync(keys, autoGetOpts))
+      })
+
+      bench('_getManyAsync packed=auto ' + label, async () => {
+        consumeResult(await db._getManyAsync(keys, autoGetOpts))
       })
     })
   }

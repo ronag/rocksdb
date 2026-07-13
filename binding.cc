@@ -1232,6 +1232,14 @@ struct BaseIterator : public Closable {
   const int limit_;
 };
 
+enum class PackedMode {
+  Unpacked,
+  Packed,
+  Auto,
+};
+
+static constexpr size_t kAutoPackedValueBytes = 8 * 1024;
+
 class Iterator final : public BaseIterator, public std::enable_shared_from_this<Iterator> {
   Reference databaseContext_;
   const bool keys_;
@@ -1243,6 +1251,12 @@ class Iterator final : public BaseIterator, public std::enable_shared_from_this<
   std::optional<re2::RE2> keyFilter_;
   std::optional<re2::RE2> valueFilter_;
   const bool unsafe_;
+
+  bool ShouldAutoPackCurrent() const {
+    if (values_) return CurrentValue().size() <= kAutoPackedValueBytes;
+    if (keys_) return CurrentKey().size() <= kAutoPackedValueBytes;
+    return true;
+  }
 
  public:
   Iterator(Database* database,
@@ -1399,7 +1413,11 @@ class Iterator final : public BaseIterator, public std::enable_shared_from_this<
                                       keyEncoding, valueEncoding, unsafe, readOptions);
   }
 
-  napi_value nextv(napi_env env, uint32_t count, uint32_t timeout, napi_value callback, const bool packed = false) {
+  napi_value nextv(napi_env env,
+                   uint32_t count,
+                   uint32_t timeout,
+                   napi_value callback,
+                   const PackedMode mode = PackedMode::Unpacked) {
     struct State {
       std::vector<rocksdb::PinnableSlice> keys;
       std::vector<rocksdb::PinnableSlice> values;
@@ -1409,6 +1427,8 @@ class Iterator final : public BaseIterator, public std::enable_shared_from_this<
       size_t bytes = 0;
       bool finished = false;
       bool limited = false;
+      bool packed = false;
+      bool modeDecided = false;
     };
 
     napi_value resourceName;
@@ -1420,7 +1440,7 @@ class Iterator final : public BaseIterator, public std::enable_shared_from_this<
 
     NAPI_STATUS_THROWS(runAsync<State>(
         resourceName, env, callback,
-        [self, this, count, timeout, databaseOperation, packed](auto& state) {
+        [self, this, count, timeout, databaseOperation, mode](auto& state) {
           const DatabaseOperationScope operationScope(databaseOperation);
           std::lock_guard operationLock(operationMutex_);
           if (closed.load()) {
@@ -1430,12 +1450,14 @@ class Iterator final : public BaseIterator, public std::enable_shared_from_this<
           // Query uses UINT32_MAX as its "all rows" sentinel. Reserving that
           // value would attempt a huge allocation before reading anything.
           const auto initialCapacity = std::min<size_t>(count, 4096);
-          if (packed) {
+          state.packed = mode == PackedMode::Packed;
+          state.modeDecided = mode != PackedMode::Auto;
+          if (state.packed) {
             const auto fieldsPerRow = static_cast<size_t>(keys_) + static_cast<size_t>(values_);
             state.offsets.reserve(initialCapacity * fieldsPerRow + 1);
             state.offsets.push_back(0);
             state.packedData.GetSelf()->reserve(std::min<size_t>(highWaterMarkBytes_, initialCapacity * 128));
-          } else {
+          } else if (state.modeDecided) {
             state.keys.reserve(initialCapacity);
             state.values.reserve(initialCapacity);
           }
@@ -1491,7 +1513,22 @@ class Iterator final : public BaseIterator, public std::enable_shared_from_this<
               break;
             }
 
-            if (packed) {
+            if (!state.modeDecided) {
+              state.packed = ShouldAutoPackCurrent();
+              state.modeDecided = true;
+              if (state.packed) {
+                const auto fieldsPerRow = static_cast<size_t>(keys_) + static_cast<size_t>(values_);
+                state.offsets.reserve(initialCapacity * fieldsPerRow + 1);
+                state.offsets.push_back(0);
+                state.packedData.GetSelf()->reserve(
+                    std::min<size_t>(highWaterMarkBytes_, initialCapacity * 128));
+              } else {
+                state.keys.reserve(initialCapacity);
+                state.values.reserve(initialCapacity);
+              }
+            }
+
+            if (state.packed) {
               const auto append = [&](const rocksdb::Slice& value) {
                 auto* data = state.packedData.GetSelf();
                 if (value.size() > std::numeric_limits<uint32_t>::max() - data->size()) {
@@ -1537,14 +1574,14 @@ class Iterator final : public BaseIterator, public std::enable_shared_from_this<
 
           return rocksdb::Status::OK();
         },
-        [self, this, packed](auto& state, napi_env env, napi_value* result) {
+        [self, this](auto& state, napi_env env, napi_value* result) {
           napi_value finished;
           NAPI_STATUS_RETURN(napi_get_boolean(env, state.finished, &finished));
 
           napi_value limited;
           NAPI_STATUS_RETURN(napi_get_boolean(env, state.limited, &limited));
 
-          if (packed) {
+          if (state.packed) {
             state.packedData.PinSelf();
 
             napi_value buffer;
@@ -1612,7 +1649,10 @@ class Iterator final : public BaseIterator, public std::enable_shared_from_this<
     return 0;
   }
 
-  napi_value nextv(napi_env env, uint32_t count, uint32_t timeout = 0, const bool packed = false) {
+  napi_value nextv(napi_env env,
+                   uint32_t count,
+                   const uint32_t timeout = 0,
+                   const PackedMode mode = PackedMode::Unpacked) {
     std::shared_ptr<DatabaseOperation> databaseOperation;
     NAPI_STATUS_THROWS(BeginDatabaseOperation(env, database_, reference_, databaseOperation));
     std::lock_guard operationLock(operationMutex_);
@@ -1630,13 +1670,15 @@ class Iterator final : public BaseIterator, public std::enable_shared_from_this<
     napi_value rows = nullptr;
     rocksdb::PinnableSlice packedData;
     std::vector<uint32_t> offsets;
+    bool packed = mode == PackedMode::Packed;
+    bool modeDecided = mode != PackedMode::Auto;
     if (packed) {
       const auto initialCapacity = std::min<size_t>(count, 4096);
       const auto fieldsPerRow = static_cast<size_t>(keys_) + static_cast<size_t>(values_);
       offsets.reserve(initialCapacity * fieldsPerRow + 1);
       offsets.push_back(0);
       packedData.GetSelf()->reserve(std::min<size_t>(highWaterMarkBytes_, initialCapacity * 128));
-    } else {
+    } else if (modeDecided) {
       NAPI_STATUS_THROWS(napi_create_array(env, &rows));
     }
 
@@ -1688,6 +1730,20 @@ class Iterator final : public BaseIterator, public std::enable_shared_from_this<
         NAPI_STATUS_THROWS(napi_get_boolean(env, true, &finished));
         NAPI_STATUS_THROWS(napi_get_boolean(env, true, &limited));
         break;
+      }
+
+      if (!modeDecided) {
+        packed = ShouldAutoPackCurrent();
+        modeDecided = true;
+        if (packed) {
+          const auto initialCapacity = std::min<size_t>(count, 4096);
+          const auto fieldsPerRow = static_cast<size_t>(keys_) + static_cast<size_t>(values_);
+          offsets.reserve(initialCapacity * fieldsPerRow + 1);
+          offsets.push_back(0);
+          packedData.GetSelf()->reserve(std::min<size_t>(highWaterMarkBytes_, initialCapacity * 128));
+        } else {
+          NAPI_STATUS_THROWS(napi_create_array(env, &rows));
+        }
       }
 
       if (packed) {
@@ -1761,6 +1817,9 @@ class Iterator final : public BaseIterator, public std::enable_shared_from_this<
       NAPI_STATUS_THROWS(napi_set_named_property(env, ret, "offsets", offsetsValue));
       NAPI_STATUS_THROWS(napi_set_named_property(env, ret, "count", countValue));
     } else {
+      if (rows == nullptr) {
+        NAPI_STATUS_THROWS(napi_create_array(env, &rows));
+      }
       NAPI_STATUS_THROWS(napi_set_named_property(env, ret, "rows", rows));
     }
     NAPI_STATUS_THROWS(napi_set_named_property(env, ret, "finished", finished));
@@ -2572,6 +2631,21 @@ struct PackedGetManyResult {
   std::vector<uint8_t> statuses;
 };
 
+static bool ShouldAutoPackGetMany(const std::vector<rocksdb::Status>& statuses,
+                                  const std::vector<rocksdb::PinnableSlice>& values) {
+  size_t count = 0;
+  size_t bytes = 0;
+  for (size_t n = 0; n < statuses.size(); n++) {
+    if (statuses[n].ok()) {
+      if (values[n].size() > std::numeric_limits<size_t>::max() - bytes) return false;
+      count += 1;
+      bytes += values[n].size();
+    }
+  }
+  return count > 0 && count <= std::numeric_limits<size_t>::max() / kAutoPackedValueBytes &&
+         bytes <= count * kAutoPackedValueBytes;
+}
+
 static rocksdb::Status PackGetManyResult(const std::vector<rocksdb::Status>& statuses,
                                          const std::vector<rocksdb::PinnableSlice>& values,
                                          PackedGetManyResult& result) {
@@ -2638,7 +2712,7 @@ static napi_status ConvertPackedGetManyResult(napi_env env, PackedGetManyResult&
   return napi_ok;
 }
 
-static napi_value db_get_many_sync_impl(napi_env env, napi_callback_info info, const bool packed) {
+static napi_value db_get_many_sync_impl(napi_env env, napi_callback_info info, const PackedMode mode) {
   NAPI_ARGV(3);
 
   Database* database;
@@ -2654,7 +2728,7 @@ static napi_value db_get_many_sync_impl(napi_env env, napi_callback_info info, c
   NAPI_STATUS_THROWS(GetColumnProperty(env, argv[2], database, column));
 
   Encoding valueEncoding = Encoding::Buffer;
-  if (!packed) {
+  if (mode != PackedMode::Packed) {
     NAPI_STATUS_THROWS(GetProperty(env, argv[2], "valueEncoding", valueEncoding));
   }
 
@@ -2662,7 +2736,7 @@ static napi_value db_get_many_sync_impl(napi_env env, napi_callback_info info, c
   NAPI_STATUS_THROWS(GetProperty(env, argv[2], "timeout", timeout));
 
   bool unsafe = false;
-  if (!packed) {
+  if (mode != PackedMode::Packed) {
     NAPI_STATUS_THROWS(GetProperty(env, argv[2], "unsafe", unsafe));
   }
 
@@ -2701,6 +2775,8 @@ static napi_value db_get_many_sync_impl(napi_env env, napi_callback_info info, c
 
   database->db->MultiGet(readOptions, column, count, keys.data(), values.data(), statuses.data());
 
+  const auto packed = mode == PackedMode::Packed ||
+                      (mode == PackedMode::Auto && ShouldAutoPackGetMany(statuses, values));
   if (packed) {
     PackedGetManyResult packedResult;
     ROCKS_STATUS_THROWS_NAPI(PackGetManyResult(statuses, values, packedResult));
@@ -2734,14 +2810,18 @@ static napi_value db_get_many_sync_impl(napi_env env, napi_callback_info info, c
 }
 
 NAPI_METHOD(db_get_many_sync) {
-  return db_get_many_sync_impl(env, info, false);
+  return db_get_many_sync_impl(env, info, PackedMode::Unpacked);
 }
 
 NAPI_METHOD(db_get_many_packed_sync) {
-  return db_get_many_sync_impl(env, info, true);
+  return db_get_many_sync_impl(env, info, PackedMode::Packed);
 }
 
-static napi_value db_get_many_impl(napi_env env, napi_callback_info info, const bool packed) {
+NAPI_METHOD(db_get_many_auto_sync) {
+  return db_get_many_sync_impl(env, info, PackedMode::Auto);
+}
+
+static napi_value db_get_many_impl(napi_env env, napi_callback_info info, const PackedMode mode) {
   NAPI_ARGV(4);
 
   Database* database;
@@ -2757,7 +2837,7 @@ static napi_value db_get_many_impl(napi_env env, napi_callback_info info, const 
   NAPI_STATUS_THROWS(GetColumnProperty(env, argv[2], database, column));
 
   Encoding valueEncoding = Encoding::Buffer;
-  if (!packed) {
+  if (mode != PackedMode::Packed) {
     NAPI_STATUS_THROWS(GetProperty(env, argv[2], "valueEncoding", valueEncoding));
   }
 
@@ -2765,7 +2845,7 @@ static napi_value db_get_many_impl(napi_env env, napi_callback_info info, const 
   NAPI_STATUS_THROWS(GetProperty(env, argv[2], "timeout", timeout));
 
   bool unsafe = false;
-  if (!packed) {
+  if (mode != PackedMode::Packed) {
     NAPI_STATUS_THROWS(GetProperty(env, argv[2], "unsafe", unsafe));
   }
 
@@ -2808,6 +2888,7 @@ static napi_value db_get_many_impl(napi_env env, napi_callback_info info, const 
     std::vector<rocksdb::Status> statuses;
     std::vector<rocksdb::PinnableSlice> values;
     PackedGetManyResult packedResult;
+    bool packed = false;
   };
 
   NAPI_STATUS_THROWS(runAsyncKeepAlive<State>(
@@ -2830,11 +2911,13 @@ static napi_value db_get_many_impl(napi_env env, napi_callback_info info, const 
 
         database->db->MultiGet(readOptions, column, count, keys.data(), state.values.data(), state.statuses.data());
 
-        return packed ? PackGetManyResult(state.statuses, state.values, state.packedResult)
-                      : rocksdb::Status::OK();
+        state.packed = mode == PackedMode::Packed ||
+                       (mode == PackedMode::Auto && ShouldAutoPackGetMany(state.statuses, state.values));
+        return state.packed ? PackGetManyResult(state.statuses, state.values, state.packedResult)
+                            : rocksdb::Status::OK();
       },
       [=](auto& state, napi_env env, napi_value* result) {
-        if (packed) {
+        if (state.packed) {
           return ConvertPackedGetManyResult(env, state.packedResult, result);
         }
 
@@ -2860,11 +2943,15 @@ static napi_value db_get_many_impl(napi_env env, napi_callback_info info, const 
 }
 
 NAPI_METHOD(db_get_many) {
-  return db_get_many_impl(env, info, false);
+  return db_get_many_impl(env, info, PackedMode::Unpacked);
 }
 
 NAPI_METHOD(db_get_many_packed) {
-  return db_get_many_impl(env, info, true);
+  return db_get_many_impl(env, info, PackedMode::Packed);
+}
+
+NAPI_METHOD(db_get_many_auto) {
+  return db_get_many_impl(env, info, PackedMode::Auto);
 }
 
 NAPI_METHOD(db_clear) {
@@ -3375,7 +3462,27 @@ NAPI_METHOD(iterator_nextv_packed) {
     uint32_t timeout = 0;
     NAPI_STATUS_THROWS(GetProperty(env, argv[2], "timeout", timeout));
 
-    return iterator->nextv(env, count, timeout, argv[3], true);
+    return iterator->nextv(env, count, timeout, argv[3], PackedMode::Packed);
+  } catch (const std::exception& e) {
+    napi_throw_error(env, nullptr, e.what());
+    return nullptr;
+  }
+}
+
+NAPI_METHOD(iterator_nextv_auto) {
+  NAPI_ARGV(4);
+
+  try {
+    std::shared_ptr<Iterator> iterator;
+    NAPI_STATUS_THROWS(GetResourceExternal(env, argv[0], kIteratorReferenceTag, iterator));
+
+    uint32_t count = 1024;
+    NAPI_STATUS_THROWS(GetValue(env, argv[1], count));
+
+    uint32_t timeout = 0;
+    NAPI_STATUS_THROWS(GetProperty(env, argv[2], "timeout", timeout));
+
+    return iterator->nextv(env, count, timeout, argv[3], PackedMode::Auto);
   } catch (const std::exception& e) {
     napi_throw_error(env, nullptr, e.what());
     return nullptr;
@@ -3415,7 +3522,27 @@ NAPI_METHOD(iterator_nextv_packed_sync) {
     uint32_t timeout = 0;
     NAPI_STATUS_THROWS(GetProperty(env, argv[2], "timeout", timeout));
 
-    return iterator->nextv(env, count, timeout, true);
+    return iterator->nextv(env, count, timeout, PackedMode::Packed);
+  } catch (const std::exception& e) {
+    napi_throw_error(env, nullptr, e.what());
+    return nullptr;
+  }
+}
+
+NAPI_METHOD(iterator_nextv_auto_sync) {
+  NAPI_ARGV(3);
+
+  try {
+    std::shared_ptr<Iterator> iterator;
+    NAPI_STATUS_THROWS(GetResourceExternal(env, argv[0], kIteratorReferenceTag, iterator));
+
+    uint32_t count = 1024;
+    NAPI_STATUS_THROWS(GetValue(env, argv[1], count));
+
+    uint32_t timeout = 0;
+    NAPI_STATUS_THROWS(GetProperty(env, argv[2], "timeout", timeout));
+
+    return iterator->nextv(env, count, timeout, PackedMode::Auto);
   } catch (const std::exception& e) {
     napi_throw_error(env, nullptr, e.what());
     return nullptr;
@@ -4254,8 +4381,10 @@ NAPI_INIT() {
   NAPI_EXPORT_FUNCTION(db_dispose);
   NAPI_EXPORT_FUNCTION(db_get_many);
   NAPI_EXPORT_FUNCTION(db_get_many_packed);
+  NAPI_EXPORT_FUNCTION(db_get_many_auto);
   NAPI_EXPORT_FUNCTION(db_get_many_sync);
   NAPI_EXPORT_FUNCTION(db_get_many_packed_sync);
+  NAPI_EXPORT_FUNCTION(db_get_many_auto_sync);
   NAPI_EXPORT_FUNCTION(db_clear);
   NAPI_EXPORT_FUNCTION(db_get_property);
   NAPI_EXPORT_FUNCTION(db_set_stats_level);
@@ -4278,8 +4407,10 @@ NAPI_INIT() {
   NAPI_EXPORT_FUNCTION(iterator_close_sync);
   NAPI_EXPORT_FUNCTION(iterator_nextv);
   NAPI_EXPORT_FUNCTION(iterator_nextv_packed);
+  NAPI_EXPORT_FUNCTION(iterator_nextv_auto);
   NAPI_EXPORT_FUNCTION(iterator_nextv_sync);
   NAPI_EXPORT_FUNCTION(iterator_nextv_packed_sync);
+  NAPI_EXPORT_FUNCTION(iterator_nextv_auto_sync);
 
   NAPI_EXPORT_FUNCTION(updates_init);
   NAPI_EXPORT_FUNCTION(updates_close);
