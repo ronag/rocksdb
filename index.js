@@ -26,6 +26,19 @@ const { kRef, kUnref } = require('./util')
 
 const kEmpty = Object.freeze({})
 
+function isPackedGetMany (options) {
+  const packed = options?.packed === true
+
+  if (packed) {
+    const valueEncoding = options?.valueEncoding
+    if (valueEncoding !== undefined && valueEncoding !== 'buffer') {
+      throw new TypeError('Packed getMany only supports buffer value encoding')
+    }
+  }
+
+  return packed
+}
+
 class RocksLevel extends AbstractLevel {
   constructor (locationOrHandle, { ...options } = {}) {
     // Validate and acquire native handles before AbstractLevel schedules its
@@ -251,7 +264,7 @@ class RocksLevel extends AbstractLevel {
       }
       this[kRef]()
       referenced = true
-      if (packed == null) packed = bindingOptions?.packed === true
+      if (packed == null) packed = isPackedGetMany(bindingOptions)
       const getMany = packed
         ? binding.db_get_many_packed
         : binding.db_get_many
@@ -337,7 +350,7 @@ class RocksLevel extends AbstractLevel {
 
     this[kRef]()
     try {
-      const getMany = options?.packed === true
+      const getMany = isPackedGetMany(options)
         ? binding.db_get_many_packed_sync
         : binding.db_get_many_sync
       return getMany(this[kContext], keys, options ?? kEmpty)

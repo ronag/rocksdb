@@ -79,6 +79,11 @@ expectType<Promise<Array<string | null | undefined>>>(
 )
 expectType<RocksPackedGetManyResult>(db._getManySync([slice], { packed: true }))
 expectType<Promise<RocksPackedGetManyResult>>(db._getManyAsync([slice], { packed: true }))
+expectType<RocksPackedGetManyResult>(
+  db._getManySync([slice], { packed: true, valueEncoding: 'buffer' })
+)
+// @ts-expect-error Packed getMany always returns raw buffer bytes
+db._getManySync([slice], { packed: true, valueEncoding: 'utf8' })
 
 const boundedValues = db.getMany(['key'], { highWaterMarkBytes: 0 })
 expectTrue<Equal<

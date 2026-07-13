@@ -54,6 +54,31 @@ test('packed option does not change public get or getMany result shapes', async 
   t.end()
 })
 
+test('packed raw getMany rejects decoded value encodings', async function (t) {
+  const db = testCommon.factory({ keyEncoding: 'buffer', valueEncoding: 'buffer' })
+  await db.open()
+
+  let syncError
+  try {
+    db._getManySync([Buffer.from('a')], { packed: true, valueEncoding: 'utf8' })
+  } catch (err) {
+    syncError = err
+  }
+
+  const asyncError = await db._getManyAsync(
+    [Buffer.from('a')],
+    { packed: true, valueEncoding: 'utf8' }
+  ).then(() => null, (err) => err)
+
+  t.ok(syncError instanceof TypeError, 'sync rejects the incompatible encoding')
+  t.equal(syncError.message, 'Packed getMany only supports buffer value encoding')
+  t.ok(asyncError instanceof TypeError, 'async rejects the incompatible encoding')
+  t.equal(asyncError.message, 'Packed getMany only supports buffer value encoding')
+
+  await db.close()
+  t.end()
+})
+
 test('packed getMany reports bounded partial reads', async function (t) {
   const db = testCommon.factory({ keyEncoding: 'buffer', valueEncoding: 'buffer' })
   await db.open()
