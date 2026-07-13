@@ -85,6 +85,28 @@ test('packed raw getMany rejects decoded value encodings', async function (t) {
   t.end()
 })
 
+test('raw getMany rejects invalid packed modes', async function (t) {
+  const db = testCommon.factory({ keyEncoding: 'buffer', valueEncoding: 'buffer' })
+  await db.open()
+  const expected = 'packed must be true, false or "auto"'
+
+  t.throws(
+    () => db._getManySync([], { packed: 'sometimes' }),
+    (err) => err instanceof TypeError && err.message === expected,
+    'sync rejects an invalid mode with the accepted literals'
+  )
+
+  const err = await db._getManyAsync([], { packed: 'sometimes' }).then(
+    () => null,
+    (err) => err
+  )
+  t.ok(err instanceof TypeError && err.message === expected,
+    'async rejects an invalid mode with the accepted literals')
+
+  await db.close()
+  t.end()
+})
+
 test('auto getMany packs values up to the 8 KiB average threshold', async function (t) {
   const db = testCommon.factory({ keyEncoding: 'buffer', valueEncoding: 'buffer' })
   await db.open()
