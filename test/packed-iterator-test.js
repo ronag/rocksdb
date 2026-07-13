@@ -144,6 +144,19 @@ test('async nextv callback reports the selected packed mode', async function (t)
   t.end()
 })
 
+test('packed option does not change public iterator nextv results', async function (t) {
+  for (const packed of [true, 'auto']) {
+    const iterator = db.iterator({ keyEncoding: 'buffer', valueEncoding: 'buffer' })
+    const entries = await iterator.nextv(1, { packed })
+
+    t.same(entries, [[Buffer.from('a'), Buffer.from('one')]],
+      `public nextv returns decoded entries for ${packed}`)
+    await iterator.close()
+  }
+
+  t.end()
+})
+
 test('packed nextv rejects prefetched rows instead of changing their encoding', async function (t) {
   const iterator = db.iterator({ keyEncoding: 'buffer', valueEncoding: 'buffer' })
   await iterator.next()

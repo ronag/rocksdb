@@ -277,7 +277,7 @@ class Iterator extends AbstractIterator {
       return callback[kPromise]
     }
 
-    this._nextvAsync(size, options, done)
+    this._nextvAsync(size, options, done, false)
 
     return callback[kPromise]
   }
@@ -435,7 +435,7 @@ class Iterator extends AbstractIterator {
     }
   }
 
-  _nextvAsync (size, options, callback) {
+  _nextvAsync (size, options, callback, packed) {
     assert(this[kContext])
     assert(!this[kBusy])
 
@@ -446,7 +446,7 @@ class Iterator extends AbstractIterator {
       this[kDB][kRef]()
       referenced = true
       this[kBusy] = true
-      const packed = getPackedMode(options)
+      if (packed == null) packed = getPackedMode(options)
 
       if (this[kPosition] < this[kCache].length) {
         if (packed === true) throw packedCacheError()
