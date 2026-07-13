@@ -218,12 +218,12 @@ class RocksLevel extends AbstractLevel {
 
       maskPartialResults(values)
       callback(null, values)
-    }, allowPartial)
+    }, allowPartial, false)
 
     return callback[kPromise]
   }
 
-  _getManyAsync (keys, options, callback, allowPartial) {
+  _getManyAsync (keys, options, callback, allowPartial, packed) {
     if (keys.some(key => typeof key === 'string')) {
       keys = keys.map(key => typeof key === 'string' ? Buffer.from(key) : key)
     }
@@ -231,7 +231,6 @@ class RocksLevel extends AbstractLevel {
     callback = fromCallback(callback, kPromise)
     let referenced = false
     let bindingOptions = options
-    let packed = false
 
     try {
       if (allowPartial == null) {
@@ -252,7 +251,7 @@ class RocksLevel extends AbstractLevel {
       }
       this[kRef]()
       referenced = true
-      packed = bindingOptions?.packed === true
+      if (packed == null) packed = bindingOptions?.packed === true
       const getMany = packed
         ? binding.db_get_many_packed
         : binding.db_get_many

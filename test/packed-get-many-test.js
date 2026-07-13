@@ -39,6 +39,21 @@ test('packed getMany sync and async preserve values, empty values and misses', a
   t.end()
 })
 
+test('packed option does not change public get or getMany result shapes', async function (t) {
+  const db = testCommon.factory({ keyEncoding: 'buffer', valueEncoding: 'buffer' })
+  await db.open()
+  await db.put(Buffer.from('a'), Buffer.from('one'))
+
+  const value = await db.get(Buffer.from('a'), { packed: true })
+  const values = await db.getMany([Buffer.from('a')], { packed: true })
+
+  t.same(value, Buffer.from('one'), 'public get returns one decoded value')
+  t.same(values, [Buffer.from('one')], 'public getMany returns a decoded value array')
+
+  await db.close()
+  t.end()
+})
+
 test('packed getMany reports bounded partial reads', async function (t) {
   const db = testCommon.factory({ keyEncoding: 'buffer', valueEncoding: 'buffer' })
   await db.open()
