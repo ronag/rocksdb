@@ -32,12 +32,17 @@ try {
     valueEncoding: 'buffer',
     fillCache: true
   }
+  const packedGetOpts = { ...getOpts, packed: true }
 
   let checksum = 0
   function consume (rows) {
     let bytes = 0
     for (const row of rows) bytes += row.byteLength + row[0]
     checksum += bytes
+  }
+
+  function consumePacked (result) {
+    checksum += result.buffer.byteLength + result.statuses[0]
   }
 
   for (const size of [64, 1024, 4096, 16 * 1024]) {
@@ -51,6 +56,10 @@ try {
     const warmed = db._getManySync(keys, getOpts)
     assert.equal(warmed.length, keys.length)
     assert(warmed.every((row) => Buffer.isBuffer(row) && row.byteLength === size && row[0] === 0x5a))
+    const warmedPacked = db._getManySync(keys, packedGetOpts)
+    assert.equal(warmedPacked.count, keys.length)
+    assert.equal(warmedPacked.buffer.byteLength, keys.length * size)
+    assert(warmedPacked.statuses.every((status) => status === 0))
 
     group(() => {
       bench('_getManySync ' + label, () => {
@@ -59,6 +68,14 @@ try {
 
       bench('_getMany ' + label, async () => {
         consume(await db._getMany(keys, getOpts))
+      })
+
+      bench('_getManySync packed ' + label, () => {
+        consumePacked(db._getManySync(keys, packedGetOpts))
+      })
+
+      bench('_getManyAsync packed ' + label, async () => {
+        consumePacked(await db._getManyAsync(keys, packedGetOpts))
       })
     })
   }

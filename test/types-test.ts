@@ -10,6 +10,7 @@ import {
   RocksFormat,
   RocksGetManyOptions,
   RocksLevel,
+  RocksPackedGetManyResult,
   RocksPackedIteratorResult,
   RocksStatistics,
   RocksUpdate,
@@ -76,6 +77,8 @@ expectType<Array<string | null | undefined>>(
 expectType<Promise<Array<string | null | undefined>>>(
   db._getManyAsync([slice], { valueEncoding: 'utf8' }, undefined, true)
 )
+expectType<RocksPackedGetManyResult>(db._getManySync([slice], { packed: true }))
+expectType<Promise<RocksPackedGetManyResult>>(db._getManyAsync([slice], { packed: true }))
 
 const boundedValues = db.getMany(['key'], { highWaterMarkBytes: 0 })
 expectTrue<Equal<
@@ -126,7 +129,8 @@ expectType<Promise<void>>(iterator._seekAsync(slice))
 expectType<Promise<{ readonly rows: Array<Buffer>; readonly finished: boolean; readonly limited?: boolean }>>(
   iterator._nextvAsync(10)
 )
-expectType<Promise<RocksPackedIteratorResult>>(iterator._nextvPackedAsync(10))
+expectType<RocksPackedIteratorResult>(iterator._nextvSync(10, { packed: true }))
+expectType<Promise<RocksPackedIteratorResult>>(iterator._nextvAsync(10, { packed: true }))
 expectType<Promise<void>>(iterator[Symbol.asyncDispose]())
 
 const publicValuesOnlyIterator = db.iterator({ keys: false, values: true })

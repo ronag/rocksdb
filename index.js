@@ -231,6 +231,7 @@ class RocksLevel extends AbstractLevel {
     callback = fromCallback(callback, kPromise)
     let referenced = false
     let bindingOptions = options
+    let packed = false
 
     try {
       if (allowPartial == null) {
@@ -251,7 +252,11 @@ class RocksLevel extends AbstractLevel {
       }
       this[kRef]()
       referenced = true
-      binding.db_get_many(this[kContext], keys, bindingOptions ?? kEmpty, (err, val) => {
+      packed = bindingOptions?.packed === true
+      const getMany = packed
+        ? binding.db_get_many_packed
+        : binding.db_get_many
+      getMany(this[kContext], keys, bindingOptions ?? kEmpty, (err, val) => {
         this[kUnref]()
         if (err) {
           callback(err)
@@ -259,8 +264,14 @@ class RocksLevel extends AbstractLevel {
         }
 
         const indexes = []
-        for (let i = 0; i < val.length; i++) {
-          if (val[i] === null) indexes.push(i)
+        if (packed) {
+          for (let i = 0; i < val.statuses.length; i++) {
+            if (val.statuses[i] === 2) indexes.push(i)
+          }
+        } else {
+          for (let i = 0; i < val.length; i++) {
+            if (val[i] === null) indexes.push(i)
+          }
         }
 
         if (indexes.length === 0) {
@@ -272,6 +283,8 @@ class RocksLevel extends AbstractLevel {
           callback(new ModuleError(message, {
             code: 'LEVEL_ABORTED'
           }))
+        } else if (packed) {
+          callback(null, val)
         } else {
           partialResults.set(val, indexes)
           callback(null, val)
@@ -323,7 +336,15 @@ class RocksLevel extends AbstractLevel {
       keys = keys.map(key => typeof key === 'string' ? Buffer.from(key) : key)
     }
 
-    return binding.db_get_many_sync(this[kContext], keys, options ?? kEmpty)
+    this[kRef]()
+    try {
+      const getMany = options?.packed === true
+        ? binding.db_get_many_packed_sync
+        : binding.db_get_many_sync
+      return getMany(this[kContext], keys, options ?? kEmpty)
+    } finally {
+      this[kUnref]()
+    }
   }
 
   _del (key, options, callback) {

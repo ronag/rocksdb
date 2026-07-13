@@ -27,7 +27,7 @@ test('setUp packed iterator database', async function (t) {
 
 test('packed nextv returns one byte arena and cumulative field offsets', async function (t) {
   const iterator = db._iterator({ keyEncoding: 'buffer', valueEncoding: 'buffer' })
-  const first = await iterator._nextvPackedAsync(2)
+  const first = await iterator._nextvAsync(2, { packed: true })
 
   t.equal(first.count, 2, 'reports logical row count')
   t.same(first.offsets, new Uint32Array([0, 1, 4, 5, 8]),
@@ -37,7 +37,7 @@ test('packed nextv returns one byte arena and cumulative field offsets', async f
   t.equal(first.finished, false, 'count cap leaves the iterator open')
   t.equal(first.limited, true, 'count cap is reported as limited')
 
-  const second = await iterator._nextvPackedAsync(2)
+  const second = await iterator._nextvAsync(2, { packed: true })
   t.equal(second.count, 1, 'reads the remaining row')
   t.equal(second.finished, true, 'reports natural exhaustion')
   t.equal(second.limited, false, 'natural exhaustion is not a limit')
@@ -49,9 +49,25 @@ test('packed nextv returns one byte arena and cumulative field offsets', async f
   t.end()
 })
 
+test('packed nextv supports synchronous reads', async function (t) {
+  const iterator = db._iterator({ keyEncoding: 'buffer', valueEncoding: 'buffer' })
+  const result = iterator._nextvSync(2, { packed: true })
+
+  t.equal(result.count, 2, 'reports logical row count')
+  t.same(result.offsets, new Uint32Array([0, 1, 4, 5, 8]),
+    'sync offsets delimit alternating key/value fields')
+  t.same(fields(result), [Buffer.from('a'), Buffer.from('one'), Buffer.from('b'), Buffer.from('two')],
+    'sync arena reconstructs the original rows')
+  t.equal(result.finished, false, 'count cap leaves the iterator open')
+  t.equal(result.limited, true, 'count cap is reported as limited')
+
+  await iterator.close()
+  t.end()
+})
+
 test('packed nextv supports values-only and no-field iterators', async function (t) {
   const values = db._iterator({ keys: false, values: true, valueEncoding: 'buffer' })
-  const valuesResult = await values._nextvPackedAsync(10)
+  const valuesResult = await values._nextvAsync(10, { packed: true })
   t.equal(valuesResult.count, 3, 'values-only iterator reports every row')
   t.equal(valuesResult.offsets.length, 4, 'one boundary is emitted per value plus the origin')
   t.same(fields(valuesResult).slice(0, 2), [Buffer.from('one'), Buffer.from('two')],
@@ -59,7 +75,7 @@ test('packed nextv supports values-only and no-field iterators', async function 
   await values.close()
 
   const none = db._iterator({ keys: false, values: false })
-  const noneResult = await none._nextvPackedAsync(10)
+  const noneResult = await none._nextvAsync(10, { packed: true })
   t.equal(noneResult.count, 3, 'no-field iterator retains logical row count')
   t.same(noneResult.offsets, new Uint32Array([0]), 'no-field iterator emits no byte fields')
   t.equal(noneResult.buffer.byteLength, 0, 'no-field iterator arena is empty')
@@ -73,7 +89,7 @@ test('packed nextv rejects prefetched rows instead of changing their encoding', 
   await iterator.next()
   t.ok(iterator.cached > 0, 'precondition: public next prefetched rows')
 
-  const err = await iterator._nextvPackedAsync(10).then(
+  const err = await iterator._nextvAsync(10, { packed: true }).then(
     () => null,
     (err) => err
   )
@@ -87,7 +103,7 @@ test('packed nextv flushes a close requested by a throwing option accessor', asy
   const iterator = db._iterator({ keyEncoding: 'buffer', valueEncoding: 'buffer' })
   const expected = new Error('timeout getter failed')
   let closePromise
-  const options = {}
+  const options = { packed: true }
   Object.defineProperty(options, 'timeout', {
     get () {
       closePromise = iterator.close()
@@ -95,7 +111,7 @@ test('packed nextv flushes a close requested by a throwing option accessor', asy
     }
   })
 
-  const err = await iterator._nextvPackedAsync(10, options).then(
+  const err = await iterator._nextvAsync(10, options).then(
     () => null,
     (err) => err
   )
