@@ -54,6 +54,18 @@ test('async getMany always snapshots Buffer and SliceLike keys before queueing',
       assert.equal((await pending)[0].toString(), 'value-a')
       await blocker
 
+      blocker = occupyWorker()
+      const packedKey = Buffer.from('a')
+      pending = db._getManyAsync([packedKey], { packed: true })
+      packedKey[0] = 0x62
+      const packed = await pending
+      assert.equal(packed.statuses[0], 0)
+      assert.equal(
+        packed.buffer.subarray(packed.offsets[0], packed.offsets[1]).toString(),
+        'value-a'
+      )
+      await blocker
+
       await db.close()
     })().catch((err) => {
       console.error(err)

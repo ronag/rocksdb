@@ -22,9 +22,22 @@ const noFieldsIterators = new WeakSet()
 const noFieldsNextOptions = Object.freeze({ [kNoFieldsNext]: true })
 const deferredPartialResults = new WeakSet()
 
-const { kRef, kUnref } = require('./util')
+const { getPackedMode, kRef, kUnref, setPackedResult } = require('./util')
 
 const kEmpty = Object.freeze({})
+
+function isPackedGetMany (options) {
+  const packed = getPackedMode(options)
+
+  if (packed !== false) {
+    const valueEncoding = options?.valueEncoding
+    if (valueEncoding !== undefined && valueEncoding !== 'buffer') {
+      throw new TypeError('Packed getMany only supports buffer value encoding')
+    }
+  }
+
+  return packed
+}
 
 class RocksLevel extends AbstractLevel {
   constructor (locationOrHandle, { ...options } = {}) {
@@ -218,12 +231,12 @@ class RocksLevel extends AbstractLevel {
 
       maskPartialResults(values)
       callback(null, values)
-    }, allowPartial)
+    }, allowPartial, false, false)
 
     return callback[kPromise]
   }
 
-  _getManyAsync (keys, options, callback, allowPartial) {
+  _getManyAsync (keys, options, callback, allowPartial, packed, exposePacked = true) {
     if (keys.some(key => typeof key === 'string')) {
       keys = keys.map(key => typeof key === 'string' ? Buffer.from(key) : key)
     }
@@ -251,7 +264,13 @@ class RocksLevel extends AbstractLevel {
       }
       this[kRef]()
       referenced = true
-      binding.db_get_many(this[kContext], keys, bindingOptions ?? kEmpty, (err, val) => {
+      if (packed == null) packed = isPackedGetMany(bindingOptions)
+      const getMany = packed === true
+        ? binding.db_get_many_packed
+        : packed === 'auto'
+          ? binding.db_get_many_auto
+          : binding.db_get_many
+      getMany(this[kContext], keys, bindingOptions ?? kEmpty, (err, val) => {
         this[kUnref]()
         if (err) {
           callback(err)
@@ -259,12 +278,20 @@ class RocksLevel extends AbstractLevel {
         }
 
         const indexes = []
-        for (let i = 0; i < val.length; i++) {
-          if (val[i] === null) indexes.push(i)
+        const packedResult = !Array.isArray(val)
+        if (packedResult) {
+          for (let i = 0; i < val.statuses.length; i++) {
+            if (val.statuses[i] === 2) indexes.push(i)
+          }
+        } else {
+          for (let i = 0; i < val.length; i++) {
+            if (val[i] === null) indexes.push(i)
+          }
         }
 
         if (indexes.length === 0) {
-          callback(null, val)
+          if (exposePacked) setPackedResult(val, packedResult)
+          callback(null, val, packedResult)
         } else if (!allowPartial) {
           const message = keys.length === 1
             ? 'Multi-get stopped before the value was read'
@@ -272,9 +299,13 @@ class RocksLevel extends AbstractLevel {
           callback(new ModuleError(message, {
             code: 'LEVEL_ABORTED'
           }))
+        } else if (packedResult) {
+          if (exposePacked) setPackedResult(val, true)
+          callback(null, val, true)
         } else {
           partialResults.set(val, indexes)
-          callback(null, val)
+          if (exposePacked) setPackedResult(val, false)
+          callback(null, val, false)
         }
       })
     } catch (err) {
@@ -323,7 +354,19 @@ class RocksLevel extends AbstractLevel {
       keys = keys.map(key => typeof key === 'string' ? Buffer.from(key) : key)
     }
 
-    return binding.db_get_many_sync(this[kContext], keys, options ?? kEmpty)
+    this[kRef]()
+    try {
+      const packed = isPackedGetMany(options)
+      const getMany = packed === true
+        ? binding.db_get_many_packed_sync
+        : packed === 'auto'
+          ? binding.db_get_many_auto_sync
+          : binding.db_get_many_sync
+      const result = getMany(this[kContext], keys, options ?? kEmpty)
+      return setPackedResult(result, !Array.isArray(result))
+    } finally {
+      this[kUnref]()
+    }
   }
 
   _del (key, options, callback) {

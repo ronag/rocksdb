@@ -86,7 +86,7 @@ test('packed iterator arena survives iterator close and forced GC', async functi
   await db.put(Buffer.from('packed'), expected)
 
   const iterator = db._iterator({ keyEncoding: 'buffer', valueEncoding: 'buffer' })
-  const result = await iterator._nextvPackedAsync(10)
+  const result = await iterator._nextvAsync(10, { packed: true })
   await iterator.close()
   await db.close()
 
@@ -99,6 +99,26 @@ test('packed iterator arena survives iterator close and forced GC', async functi
   t.equal(result.count, 1, 'retained one packed row')
   t.ok(result.buffer.subarray(valueStart, valueEnd).equals(expected),
     'external packed arena remains valid after close and GC')
+  t.end()
+})
+
+test('packed getMany arena survives database close and forced GC', async function (t) {
+  const db = testCommon.factory({ keyEncoding: 'buffer', valueEncoding: 'buffer' })
+  await db.open()
+
+  const expected = Buffer.alloc(128 * 1024, 0x6b)
+  await db.put(Buffer.from('packed-get-many'), expected)
+
+  const result = await db._getManyAsync([Buffer.from('packed-get-many')], { packed: true })
+  await db.close()
+
+  if (global.gc) {
+    for (let index = 0; index < 4; index++) global.gc()
+  }
+
+  t.same(result.statuses, new Uint8Array([0]), 'retained one packed value')
+  t.ok(result.buffer.subarray(result.offsets[0], result.offsets[1]).equals(expected),
+    'external packed getMany arena remains valid after close and GC')
   t.end()
 })
 
