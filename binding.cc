@@ -3171,6 +3171,74 @@ NAPI_METHOD(db_get_property) {
   return result;
 }
 
+// Batch form of db_get_property: read several rocksdb properties from ONE
+// column family in a single native call, returning an object keyed by property
+// name. Callers that sample many properties per tick (e.g. per-column-family
+// stats snapshots) otherwise pay one JS<->native transition per property; the
+// column handle is also resolved once here instead of per call.
+NAPI_METHOD(db_get_properties) {
+  NAPI_ARGV(3);
+
+  Database* database;
+  std::shared_ptr<DatabaseReference> reference;
+  NAPI_STATUS_THROWS(GetDatabase(env, argv[0], database, &reference));
+  std::shared_ptr<DatabaseOperation> databaseOperation;
+  NAPI_STATUS_THROWS(BeginDatabaseOperation(env, database, reference, databaseOperation));
+
+  if (!database->db) {
+    napi_throw_error(env, "LEVEL_DATABASE_NOT_OPEN", "Database is not open");
+    return NULL;
+  }
+
+  bool isArray = false;
+  NAPI_STATUS_THROWS(napi_is_array(env, argv[1], &isArray));
+  if (!isArray) {
+    napi_throw_type_error(env, NULL, "The first argument 'properties' must be an array");
+    return NULL;
+  }
+
+  uint32_t length = 0;
+  NAPI_STATUS_THROWS(napi_get_array_length(env, argv[1], &length));
+
+  // Resolve the column once for the whole batch.
+  rocksdb::ColumnFamilyHandle* column = database->db->DefaultColumnFamily();
+  NAPI_STATUS_THROWS(GetColumnProperty(env, argv[2], database, column));
+
+  napi_value result;
+  NAPI_STATUS_THROWS(napi_create_object(env, &result));
+
+  std::string value;
+  for (uint32_t n = 0; n < length; ++n) {
+    napi_value name;
+    NAPI_STATUS_THROWS(napi_get_element(env, argv[1], n, &name));
+
+    napi_valuetype type;
+    NAPI_STATUS_THROWS(napi_typeof(env, name, &type));
+    if (type != napi_string) {
+      napi_throw_type_error(env, NULL, "The 'properties' array must contain only strings");
+      return NULL;
+    }
+
+    rocksdb::PinnableSlice property;
+    NAPI_STATUS_THROWS(GetValue(env, name, property));
+
+    // Match db_get_property: a missing property yields an empty string rather
+    // than throwing, so callers can Number()-coerce uniformly.
+    value.clear();
+    database->db->GetProperty(column, property, &value);
+
+    napi_value element;
+    NAPI_STATUS_THROWS(napi_create_string_utf8(env, value.data(), value.size(), &element));
+    // Define an own data property so a property named "__proto__" does not
+    // invoke Object.prototype's setter and disappear from the result.
+    napi_property_descriptor descriptor = {
+        nullptr, name, nullptr, nullptr, nullptr, element, napi_default_jsproperty, nullptr};
+    NAPI_STATUS_THROWS(napi_define_properties(env, result, 1, &descriptor));
+  }
+
+  return result;
+}
+
 static napi_status CreateStatisticsSnapshot(napi_env env,
                                             const std::shared_ptr<rocksdb::Statistics>& statistics,
                                             napi_value* result) {
@@ -4406,6 +4474,7 @@ NAPI_INIT() {
   NAPI_EXPORT_FUNCTION(db_get_many_auto_sync);
   NAPI_EXPORT_FUNCTION(db_clear);
   NAPI_EXPORT_FUNCTION(db_get_property);
+  NAPI_EXPORT_FUNCTION(db_get_properties);
   NAPI_EXPORT_FUNCTION(db_set_stats_level);
   NAPI_EXPORT_FUNCTION(db_get_statistics);
   NAPI_EXPORT_FUNCTION(db_get_latest_sequence);

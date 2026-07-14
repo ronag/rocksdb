@@ -813,6 +813,7 @@ export class RocksLevel<KDefault = string, VDefault = string>
   _chainedBatch (): RocksChainedBatch<this, KDefault, VDefault>
 
   getProperty (property: string, options?: RocksColumnOperationOptions): string
+  getProperties (properties: string[], options?: RocksColumnOperationOptions): Record<string, string>
   setStatisticsEnabled (enabled: boolean): boolean
   getStatistics (): RocksStatisticsSnapshot | null
 
