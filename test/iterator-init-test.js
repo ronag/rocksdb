@@ -28,30 +28,35 @@ function snapshotCount (db) {
 }
 
 function holdIteratorInitialization () {
-  const originalInit = binding.iterator_init
-  let heldArguments
+  const originals = {
+    iterator_init: binding.iterator_init,
+    iterator_init_nextv: binding.iterator_init_nextv
+  }
+  let held
   let resumed = false
 
-  binding.iterator_init = function (...args) {
-    heldArguments = args
+  for (const name of Object.keys(originals)) {
+    binding[name] = function (...args) {
+      held = { name, args }
+    }
   }
 
   return {
     get captured () {
-      return heldArguments != null
+      return held != null
     },
     restore () {
-      binding.iterator_init = originalInit
+      for (const [name, original] of Object.entries(originals)) binding[name] = original
     },
     resume () {
-      if (resumed || !heldArguments) return
+      if (resumed || !held) return
 
       resumed = true
-      const args = heldArguments
-      heldArguments = null
-      binding.iterator_init = originalInit
+      const { name, args } = held
+      held = null
+      this.restore()
       try {
-        originalInit(...args)
+        originals[name](...args)
       } catch (err) {
         process.nextTick(args.at(-1), err)
         return err
@@ -111,16 +116,23 @@ test('iterator initialization is lazy and asynchronous', async function (t) {
   ])
 
   const originalInit = binding.iterator_init
+  const originalInitNextv = binding.iterator_init_nextv
   let initCalls = 0
   binding.iterator_init = function (...args) {
     initCalls++
     return originalInit(...args)
   }
+  binding.iterator_init_nextv = function (...args) {
+    initCalls++
+    return originalInitNextv(...args)
+  }
 
   const resourceTypes = []
   const hook = createHook({
     init (asyncId, type) {
-      if (type === 'leveldown.iterator_init') resourceTypes.push(type)
+      if (type === 'leveldown.iterator_init' || type === 'iterator.nextv') {
+        resourceTypes.push(type)
+      }
     }
   })
 
@@ -141,7 +153,8 @@ test('iterator initialization is lazy and asynchronous', async function (t) {
     t.same(await first, ['a', '1'], 'the first read waits for initialization')
     hook.disable()
 
-    t.same(resourceTypes, ['leveldown.iterator_init'], 'initialization runs as async work')
+    t.same(resourceTypes, ['iterator.nextv'],
+      'initialization and the first refill run as one async work item')
     t.equal(snapshotCount(db), 1, 'initialized iterator keeps its snapshot pointer valid')
     t.same(await iterator.next(), ['b', '2'], 'the initialized iterator remains usable')
     t.equal(initCalls, 1, 'later reads reuse the native iterator')
@@ -159,6 +172,7 @@ test('iterator initialization is lazy and asynchronous', async function (t) {
   } finally {
     hook.disable()
     binding.iterator_init = originalInit
+    binding.iterator_init_nextv = originalInitNextv
     await db.close()
   }
 
@@ -221,12 +235,17 @@ test('failed initialization releases native resources and preserves its error', 
   await db.put('a', '1')
 
   const originalInit = binding.iterator_init
+  const originalInitNextv = binding.iterator_init_nextv
   const originalCloseSync = binding.iterator_close_sync
   let initCalls = 0
   let synchronousCloseCalls = 0
   binding.iterator_init = function (...args) {
     initCalls++
     return originalInit(...args)
+  }
+  binding.iterator_init_nextv = function (...args) {
+    initCalls++
+    return originalInitNextv(...args)
   }
   binding.iterator_close_sync = function (...args) {
     synchronousCloseCalls++
@@ -266,6 +285,7 @@ test('failed initialization releases native resources and preserves its error', 
     t.equal(synchronousCloseCalls, 0, 'async failures clean up in their worker')
   } finally {
     binding.iterator_init = originalInit
+    binding.iterator_init_nextv = originalInitNextv
     binding.iterator_close_sync = originalCloseSync
     await invalidKey.close()
     await invalidValue.close()
@@ -580,8 +600,12 @@ test('initialization and cleanup errors are both observable', async function (t)
   const initializationError = new Error('synthetic initialization failure')
   const cleanupError = new Error('synthetic cleanup failure')
   const originalInit = binding.iterator_init
+  const originalInitNextv = binding.iterator_init_nextv
   const originalCloseSync = binding.iterator_close_sync
   binding.iterator_init = function () {
+    throw initializationError
+  }
+  binding.iterator_init_nextv = function () {
     throw initializationError
   }
   binding.iterator_close_sync = function () {
@@ -596,6 +620,7 @@ test('initialization and cleanup errors are both observable', async function (t)
     t.equal(err.cause, initializationError, 'initialization error remains the primary cause')
   } finally {
     binding.iterator_init = originalInit
+    binding.iterator_init_nextv = originalInitNextv
     binding.iterator_close_sync = originalCloseSync
     await iterator.close()
     t.equal(snapshotCount(db), 0, 'a later close can retry cleanup successfully')

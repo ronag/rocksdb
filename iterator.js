@@ -25,7 +25,6 @@ const kBusy = Symbol('busy')
 const kPendingClose = Symbol('pendingClose')
 const kCloseRequested = Symbol('closeRequested')
 const kPublicSeek = Symbol('publicSeek')
-const kHasFilter = Symbol('hasFilter')
 const kNoFieldsNext = Symbol('noFieldsNext')
 const kKeys = Symbol('keys')
 const kValues = Symbol('values')
@@ -207,7 +206,6 @@ class Iterator extends AbstractIterator {
       this[kValues] = options.values !== false
       this[kKeyEncoding] = options.keyEncoding ?? 'buffer'
       this[kValueEncoding] = options.valueEncoding ?? 'buffer'
-      const hasFilter = options.keyFilter != null || options.valueFilter != null
 
       const bindingOptions = prepareNativeIteratorOptions(
         options,
@@ -232,7 +230,6 @@ class Iterator extends AbstractIterator {
       this[kPendingClose] = null
       this[kCloseRequested] = false
       this[kPublicSeek] = false
-      this[kHasFilter] = hasFilter
     } catch (err) {
       // AbstractIterator attaches itself to the database in super(). A failed
       // native/options construction must undo that ownership immediately or
@@ -432,7 +429,7 @@ class Iterator extends AbstractIterator {
       return this
     }
 
-    if (this[kInitState] !== kReady) {
+    if (this[kInitState] !== kReady && this[kInitState] !== kUninitialized) {
       this._initialize((err) => {
         if (err) callback(err)
         else this._next(callback)
@@ -451,52 +448,104 @@ class Iterator extends AbstractIterator {
     } else {
       const size = this[kFirst] ? 1 : 1000
       this[kFirst] = false
-
-      if (this[kHasFilter]) {
-        try {
-          this[kDB][kRef]()
-          this[kBusy] = true
-          binding.iterator_nextv(this[kContext], size, null, (err, result) => {
-            this[kBusy] = false
-            this[kDB][kUnref]()
-
-            try {
-              if (err) {
-                callback(err)
-              } else {
-                result = convertIteratorResult(this, result)
-                this[kCache] = result.rows
-                this[kFinished] = result.finished
-                this[kPosition] = 0
-                this._next(callback)
-              }
-            } finally {
-              this._flushPendingClose()
-            }
-          })
-        } catch (err) {
-          this[kDB][kUnref]()
-          this._deferNextResult(callback, err)
-        }
-      } else {
-        try {
-          const result = convertIteratorResult(
-            this,
-            binding.iterator_nextv_sync(this[kContext], size, null)
-          )
-          const { rows, finished } = result
-          this[kCache] = rows
-          this[kFinished] = finished
-          this[kPosition] = 0
-
-          setImmediate(() => this._next(callback))
-        } catch (err) {
-          process.nextTick(callback, err)
-        }
-      }
+      this._refill(size, callback, this[kInitState] === kUninitialized)
     }
 
     return this
+  }
+
+  _refill (size, callback, initialize) {
+    let referenced = false
+    let initializationScheduled = false
+    if (initialize) this[kInitState] = kInitializing
+
+    const complete = (err, result) => {
+      if (initialize) {
+        let initialized = !err
+        if (err) {
+          try {
+            // A combined worker may fail after initialization (for example,
+            // while reading or converting the first batch). Such errors stay
+            // recoverable by seek and must not become sticky init failures.
+            // This native probe only reads protected in-memory state; all
+            // RocksDB work has already completed on the worker.
+            initialized = binding.iterator_is_initialized(this[kContext])
+          } catch (stateError) {
+            err = new AggregateError(
+              [err, stateError],
+              'Iterator read failed and its initialization state could not be determined',
+              { cause: err }
+            )
+          }
+        }
+
+        if (!initialized) {
+          this[kInitState] = kFailed
+          this[kInitError] = err
+        } else {
+          this[kInitState] = kReady
+        }
+        this[kInitialTarget] = null
+      }
+
+      // Keep the database lease until the combined operation's native state
+      // has been classified. This also prevents a deferred database close
+      // from racing the in-memory initialized-state probe above.
+      if (referenced) {
+        referenced = false
+        this[kDB][kUnref]()
+      }
+
+      this[kBusy] = false
+      try {
+        if (err) {
+          callback(err)
+        } else {
+          result = convertIteratorResult(this, result)
+          this[kCache] = result.rows
+          this[kFinished] = result.finished
+          this[kPosition] = 0
+          this._next(callback)
+        }
+      } finally {
+        this._flushPendingClose()
+      }
+    }
+
+    try {
+      this[kDB][kRef]()
+      referenced = true
+      this[kBusy] = true
+
+      if (initialize) {
+        binding.iterator_init_nextv(
+          this[kContext],
+          this[kInitialTarget],
+          size,
+          null,
+          complete
+        )
+        initializationScheduled = true
+      } else {
+        binding.iterator_nextv(this[kContext], size, null, complete)
+      }
+    } catch (err) {
+      let error = err
+      if (initialize) {
+        // A scheduling failure never reached the worker-side initializer, so
+        // release the construction snapshot here as the existing init path does.
+        if (!initializationScheduled) error = this._cleanupFailedInitialization(error)
+        this[kInitState] = kFailed
+        this[kInitError] = error
+        this[kInitialTarget] = null
+      }
+
+      if (referenced) {
+        referenced = false
+        this[kDB][kUnref]()
+      }
+      this._deferNextResult(callback, error)
+    }
   }
 
   _nextv (size, options, callback) {

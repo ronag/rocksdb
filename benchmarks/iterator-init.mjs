@@ -3,6 +3,7 @@ import { execFileSync } from 'node:child_process'
 import { mkdtemp, rm } from 'node:fs/promises'
 import { cpus, platform, tmpdir } from 'node:os'
 import { dirname, join, resolve } from 'node:path'
+import { monitorEventLoopDelay } from 'node:perf_hooks'
 import { fileURLToPath, pathToFileURL } from 'node:url'
 
 const localRoot = dirname(dirname(fileURLToPath(import.meta.url)))
@@ -235,6 +236,46 @@ try {
     await iterator.close()
     assert.equal(rows, rowCount)
     return rows * 1000 / duration
+  })
+
+  const publicIteration = async (trackEventLoopDelay) => {
+    const iterator = db.iterator(options)
+    await iterator._nextvAsync(1, { packed: false })
+    iterator._refreshSync()
+
+    const delay = trackEventLoopDelay ? monitorEventLoopDelay({ resolution: 1 }) : null
+    if (delay) {
+      delay.enable()
+      await new Promise((resolve) => setImmediate(resolve))
+    }
+
+    let rows = 0
+    const start = process.hrtime.bigint()
+    for await (const entry of iterator) {
+      assert(entry)
+      rows++
+    }
+    const duration = elapsedNs(start)
+
+    if (delay) {
+      await new Promise((resolve) => setImmediate(resolve))
+      delay.disable()
+    }
+
+    await iterator.close()
+    assert.equal(rows, rowCount)
+    return {
+      throughput: rows * 1000 / duration,
+      maxEventLoopDelay: delay ? delay.max / 1e6 : 0
+    }
+  }
+
+  await measure('steady', 'steady public next()', 'M rows/s', async () => {
+    return (await publicIteration(false)).throughput
+  })
+
+  await measure('steady', 'steady public next() max event-loop delay', 'ms', async () => {
+    return (await publicIteration(true)).maxEventLoopDelay
   })
 } catch (err) {
   benchmarkError = err
