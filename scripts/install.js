@@ -17,19 +17,16 @@ const { persistentPrefixDir } = require('./deps-prefix.js')
 
 const packageRoot = path.join(__dirname, '..')
 
-// Mirrors node-gyp-build/bin.js's own --build-from-source handling, so
-// `npm run rebuild` (npm run install --build-from-source) still forces
-// a real rebuild instead of short-circuiting on an existing binary. npm also
-// supports the scoped form `--build-from-source=<pkg>`, which exports the
-// package name (not 'true') into the env.
-function buildFromSource () {
-  const flag = process.env.npm_config_build_from_source
+// The package-owned rebuild command passes a normal script argument. Keep the
+// npm config environment variable for callers using npm's conventional
+// --build-from-source flag, including its package-scoped form.
+function buildFromSource (argv = process.argv, env = process.env) {
+  if (argv.includes('--build-from-source')) return true
+
+  const flag = env.npm_config_build_from_source
   if (flag === 'true' || flag === require('../package.json').name) return true
-  try {
-    return JSON.parse(process.env.npm_config_argv || '{}').original.includes('--build-from-source')
-  } catch {
-    return false
-  }
+
+  return false
 }
 
 function hasWorkingBuild () {
@@ -39,10 +36,6 @@ function hasWorkingBuild () {
   } catch {
     return false
   }
-}
-
-if (!buildFromSource() && hasWorkingBuild()) {
-  process.exit(0)
 }
 
 function rebuildWith (prefix) {
@@ -63,22 +56,30 @@ function rebuildWith (prefix) {
 // dev rebuilds) is reused as-is — it belongs to that workflow and skips the
 // multi-minute dep build. End users never have one, so they get the
 // throwaway temp prefix and keep a clean machine.
-try {
-  const persistent = persistentPrefixDir()
-  if (buildDeps.stampMatches(persistent)) {
-    rebuildWith(persistent)
-  } else {
-    const tmp = fs.mkdtempSync(path.join(os.tmpdir(), 'rocks-level-deps-'))
-    try {
-      rebuildWith(tmp)
-    } finally {
-      fs.rmSync(tmp, { recursive: true, force: true })
+function main () {
+  if (!buildFromSource() && hasWorkingBuild()) return
+
+  try {
+    const persistent = persistentPrefixDir()
+    if (buildDeps.stampMatches(persistent)) {
+      rebuildWith(persistent)
+    } else {
+      const tmp = fs.mkdtempSync(path.join(os.tmpdir(), 'rocks-level-deps-'))
+      try {
+        rebuildWith(tmp)
+      } finally {
+        fs.rmSync(tmp, { recursive: true, force: true })
+      }
     }
+  } catch (err) {
+    // The message (unsupported platform, missing git/cmake/make, failed build
+    // step) is the useful part — a stack trace into this script is noise for
+    // someone whose `npm install` just failed.
+    console.error(err.message)
+    process.exitCode = 1
   }
-} catch (err) {
-  // The message (unsupported platform, missing git/cmake/make, failed build
-  // step) is the useful part — a stack trace into this script is noise for
-  // someone whose `npm install` just failed.
-  console.error(err.message)
-  process.exit(1)
 }
+
+if (require.main === module) main()
+
+module.exports = { buildFromSource }

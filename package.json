@@ -13,7 +13,7 @@
     "test-gc": "node --expose-gc test/gc.js",
     "test-prebuild": "cross-env PREBUILDS_ONLY=1 npm t",
     "prebuildify": "node scripts/prebuildify.js",
-    "rebuild": "npm run install --build-from-source",
+    "rebuild": "node scripts/install.js --build-from-source",
     "release": "./release.sh"
   },
   "dependencies": {
