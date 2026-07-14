@@ -60,6 +60,48 @@ function holdIteratorInitialization () {
   }
 }
 
+test('failed iterator construction detaches its partial database resource', async function (t) {
+  const db = testCommon.factory()
+  await db.open()
+
+  const expected = new Error('synthetic iterator construction failure')
+  const originalCreate = binding.iterator_create
+  const originalAttach = db.attachResource
+  const originalDetach = db.detachResource
+  let attached
+  let detachCalls = 0
+
+  db.attachResource = function (resource) {
+    attached = resource
+    return originalAttach.call(this, resource)
+  }
+  db.detachResource = function (resource) {
+    detachCalls++
+    t.equal(resource, attached, 'the exact partially constructed iterator is detached')
+    return originalDetach.call(this, resource)
+  }
+  binding.iterator_create = function () {
+    throw expected
+  }
+
+  try {
+    t.throws(
+      () => db.iterator(),
+      (err) => err === expected,
+      'the original construction error is preserved'
+    )
+    t.ok(attached, 'AbstractIterator attached the resource before native construction')
+    t.equal(detachCalls, 1, 'failed construction detaches the resource exactly once')
+  } finally {
+    binding.iterator_create = originalCreate
+    db.attachResource = originalAttach
+    db.detachResource = originalDetach
+    await db.close()
+  }
+
+  t.end()
+})
+
 test('iterator initialization is lazy and asynchronous', async function (t) {
   const db = testCommon.factory()
   await db.open()

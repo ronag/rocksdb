@@ -202,35 +202,44 @@ class Iterator extends AbstractIterator {
   constructor (db, context, options) {
     super(db, options)
 
-    this[kKeys] = options.keys !== false
-    this[kValues] = options.values !== false
-    this[kKeyEncoding] = options.keyEncoding ?? 'buffer'
-    this[kValueEncoding] = options.valueEncoding ?? 'buffer'
+    try {
+      this[kKeys] = options.keys !== false
+      this[kValues] = options.values !== false
+      this[kKeyEncoding] = options.keyEncoding ?? 'buffer'
+      this[kValueEncoding] = options.valueEncoding ?? 'buffer'
+      const hasFilter = options.keyFilter != null || options.valueFilter != null
 
-    const bindingOptions = prepareNativeIteratorOptions(
-      options,
-      this[kKeyEncoding],
-      this[kValueEncoding]
-    )
+      const bindingOptions = prepareNativeIteratorOptions(
+        options,
+        this[kKeyEncoding],
+        this[kValueEncoding]
+      )
 
-    // Capture the RocksDB snapshot synchronously, but defer NewIterator and
-    // its initial seek (the potentially blocking work) to the first operation.
-    this[kContext] = binding.iterator_create(context, bindingOptions)
-    this[kInitState] = kUninitialized
-    this[kInitCallbacks] = []
-    this[kInitError] = null
-    this[kInitialTarget] = null
+      // Capture the RocksDB snapshot synchronously, but defer NewIterator and
+      // its initial seek (the potentially blocking work) to the first operation.
+      this[kContext] = binding.iterator_create(context, bindingOptions)
+      this[kInitState] = kUninitialized
+      this[kInitCallbacks] = []
+      this[kInitError] = null
+      this[kInitialTarget] = null
 
-    this[kFirst] = true
-    this[kCache] = kEmpty
-    this[kFinished] = false
-    this[kPosition] = 0
-    this[kDB] = db
-    this[kBusy] = false
-    this[kPendingClose] = null
-    this[kCloseRequested] = false
-    this[kPublicSeek] = false
-    this[kHasFilter] = options.keyFilter != null || options.valueFilter != null
+      this[kFirst] = true
+      this[kCache] = kEmpty
+      this[kFinished] = false
+      this[kPosition] = 0
+      this[kDB] = db
+      this[kBusy] = false
+      this[kPendingClose] = null
+      this[kCloseRequested] = false
+      this[kPublicSeek] = false
+      this[kHasFilter] = hasFilter
+    } catch (err) {
+      // AbstractIterator attaches itself to the database in super(). A failed
+      // native/options construction must undo that ownership immediately or
+      // the database retains an unreachable, partially initialized iterator.
+      db.detachResource(this)
+      throw err
+    }
   }
 
   _initialize (callback) {
