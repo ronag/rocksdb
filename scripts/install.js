@@ -38,16 +38,24 @@ function hasWorkingBuild () {
   }
 }
 
+function nativeBuildEnvironment (prefix, env = process.env, jobs = buildDeps.jobs()) {
+  return {
+    ...env,
+    // node-gyp-build/bin.js does not inspect this script's argv. Force its
+    // build branch explicitly so an existing addon cannot short-circuit a
+    // requested rebuild.
+    npm_config_build_from_source: 'true',
+    JOBS: jobs,
+    ROCKS_LEVEL_DEPS_PREFIX: prefix
+  }
+}
+
 function rebuildWith (prefix) {
   buildDeps.ensure(prefix)
   execFileSync(process.execPath, [require.resolve('node-gyp-build/bin.js')], {
     stdio: 'inherit',
     cwd: packageRoot,
-    env: {
-      ...process.env,
-      JOBS: buildDeps.jobs(),
-      ROCKS_LEVEL_DEPS_PREFIX: prefix
-    }
+    env: nativeBuildEnvironment(prefix)
   })
 }
 
@@ -82,4 +90,4 @@ function main () {
 
 if (require.main === module) main()
 
-module.exports = { buildFromSource }
+module.exports = { buildFromSource, nativeBuildEnvironment }

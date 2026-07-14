@@ -2,7 +2,7 @@
 
 const test = require('tape')
 
-const { buildFromSource } = require('../scripts/install.js')
+const { buildFromSource, nativeBuildEnvironment } = require('../scripts/install.js')
 const packageName = require('../package.json').name
 
 test('build-from-source uses the script argument on Node 26', function (t) {
@@ -26,5 +26,22 @@ test('build-from-source ignores the removed npm argv compatibility payload', fun
     buildFromSource([], { npm_config_argv: '{"original":["--build-from-source"]}' }),
     'npm 6 compatibility state is not parsed'
   )
+  t.end()
+})
+
+test('native rebuild forces node-gyp-build past an existing addon', function (t) {
+  const original = {
+    KEEP: 'value',
+    npm_config_build_from_source: 'false',
+    JOBS: 'old',
+    ROCKS_LEVEL_DEPS_PREFIX: 'old'
+  }
+  const env = nativeBuildEnvironment('/tmp/rocks-level-prefix', original, '8')
+
+  t.equal(env.npm_config_build_from_source, 'true', 'node-gyp-build is forced to compile')
+  t.equal(env.JOBS, '8', 'the validated job count is forwarded')
+  t.equal(env.ROCKS_LEVEL_DEPS_PREFIX, '/tmp/rocks-level-prefix', 'the dependency prefix is forwarded')
+  t.equal(env.KEEP, 'value', 'unrelated environment variables are preserved')
+  t.equal(original.npm_config_build_from_source, 'false', 'the caller environment is not mutated')
   t.end()
 })
