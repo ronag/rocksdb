@@ -10,11 +10,9 @@ reads return one byte arena and typed-array metadata instead of allocating a
 JavaScript buffer for every key or value.
 
 With `packed: 'auto'`, reads use the packed representation for values up to 8
-KiB and the unpacked representation for larger values. Automatic reads also
-use the unpacked representation whenever an enabled key or value encoding is
-not `buffer`. `getMany` selects based on the average size of the values it
-found. Iterators select based on the first row in the batch, avoiding a second
-pass or a whole-batch copy.
+KiB and the unpacked representation for larger values. `getMany` selects based
+on the average size of the values it found. Iterators select based on the first
+row in the batch, avoiding a second pass or a whole-batch copy.
 
 Every raw result exposes a `packed: boolean` discriminator. Async callbacks
 also receive the selected mode as their third argument:
@@ -34,10 +32,22 @@ Packed `getMany` results contain:
 - `statuses`: one status per key (`0` value, `1` not found, `2` incomplete)
 - `count`: number of requested keys
 
-Packed reads always return raw bytes. Packed `getMany` reads therefore require
-`valueEncoding: 'buffer'` (or no encoding), while packed iterator reads require
-`keyEncoding` and `valueEncoding` to be `buffer` for each enabled field.
-Explicit `packed: true` reads throw when these requirements are not met.
+The raw methods additionally support `valueEncoding: 'slice'` for `getMany`
+and `keyEncoding: 'slice'` / `valueEncoding: 'slice'` for iterators. This
+encoding is intentionally not part of the AbstractLevel encoding manifest.
+It is only available through `_getManySync()`, `_getManyAsync()`,
+`_nextvSync()` and `_nextvAsync()`.
+
+A slice-encoded `getMany` result is always an ordinary value array containing
+`@nxtedition/slice` `Slice` objects. A slice-encoded iterator result always has
+`rows` containing `Slice` objects for its slice fields. If the native read was
+packed, those objects are zero-copy views of its shared byte arena. The
+`packed` discriminator and async callback flag continue to report which native
+representation was selected.
+
+Both `packed: true` and `packed: 'auto'` require `buffer` or `slice` for every
+enabled raw field. Other encodings throw. Buffer-encoded packed reads preserve
+the arena result described above.
 
 ## Packed `getMany` benchmark
 

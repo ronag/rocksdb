@@ -2,6 +2,7 @@
 
 const { fromCallback } = require('catering')
 const { AbstractLevel } = require('abstract-level')
+const { Slice } = require('@nxtedition/slice')
 const ModuleError = require('module-error')
 const binding = require('./binding')
 const { ChainedBatch } = require('./chained-batch')
@@ -26,17 +27,58 @@ const { getPackedMode, kRef, kUnref, setPackedResult } = require('./util')
 
 const kEmpty = Object.freeze({})
 
-function isPackedGetMany (options) {
-  const packed = getPackedMode(options)
+function prepareRawGetManyOptions (options, packed) {
+  if ((typeof options !== 'object' || options === null) && typeof options !== 'function') {
+    return { bindingOptions: options ?? kEmpty, valueEncoding: 'buffer' }
+  }
 
-  if (packed === true) {
-    const valueEncoding = options?.valueEncoding
-    if (valueEncoding !== undefined && valueEncoding !== 'buffer') {
-      throw new TypeError('Packed getMany only supports buffer value encoding')
+  let valueEncoding
+  const readValueEncoding = () => {
+    if (valueEncoding === undefined) {
+      valueEncoding = Reflect.get(options, 'valueEncoding', options) ?? 'buffer'
+    }
+    return valueEncoding
+  }
+
+  if (packed !== false) {
+    const encoding = readValueEncoding()
+    if (encoding !== 'buffer' && encoding !== 'slice') {
+      throw new TypeError('Packed getMany only supports buffer or slice value encoding')
     }
   }
 
-  return packed
+  const bindingOptions = new Proxy(options, {
+    get (target, property) {
+      if (property === 'valueEncoding') {
+        const encoding = readValueEncoding()
+        return encoding === 'slice' ? 'buffer' : encoding
+      }
+      return Reflect.get(target, property, target)
+    }
+  })
+
+  return {
+    bindingOptions,
+    get valueEncoding () {
+      return readValueEncoding()
+    }
+  }
+}
+
+function convertRawGetManyResult (result, valueEncoding) {
+  if (valueEncoding !== 'slice') return result
+
+  if (Array.isArray(result)) {
+    return result.map(value => Buffer.isBuffer(value) ? new Slice(value) : value)
+  }
+
+  return Array.from(result.statuses, (status, index) => {
+    if (status === 1) return undefined
+    if (status === 2) return null
+
+    const start = result.offsets[index]
+    return new Slice(result.buffer, start, result.offsets[index + 1] - start)
+  })
 }
 
 class RocksLevel extends AbstractLevel {
@@ -264,13 +306,15 @@ class RocksLevel extends AbstractLevel {
       }
       this[kRef]()
       referenced = true
-      if (packed == null) packed = isPackedGetMany(bindingOptions)
+      if (packed == null) packed = getPackedMode(bindingOptions)
+      const prepared = prepareRawGetManyOptions(bindingOptions, packed)
+      bindingOptions = prepared.bindingOptions
       const getMany = packed === true
         ? binding.db_get_many_packed
         : packed === 'auto'
           ? binding.db_get_many_auto
           : binding.db_get_many
-      getMany(this[kContext], keys, bindingOptions ?? kEmpty, (err, val) => {
+      getMany(this[kContext], keys, bindingOptions, (err, val) => {
         this[kUnref]()
         if (err) {
           callback(err)
@@ -288,6 +332,8 @@ class RocksLevel extends AbstractLevel {
             if (val[i] === null) indexes.push(i)
           }
         }
+
+        val = convertRawGetManyResult(val, prepared.valueEncoding)
 
         if (indexes.length === 0) {
           if (exposePacked) setPackedResult(val, packedResult)
@@ -356,14 +402,17 @@ class RocksLevel extends AbstractLevel {
 
     this[kRef]()
     try {
-      const packed = isPackedGetMany(options)
+      const packed = getPackedMode(options)
+      const prepared = prepareRawGetManyOptions(options, packed)
       const getMany = packed === true
         ? binding.db_get_many_packed_sync
         : packed === 'auto'
           ? binding.db_get_many_auto_sync
           : binding.db_get_many_sync
-      const result = getMany(this[kContext], keys, options ?? kEmpty)
-      return setPackedResult(result, !Array.isArray(result))
+      const nativeResult = getMany(this[kContext], keys, prepared.bindingOptions)
+      const packedResult = !Array.isArray(nativeResult)
+      const result = convertRawGetManyResult(nativeResult, prepared.valueEncoding)
+      return setPackedResult(result, packedResult)
     } finally {
       this[kUnref]()
     }

@@ -2,6 +2,7 @@ import { Buffer } from 'node:buffer'
 import { ok } from 'node:assert'
 
 import { AbstractLevel } from 'abstract-level'
+import { Slice } from '@nxtedition/slice'
 
 import {
   RocksCache,
@@ -99,11 +100,19 @@ db._getManyAsync([slice], { packed: 'auto' }, (err, result, packed) => {
 expectType<RocksPackedGetManyResult>(
   db._getManySync([slice], { packed: true, valueEncoding: 'buffer' })
 )
-// @ts-expect-error Packed getMany always returns raw buffer bytes
-db._getManySync([slice], { packed: true, valueEncoding: 'utf8' })
-expectType<RocksPackedGetManyResult | Array<string | undefined | null>>(
-  db._getManySync([slice], { packed: 'auto', valueEncoding: 'utf8' })
+expectType<RocksRawGetManyResult<'slice', true>>(
+  db._getManySync([slice], { packed: true, valueEncoding: 'slice' })
 )
+expectType<RocksRawGetManyResult<'slice', boolean>>(
+  db._getManySync([slice], { packed: 'auto', valueEncoding: 'slice' })
+)
+expectType<RocksRawGetManyResult<'slice'>>(
+  db._getManySync([slice], { valueEncoding: 'slice' })
+)
+// @ts-expect-error Packed getMany only supports buffer or slice output
+db._getManySync([slice], { packed: true, valueEncoding: 'utf8' })
+// @ts-expect-error Auto-packed getMany only supports buffer or slice output
+db._getManySync([slice], { packed: 'auto', valueEncoding: 'utf8' })
 // @ts-expect-error A runtime boolean can select packed output and therefore requires buffers
 db._getManySync([slice], { packed: booleanFlag, valueEncoding: 'utf8' })
 
@@ -174,6 +183,22 @@ iterator._nextvAsync(10, { packed: 'auto' }, (err, result, packed) => {
   if (result?.packed) expectType<RocksPackedIteratorResult>(result)
 })
 expectType<Promise<void>>(iterator[Symbol.asyncDispose]())
+
+const sliceIterator = db._iterator({ keyEncoding: 'slice', valueEncoding: 'slice' })
+expectType<RocksRawIteratorResult<Slice, Slice>>(
+  sliceIterator._nextvSync(10)
+)
+expectType<RocksRawIteratorResult<Slice, Slice, true, true, true>>(
+  sliceIterator._nextvSync(10, { packed: true })
+)
+expectType<Promise<RocksRawIteratorResult<Slice, Slice, true, true, boolean>>>(
+  sliceIterator._nextvAsync(10, { packed: 'auto' })
+)
+
+const mixedSliceIterator = db._iterator({ keyEncoding: 'buffer', valueEncoding: 'slice' })
+expectType<RocksRawIteratorResult<Buffer, Slice, true, true, true>>(
+  mixedSliceIterator._nextvSync(10, { packed: true })
+)
 
 const publicValuesOnlyIterator = db.iterator({ keys: false, values: true })
 publicValuesOnlyIterator.seek('key')

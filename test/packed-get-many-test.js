@@ -1,6 +1,7 @@
 'use strict'
 
 const test = require('tape')
+const { Slice } = require('@nxtedition/slice')
 const testCommon = require('./common')
 
 function unpack (result) {
@@ -62,39 +63,67 @@ test('packed raw getMany rejects decoded value encodings', async function (t) {
   const db = testCommon.factory({ keyEncoding: 'buffer', valueEncoding: 'buffer' })
   await db.open()
 
-  let syncError
-  try {
-    db._getManySync([Buffer.from('a')], { packed: true, valueEncoding: 'utf8' })
-  } catch (err) {
-    syncError = err
+  const expected = 'Packed getMany only supports buffer or slice value encoding'
+  for (const packed of [true, 'auto']) {
+    let syncError
+    try {
+      db._getManySync([Buffer.from('a')], { packed, valueEncoding: 'utf8' })
+    } catch (err) {
+      syncError = err
+    }
+
+    const asyncError = await db._getManyAsync(
+      [Buffer.from('a')],
+      { packed, valueEncoding: 'utf8' }
+    ).then(() => null, (err) => err)
+
+    t.ok(syncError instanceof TypeError, `sync rejects the incompatible encoding for ${packed}`)
+    t.equal(syncError.message, expected)
+    t.ok(asyncError instanceof TypeError, `async rejects the incompatible encoding for ${packed}`)
+    t.equal(asyncError.message, expected)
   }
-
-  const asyncError = await db._getManyAsync(
-    [Buffer.from('a')],
-    { packed: true, valueEncoding: 'utf8' }
-  ).then(() => null, (err) => err)
-
-  t.ok(syncError instanceof TypeError, 'sync rejects the incompatible encoding')
-  t.equal(syncError.message, 'Packed getMany only supports buffer value encoding')
-  t.ok(asyncError instanceof TypeError, 'async rejects the incompatible encoding')
-  t.equal(asyncError.message, 'Packed getMany only supports buffer value encoding')
 
   await db.close()
   t.end()
 })
 
-test('auto getMany falls back to decoded values for non-buffer encodings', async function (t) {
+test('slice getMany converts unpacked and packed native values to Slice objects', async function (t) {
   const db = testCommon.factory({ keyEncoding: 'buffer', valueEncoding: 'buffer' })
   await db.open()
-  await db.put('key', Buffer.from('value'))
+  await db.batch([
+    { type: 'put', key: 'a', value: Buffer.from('one') },
+    { type: 'put', key: 'empty', value: Buffer.alloc(0) },
+    { type: 'put', key: 'large', value: Buffer.alloc(8 * 1024 + 1, 0x78) }
+  ])
 
   for (const [name, read] of [
-    ['sync', () => db._getManySync(['key'], { packed: 'auto', valueEncoding: 'utf8' })],
-    ['async', () => db._getManyAsync(['key'], { packed: 'auto', valueEncoding: 'utf8' })]
+    ['sync', (packed, keys = ['a', 'missing', 'empty']) => db._getManySync(keys, {
+      packed,
+      valueEncoding: 'slice'
+    })],
+    ['async', (packed, keys = ['a', 'missing', 'empty']) => db._getManyAsync(keys, {
+      packed,
+      valueEncoding: 'slice'
+    })]
   ]) {
-    const result = await read()
-    t.equal(result.packed, false, `${name} reports the unpacked mode`)
-    t.same(result, ['value'], `${name} preserves the requested decoding`)
+    for (const packed of [false, true, 'auto']) {
+      const result = await read(packed)
+      t.ok(Array.isArray(result), `${name} ${packed} returns the ordinary getMany shape`)
+      t.equal(result.packed, packed !== false, `${name} ${packed} reports the native mode`)
+      t.ok(result[0] instanceof Slice, `${name} ${packed} converts a value to Slice`)
+      t.equal(result[0].toString(), 'one', `${name} ${packed} preserves value bytes`)
+      t.equal(result[1], undefined, `${name} ${packed} preserves a missing value`)
+      t.ok(result[2] instanceof Slice, `${name} ${packed} converts an empty value to Slice`)
+      t.equal(result[2].byteLength, 0, `${name} ${packed} preserves an empty value`)
+      if (result.packed) {
+        t.equal(result[0].buffer, result[2].buffer,
+          `${name} ${packed} slices share the packed arena`)
+      }
+    }
+
+    const large = await read('auto', ['large'])
+    t.equal(large.packed, false, `${name} auto preserves the native unpacked choice`)
+    t.ok(large[0] instanceof Slice, `${name} auto converts an unpacked value to Slice`)
   }
 
   await db.close()

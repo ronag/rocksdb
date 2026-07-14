@@ -2,6 +2,7 @@
 
 const { fromCallback } = require('catering')
 const { AbstractIterator } = require('abstract-level')
+const { Slice } = require('@nxtedition/slice')
 const ModuleError = require('module-error')
 const assert = require('node:assert')
 const { Buffer } = require('node:buffer')
@@ -22,6 +23,10 @@ const kCloseRequested = Symbol('closeRequested')
 const kPublicSeek = Symbol('publicSeek')
 const kHasFilter = Symbol('hasFilter')
 const kNoFieldsNext = Symbol('noFieldsNext')
+const kKeys = Symbol('keys')
+const kValues = Symbol('values')
+const kKeyEncoding = Symbol('keyEncoding')
+const kValueEncoding = Symbol('valueEncoding')
 
 const kEmpty = Object.freeze([])
 
@@ -88,11 +93,81 @@ function emptyPackedResult () {
   }
 }
 
+function isPackedEncoding (encoding) {
+  return encoding === 'buffer' || encoding === 'slice'
+}
+
+function prepareNativeIteratorOptions (options, keyEncoding, valueEncoding) {
+  if (keyEncoding !== 'slice' && valueEncoding !== 'slice') return options
+
+  return new Proxy(options, {
+    get (target, property) {
+      if (property === 'keyEncoding' && keyEncoding === 'slice') return 'buffer'
+      if (property === 'valueEncoding' && valueEncoding === 'slice') return 'buffer'
+      return Reflect.get(target, property, target)
+    }
+  })
+}
+
+function validatePackedEncodings (iterator, packed) {
+  if (packed === false) return
+
+  if ((iterator[kKeys] && !isPackedEncoding(iterator[kKeyEncoding])) ||
+      (iterator[kValues] && !isPackedEncoding(iterator[kValueEncoding]))) {
+    throw new TypeError('Packed iterator only supports buffer or slice key and value encodings')
+  }
+}
+
+function convertIteratorResult (iterator, result) {
+  const convertKey = iterator[kKeyEncoding] === 'slice'
+  const convertValue = iterator[kValueEncoding] === 'slice'
+  if (!convertKey && !convertValue) return result
+
+  if ('rows' in result) {
+    const rows = result.rows.map((value, index) => {
+      const convert = index % 2 === 0 ? convertKey : convertValue
+      return convert && value !== undefined ? new Slice(value) : value
+    })
+    return { ...result, rows }
+  }
+
+  let offsetIndex = 0
+  const rows = []
+  const read = (encoding) => {
+    const start = result.offsets[offsetIndex++]
+    const length = result.offsets[offsetIndex] - start
+    return encoding === 'slice'
+      ? new Slice(result.buffer, start, length)
+      : result.buffer.subarray(start, start + length)
+  }
+
+  for (let index = 0; index < result.count; index++) {
+    rows.push(iterator[kKeys] ? read(iterator[kKeyEncoding]) : undefined)
+    rows.push(iterator[kValues] ? read(iterator[kValueEncoding]) : undefined)
+  }
+
+  return {
+    rows,
+    finished: result.finished,
+    limited: result.limited
+  }
+}
+
 class Iterator extends AbstractIterator {
   constructor (db, context, options) {
     super(db, options)
 
-    this[kContext] = binding.iterator_init_sync(context, options)
+    this[kKeys] = options.keys !== false
+    this[kValues] = options.values !== false
+    this[kKeyEncoding] = options.keyEncoding ?? 'buffer'
+    this[kValueEncoding] = options.valueEncoding ?? 'buffer'
+
+    const bindingOptions = prepareNativeIteratorOptions(
+      options,
+      this[kKeyEncoding],
+      this[kValueEncoding]
+    )
+    this[kContext] = binding.iterator_init_sync(context, bindingOptions)
 
     this[kFirst] = true
     this[kCache] = kEmpty
@@ -408,15 +483,16 @@ class Iterator extends AbstractIterator {
       this[kDB][kRef]()
       referenced = true
       const packed = getPackedMode(options)
+      validatePackedEncodings(this, packed)
 
       if (this[kPosition] < this[kCache].length) {
         if (packed === true) throw packedCacheError()
-        return setPackedResult(this._nextvCached(size), false)
+        return setPackedResult(convertIteratorResult(this, this._nextvCached(size)), false)
       }
 
       if (this[kFinished]) {
         const result = packed === true ? emptyPackedResult() : { rows: [], finished: true }
-        return setPackedResult(result, packed === true)
+        return setPackedResult(convertIteratorResult(this, result), packed === true)
       }
 
       const nextv = packed === true
@@ -427,7 +503,8 @@ class Iterator extends AbstractIterator {
       const result = nextv(this[kContext], size, options)
       this[kFinished] = result.finished
 
-      return setPackedResult(result, !('rows' in result))
+      const packedResult = !('rows' in result)
+      return setPackedResult(convertIteratorResult(this, result), packedResult)
     } finally {
       this[kBusy] = false
       if (referenced) this[kDB][kUnref]()
@@ -447,6 +524,7 @@ class Iterator extends AbstractIterator {
       referenced = true
       this[kBusy] = true
       if (packed == null) packed = getPackedMode(options)
+      validatePackedEncodings(this, packed)
 
       if (this[kPosition] < this[kCache].length) {
         if (packed === true) throw packedCacheError()
@@ -475,6 +553,7 @@ class Iterator extends AbstractIterator {
             } else {
               this[kFinished] = result.finished
               const packedResult = !('rows' in result)
+              result = convertIteratorResult(this, result)
               setPackedResult(result, packedResult)
               callback(null, result, packedResult)
             }
@@ -498,6 +577,7 @@ class Iterator extends AbstractIterator {
         if (err) {
           callback(err)
         } else {
+          result = convertIteratorResult(this, result)
           setPackedResult(result, packed)
           callback(null, result, packed)
         }
