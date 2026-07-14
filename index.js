@@ -33,6 +33,13 @@ const kBatchAsync = Symbol('batchAsync')
 const kPublicEventToken = Symbol('publicEventToken')
 const kPublicOpenToken = Symbol('publicOpenToken')
 const kPublicCloseToken = Symbol('publicCloseToken')
+const kOpenEpoch = Symbol('openEpoch')
+const kCloseGroups = Symbol('closeGroups')
+const kPhysicalCloseGroup = Symbol('physicalCloseGroup')
+const kLandingClose = Symbol('landingClose')
+const kNativeClose = Symbol('nativeClose')
+const openContinuations = new WeakSet()
+const closeContinuations = new WeakMap()
 const partialResults = new WeakMap()
 const noFieldsIterators = new WeakSet()
 const noFieldsNextOptions = Object.freeze({ [kNoFieldsNext]: true })
@@ -337,6 +344,10 @@ class RocksLevel extends AbstractLevel {
 
     this[kRefs] = 0
     this[kPendingClose] = null
+    this[kOpenEpoch] = 0
+    this[kCloseGroups] = new Map()
+    this[kPhysicalCloseGroup] = null
+    this[kLandingClose] = false
   }
 
   [Symbol.asyncDispose] () {
@@ -352,15 +363,30 @@ class RocksLevel extends AbstractLevel {
       callback = options
       options = undefined
     }
-    callback = fromCallback(callback, kPromise)
-    const safeCallback = rethrowingCallback(callback)
+
+    // AbstractLevel re-enters this method after a pending transition lands.
+    // Keep that continuation in the original ordering epoch, while still
+    // installing a fresh listener guard for the physical open it may start.
+    const reentry = typeof callback === 'function' && openContinuations.has(callback)
+    let promise
+    if (!reentry) {
+      callback = fromCallback(callback, kPromise)
+      promise = callback[kPromise]
+      callback = rethrowingCallback(callback)
+      openContinuations.add(callback)
+
+      // A public open separates close request groups even when the request is
+      // queued behind a transition or the database is already open.
+      this[kOpenEpoch]++
+    }
+
     const previous = this[kPublicOpenToken]
     const token = { claimed: false, errors: [] }
     this[kPublicOpenToken] = token
 
     try {
       guardPublicEvents(this, ['opening'], () => {
-        super.open(options, safeCallback)
+        super.open(options, callback)
       }, token.errors)
     } catch (err) {
       rethrowErrors(token.errors)
@@ -369,7 +395,129 @@ class RocksLevel extends AbstractLevel {
       this[kPublicOpenToken] = previous
     }
 
-    return callback[kPromise]
+    return promise
+  }
+
+  close (callback) {
+    const continuation = typeof callback === 'function'
+      ? closeContinuations.get(callback)
+      : undefined
+
+    const callClose = (complete) => {
+      const token = this.status === 'open' && !this[kPublicCloseToken]
+        ? { errors: [] }
+        : null
+      if (token) this[kPublicCloseToken] = token
+
+      try {
+        if (token) {
+          guardPublicEvents(this, ['closing'], () => {
+            super.close(complete)
+          }, token.errors)
+        } else {
+          super.close(complete)
+        }
+      } catch (err) {
+        if (this[kPublicCloseToken] === token) this[kPublicCloseToken] = null
+        if (token) rethrowErrors(token.errors)
+        throw err
+      }
+    }
+
+    // AbstractLevel re-enters this.close() from its private landed event. Do
+    // not let that continuation start another public group. Re-entry from a
+    // native close landing is deferred because AbstractLevel's error path calls
+    // maybeClosed(err) synchronously after emitting the landed event; changing
+    // state during that emit otherwise recurses in abstract-level@1.x.
+    if (continuation && continuation.db === this) {
+      if (this[kLandingClose] && this.status === 'open') {
+        process.nextTick(() => this.close(callback))
+        return
+      }
+
+      if (this.status === 'open') {
+        this[kPhysicalCloseGroup] = continuation.group
+      }
+      return callClose(callback)
+    }
+
+    // Preserve AbstractLevel's fast idempotent path when there is no native
+    // close attempt to coordinate.
+    if (this.status === 'closed') {
+      callback = fromCallback(callback, kPromise)
+      const promise = callback[kPromise]
+      callClose(rethrowingCallback(callback))
+      return promise
+    }
+
+    callback = fromCallback(callback, kPromise)
+    const promise = callback[kPromise]
+    callback = rethrowingCallback(callback)
+    const epoch = this[kOpenEpoch]
+
+    const activeGroup = this[kCloseGroups].get(epoch)
+    if (activeGroup && activeGroup.accepting) {
+      activeGroup.callbacks.push(callback)
+      return promise
+    }
+
+    const group = {
+      callbacks: [callback],
+      terminalError: null,
+      accepting: true,
+      finished: false
+    }
+    this[kCloseGroups].set(epoch, group)
+
+    const complete = (err) => {
+      if (group.finished) return
+      group.finished = true
+      group.accepting = false
+      if (this[kCloseGroups].get(epoch) === group) {
+        this[kCloseGroups].delete(epoch)
+      }
+
+      // A queued open can change AbstractLevel's eventual error while a
+      // terminal native close is landing. Preserve the native teardown error
+      // captured for this close attempt rather than the later state error.
+      const closeError = group.terminalError || err
+      const thrown = []
+      const callbacks = group.callbacks.splice(0)
+      for (const pending of callbacks) {
+        try {
+          pending(closeError)
+        } catch (err) {
+          thrown.push(err)
+        }
+      }
+
+      // One throwing callback must not prevent Promise and callback peers from
+      // settling. Rethrow only after the complete fanout, preserving normal
+      // uncaught callback-error behavior.
+      for (const err of thrown) {
+        process.nextTick(() => { throw err })
+      }
+    }
+    closeContinuations.set(complete, { db: this, group })
+
+    try {
+      if (this.status === 'open') {
+        this[kPhysicalCloseGroup] = group
+      }
+      callClose(complete)
+    } catch (err) {
+      group.accepting = false
+      group.finished = true
+      if (this[kCloseGroups].get(epoch) === group) {
+        this[kCloseGroups].delete(epoch)
+      }
+      if (this[kPhysicalCloseGroup] === group) {
+        this[kPhysicalCloseGroup] = null
+      }
+      throw err
+    }
+
+    return promise
   }
 
   static async open (...args) {
@@ -471,9 +619,61 @@ class RocksLevel extends AbstractLevel {
       // so we must call binding.db_close here (not just the callback) or the
       // native DB and its directory lock would leak. nextTick avoids reentering
       // the native layer from within the completing op's own callback.
-      const callback = this[kPendingClose]
+      const { callback, group } = this[kPendingClose]
       this[kPendingClose] = null
-      process.nextTick(() => binding.db_close(this[kContext], callback))
+      process.nextTick(() => this[kNativeClose](callback, group))
+    }
+  }
+
+  [kNativeClose] (callback, group) {
+    const land = (err) => {
+      this[kLandingClose] = true
+      try {
+        callback(err)
+      } finally {
+        this[kLandingClose] = false
+      }
+    }
+
+    const complete = (err) => {
+      // A close admitted after the physical result is known is a new
+      // idempotent/retry group, even if no open request changed the epoch.
+      if (group) group.accepting = false
+
+      let closed = false
+      if (err) {
+        try {
+          closed = binding.db_is_closed(this[kContext])
+        } catch (stateErr) {
+          land(new AggregateError([err, stateErr], 'Failed to determine database close state'))
+          return
+        }
+      }
+
+      if (closed) {
+        // AbstractLevel assumes that a failing _close() leaves the database
+        // open. RocksDB can instead report I/O errors after teardown is
+        // irreversible. Let AbstractLevel publish the actual closed state,
+        // while close() still rejects with its established error shape.
+        const closeError = new ModuleError('Database is not closed', {
+          code: 'LEVEL_DATABASE_NOT_CLOSED',
+          cause: err
+        })
+        if (group) {
+          group.terminalError = closeError
+          land()
+        } else {
+          land(closeError)
+        }
+      } else {
+        land(err)
+      }
+    }
+
+    try {
+      binding.db_close(this[kContext], complete)
+    } catch (err) {
+      process.nextTick(complete, err)
     }
   }
 
@@ -485,37 +685,14 @@ class RocksLevel extends AbstractLevel {
           this, ['closed'], callback, err, value, token.errors
         )
       : callback
+    const group = this[kPhysicalCloseGroup]
+    this[kPhysicalCloseGroup] = null
 
     if (this[kRefs]) {
-      this[kPendingClose] = complete
+      this[kPendingClose] = { callback: complete, group }
     } else {
-      binding.db_close(this[kContext], complete)
+      this[kNativeClose](complete, group)
     }
-  }
-
-  close (callback) {
-    callback = fromCallback(callback, kPromise)
-    const safeCallback = rethrowingCallback(callback)
-    const token = this.status === 'open' && !this[kPublicCloseToken]
-      ? { errors: [] }
-      : null
-    if (token) this[kPublicCloseToken] = token
-
-    try {
-      if (token) {
-        guardPublicEvents(this, ['closing'], () => {
-          super.close(safeCallback)
-        }, token.errors)
-      } else {
-        super.close(safeCallback)
-      }
-    } catch (err) {
-      if (this[kPublicCloseToken] === token) this[kPublicCloseToken] = null
-      if (token) rethrowErrors(token.errors)
-      throw err
-    }
-
-    return callback[kPromise]
   }
 
   _put (key, value, options, callback) {

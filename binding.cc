@@ -43,6 +43,7 @@
 
 #if defined(ROCKS_LEVEL_TEST_FAULTS)
 #include <stdexcept>
+#include <cstdlib>
 #endif
 
 #ifdef __linux__
@@ -76,6 +77,110 @@ static constexpr int DefaultBackgroundParallelism(unsigned int hardwareConcurren
 static_assert(DefaultBackgroundParallelism(0) == 1);
 static_assert(DefaultBackgroundParallelism(8) == 4);
 static_assert(DefaultBackgroundParallelism(1024) == kMaxBackgroundParallelism);
+
+#if defined(ROCKS_LEVEL_TEST_FAULTS)
+static int ExceptionCountdownForTest(const char* name) {
+  const auto* const value = std::getenv(name);
+  if (value == nullptr) return 0;
+
+  char* end = nullptr;
+  const auto parsed = std::strtol(value, &end, 10);
+  if (end == value || *end != '\0' || parsed <= 0 || parsed > std::numeric_limits<int>::max()) {
+    return 0;
+  }
+  return static_cast<int>(parsed);
+}
+
+// Initialize while the addon is loaded on the JS thread rather than calling
+// getenv() for the first time from a close worker while process.env may change.
+static const int initialUpdatesCloseExceptionCountdownForTest =
+    ExceptionCountdownForTest("ROCKS_LEVEL_TEST_UPDATES_CLOSE_EXCEPTION_COUNTDOWN");
+static std::atomic<int> updatesCloseExceptionCountdownForTest{
+    initialUpdatesCloseExceptionCountdownForTest};
+static std::atomic<int> databaseCloseAfterTransferExceptionCountdownForTest{
+    ExceptionCountdownForTest("ROCKS_LEVEL_TEST_DB_CLOSE_EXCEPTION_AFTER_TRANSFER_COUNTDOWN")};
+static std::atomic<int> databaseCloseBeforeTransferExceptionCountdownForTest{
+    ExceptionCountdownForTest("ROCKS_LEVEL_TEST_DB_CLOSE_EXCEPTION_BEFORE_TRANSFER_COUNTDOWN")};
+static std::atomic<int> databaseCloseColumnExceptionCountdownForTest{
+    ExceptionCountdownForTest("ROCKS_LEVEL_TEST_DB_CLOSE_EXCEPTION_COLUMN_COUNTDOWN")};
+static std::atomic<int> databaseOpenAfterColumnExceptionCountdownForTest{
+    ExceptionCountdownForTest("ROCKS_LEVEL_TEST_DB_OPEN_EXCEPTION_AFTER_COLUMN_COUNTDOWN")};
+static std::atomic<int> databaseOpenCleanupExceptionCountdownForTest{
+    ExceptionCountdownForTest("ROCKS_LEVEL_TEST_DB_OPEN_CLEANUP_EXCEPTION_COUNTDOWN")};
+
+static bool InjectUpdatesCloseExceptionForTest() {
+  auto current = updatesCloseExceptionCountdownForTest.load(std::memory_order_relaxed);
+  while (current > 0) {
+    if (updatesCloseExceptionCountdownForTest.compare_exchange_weak(
+            current, current - 1, std::memory_order_relaxed, std::memory_order_relaxed)) {
+      return current == 1;
+    }
+  }
+  return false;
+}
+
+static bool InjectDatabaseCloseColumnExceptionForTest() {
+  auto current = databaseCloseColumnExceptionCountdownForTest.load(std::memory_order_relaxed);
+  while (current > 0) {
+    if (databaseCloseColumnExceptionCountdownForTest.compare_exchange_weak(
+            current, current - 1, std::memory_order_relaxed, std::memory_order_relaxed)) {
+      return current == 1;
+    }
+  }
+  return false;
+}
+
+static bool InjectDatabaseCloseAfterTransferExceptionForTest() {
+  auto current = databaseCloseAfterTransferExceptionCountdownForTest.load(std::memory_order_relaxed);
+  while (current > 0) {
+    if (databaseCloseAfterTransferExceptionCountdownForTest.compare_exchange_weak(
+            current, current - 1, std::memory_order_relaxed, std::memory_order_relaxed)) {
+      return current == 1;
+    }
+  }
+  return false;
+}
+
+static bool InjectDatabaseCloseBeforeTransferExceptionForTest() {
+  auto current = databaseCloseBeforeTransferExceptionCountdownForTest.load(std::memory_order_relaxed);
+  while (current > 0) {
+    if (databaseCloseBeforeTransferExceptionCountdownForTest.compare_exchange_weak(
+            current, current - 1, std::memory_order_relaxed, std::memory_order_relaxed)) {
+      return current == 1;
+    }
+  }
+  return false;
+}
+
+static bool InjectDatabaseOpenAfterColumnExceptionForTest() {
+  auto current = databaseOpenAfterColumnExceptionCountdownForTest.load(std::memory_order_relaxed);
+  while (current > 0) {
+    if (databaseOpenAfterColumnExceptionCountdownForTest.compare_exchange_weak(
+            current, current - 1, std::memory_order_relaxed, std::memory_order_relaxed)) {
+      return current == 1;
+    }
+  }
+  return false;
+}
+
+static bool InjectDatabaseOpenCleanupExceptionForTest() {
+  auto current = databaseOpenCleanupExceptionCountdownForTest.load(std::memory_order_relaxed);
+  while (current > 0) {
+    if (databaseOpenCleanupExceptionCountdownForTest.compare_exchange_weak(
+            current, current - 1, std::memory_order_relaxed, std::memory_order_relaxed)) {
+      return current == 1;
+    }
+  }
+  return false;
+}
+#else
+static constexpr bool InjectUpdatesCloseExceptionForTest() { return false; }
+static constexpr bool InjectDatabaseCloseColumnExceptionForTest() { return false; }
+static constexpr bool InjectDatabaseCloseAfterTransferExceptionForTest() { return false; }
+static constexpr bool InjectDatabaseCloseBeforeTransferExceptionForTest() { return false; }
+static constexpr bool InjectDatabaseOpenAfterColumnExceptionForTest() { return false; }
+static constexpr bool InjectDatabaseOpenCleanupExceptionForTest() { return false; }
+#endif
 
 static std::mutex& GetBackgroundParallelismMutex() {
   // The default RocksDB Env and its thread pools are process-wide, so pool
@@ -260,10 +365,13 @@ struct ColumnFamily {
 };
 
 struct Closable {
-  virtual ~Closable() {}
+  virtual ~Closable() noexcept = default;
   // Called with the owning reference's resources mutex held. Implementations must only
   // release their RocksDB resources and must not call back into Database.
   virtual rocksdb::Status CloseResources() = 0;
+  // Destruction cannot retain this raw pointer for a later retry. Implementations
+  // perform their strongest no-throw fallback after CloseResources() throws.
+  virtual void AbandonResources() noexcept = 0;
   std::atomic<bool> closed{false};
 };
 
@@ -295,9 +403,13 @@ struct Database final {
   rocksdb::Status Close(const std::shared_ptr<DatabaseReference>& reference);
   rocksdb::Status Attach(const std::shared_ptr<DatabaseReference>& reference, Closable* closable);
   rocksdb::Status Close(const std::shared_ptr<DatabaseReference>& reference, Closable* closable);
+  void AbandonReferenceResourcesForCleanup(
+      const std::shared_ptr<DatabaseReference>& reference) noexcept;
+  void DetachOnDestroy(const std::shared_ptr<DatabaseReference>& reference, Closable* closable) noexcept;
   std::shared_ptr<DatabaseOperation> BeginOperation(const std::shared_ptr<DatabaseReference>& reference);
   void EndOperation(const std::shared_ptr<DatabaseReference>& reference);
   bool IsOpen(const std::shared_ptr<DatabaseReference>& reference) const;
+  bool IsClosed(const std::shared_ptr<DatabaseReference>& reference) const;
 
   rocksdb::ColumnFamilyHandle* ResolveColumn(uint64_t generation, int32_t id) const {
     std::lock_guard lock(stateMutex_);
@@ -477,12 +589,30 @@ rocksdb::Status Database::Open(const std::shared_ptr<DatabaseReference>& referen
   std::vector<rocksdb::ColumnFamilyHandle*> handles;
   rocksdb::Status status;
   std::map<int32_t, ColumnFamily> openedColumns;
-  const auto cleanupOpened = [&] {
-    if (!openedDb) return;
-    for (auto* handle : handles) {
-      openedDb->DestroyColumnFamilyHandle(handle);
+  const auto cleanupOpened = [&]() noexcept {
+    if (!openedDb) {
+      handles.clear();
+      return;
     }
-    openedDb->Close();
+
+    // Consume each raw handle before attempting destruction. If RocksDB or a
+    // test fault throws, a second cleanup pass must never destroy it twice.
+    while (!handles.empty()) {
+      auto* const handle = handles.back();
+      handles.pop_back();
+      try {
+        openedDb->DestroyColumnFamilyHandle(handle).PermitUncheckedError();
+        if (InjectDatabaseOpenCleanupExceptionForTest()) {
+          throw std::runtime_error("Injected database open cleanup exception");
+        }
+      } catch (...) {
+      }
+    }
+
+    try {
+      openedDb->Close().PermitUncheckedError();
+    } catch (...) {
+    }
     openedDb.reset();
   };
 
@@ -495,6 +625,9 @@ rocksdb::Status Database::Open(const std::shared_ptr<DatabaseReference>& referen
       for (size_t n = 0; n < handles.size(); ++n) {
         ColumnFamily column{handles[n], descriptors[n]};
         openedColumns.emplace(column.handle->GetID(), std::move(column));
+        if (InjectDatabaseOpenAfterColumnExceptionForTest()) {
+          throw std::runtime_error("Injected database open exception after column setup");
+        }
       }
     } else {
       cleanupOpened();
@@ -552,68 +685,150 @@ rocksdb::Status Database::Close(const std::shared_ptr<DatabaseReference>& refere
     return rocksdb::Status::OK();
   }
   if (reference->phase == DatabaseReference::Phase::Closing) {
-    stateChanged_.wait(lock, [&] { return reference->phase == DatabaseReference::Phase::Inactive; });
-    return rocksdb::Status::OK();
+    stateChanged_.wait(lock, [&] { return reference->phase != DatabaseReference::Phase::Closing; });
+    if (reference->phase == DatabaseReference::Phase::Inactive) {
+      return rocksdb::Status::OK();
+    }
   }
 
+  std::unique_ptr<rocksdb::DB> closingDb;
+  std::map<int32_t, ColumnFamily> closingColumns;
+  const auto finishTerminalCleanup = [&]() noexcept {
+    if (!closingDb) return;
+
+    while (!closingColumns.empty()) {
+      const auto column = closingColumns.begin();
+      try {
+        closingDb->DestroyColumnFamilyHandle(column->second.handle).PermitUncheckedError();
+      } catch (...) {
+      }
+      closingColumns.erase(column);
+    }
+
+    try {
+      closingDb->Close().PermitUncheckedError();
+    } catch (...) {
+    }
+  };
+
+  const auto priorPhase = reference->phase;
   reference->phase = DatabaseReference::Phase::Closing;
-  lock.unlock();
-  {
-    std::unique_lock operationsLock(reference->operationsMutex);
-    reference->operationsChanged.wait(operationsLock, [&] { return reference->activeOperations == 0; });
-  }
-  lock.lock();
+  try {
+    lock.unlock();
+    {
+      std::unique_lock operationsLock(reference->operationsMutex);
+      reference->operationsChanged.wait(operationsLock, [&] { return reference->activeOperations == 0; });
+    }
+    lock.lock();
 
-  rocksdb::Status status = rocksdb::Status::OK();
-  {
-    std::lock_guard resourcesLock(reference->resourcesMutex);
-    for (auto* closable : reference->resources) {
-      const auto closeStatus = closable->CloseResources();
+    if (InjectDatabaseCloseBeforeTransferExceptionForTest()) {
+      throw std::runtime_error("Injected database close exception before ownership transfer");
+    }
+
+    rocksdb::Status status = rocksdb::Status::OK();
+    {
+      std::lock_guard resourcesLock(reference->resourcesMutex);
+      while (!reference->resources.empty()) {
+        const auto resource = reference->resources.begin();
+        auto* const closable = *resource;
+        rocksdb::Status closeStatus;
+        try {
+          closeStatus = closable->CloseResources();
+        } catch (...) {
+          // The resource remains attached so a later database close or its
+          // destructor can retry cleanup. CloseResources implementations are
+          // idempotent; reset the flag in case the failed call set it before
+          // throwing, otherwise destruction could leave a dangling raw entry.
+          closable->closed = false;
+          throw;
+        }
+        if (status.ok() && !closeStatus.ok()) {
+          status = closeStatus;
+        }
+        closable->closed = true;
+        // Erase each settled resource immediately. If a later resource throws,
+        // already-closed objects can then be finalized without leaving stale
+        // pointers in this reference's resource set.
+        reference->resources.erase(resource);
+      }
+    }
+
+    assert(openReferences_ > 0);
+    if (--openReferences_ > 0) {
+      reference->phase = DatabaseReference::Phase::Inactive;
+      reference->generation = 0;
+      stateChanged_.notify_all();
+      return status;
+    }
+
+    state_ = State::Closing;
+    closingDb.swap(db);
+    closingColumns.swap(columns);
+    statistics.reset();
+    reference->phase = DatabaseReference::Phase::Inactive;
+    reference->generation = 0;
+    lock.unlock();
+
+    if (InjectDatabaseCloseAfterTransferExceptionForTest()) {
+      throw std::runtime_error("Injected database close exception after ownership transfer");
+    }
+
+    if (closingDb) {
+      const auto flushStatus = closingDb->FlushWAL(true);
+      if (status.ok() && !flushStatus.ok()) {
+        status = flushStatus;
+      }
+      while (!closingColumns.empty()) {
+        const auto column = closingColumns.begin();
+        if (InjectDatabaseCloseColumnExceptionForTest()) {
+          throw std::runtime_error("Injected database column destruction exception");
+        }
+        const auto destroyStatus = closingDb->DestroyColumnFamilyHandle(column->second.handle);
+        if (status.ok() && !destroyStatus.ok()) {
+          status = destroyStatus;
+        }
+        closingColumns.erase(column);
+      }
+      const auto closeStatus = closingDb->Close();
       if (status.ok() && !closeStatus.ok()) {
         status = closeStatus;
       }
-      closable->closed = true;
     }
-    reference->resources.clear();
-  }
 
-  assert(openReferences_ > 0);
-  if (--openReferences_ > 0) {
-    reference->phase = DatabaseReference::Phase::Inactive;
-    reference->generation = 0;
+    lock.lock();
+    state_ = State::Closed;
     stateChanged_.notify_all();
     return status;
+  } catch (const std::exception& error) {
+    if (!lock.owns_lock()) lock.lock();
+    if (reference->phase == DatabaseReference::Phase::Closing) {
+      // No ownership was transferred yet, so the reference remains usable and
+      // AbstractLevel may correctly return to its open state.
+      reference->phase = priorPhase;
+    } else if (state_ == State::Closing) {
+      // Ownership has already moved into local RAII values. Their unwinding
+      // completes teardown, so publish the terminal state before reporting the
+      // exception to JavaScript.
+      lock.unlock();
+      finishTerminalCleanup();
+      lock.lock();
+      state_ = State::Closed;
+    }
+    stateChanged_.notify_all();
+    return rocksdb::Status::Aborted(error.what());
+  } catch (...) {
+    if (!lock.owns_lock()) lock.lock();
+    if (reference->phase == DatabaseReference::Phase::Closing) {
+      reference->phase = priorPhase;
+    } else if (state_ == State::Closing) {
+      lock.unlock();
+      finishTerminalCleanup();
+      lock.lock();
+      state_ = State::Closed;
+    }
+    stateChanged_.notify_all();
+    return rocksdb::Status::Aborted("Unknown exception while closing database");
   }
-
-  state_ = State::Closing;
-  auto closingDb = std::move(db);
-  auto closingColumns = std::move(columns);
-  statistics.reset();
-  reference->phase = DatabaseReference::Phase::Inactive;
-  reference->generation = 0;
-  lock.unlock();
-
-  if (closingDb) {
-    const auto flushStatus = closingDb->FlushWAL(true);
-    if (status.ok() && !flushStatus.ok()) {
-      status = flushStatus;
-    }
-    for (auto& [id, column] : closingColumns) {
-      const auto destroyStatus = closingDb->DestroyColumnFamilyHandle(column.handle);
-      if (status.ok() && !destroyStatus.ok()) {
-        status = destroyStatus;
-      }
-    }
-    const auto closeStatus = closingDb->Close();
-    if (status.ok() && !closeStatus.ok()) {
-      status = closeStatus;
-    }
-  }
-
-  lock.lock();
-  state_ = State::Closed;
-  stateChanged_.notify_all();
-  return status;
 }
 
 rocksdb::Status Database::Attach(const std::shared_ptr<DatabaseReference>& reference, Closable* closable) {
@@ -631,18 +846,80 @@ rocksdb::Status Database::Attach(const std::shared_ptr<DatabaseReference>& refer
 
 rocksdb::Status Database::Close(const std::shared_ptr<DatabaseReference>& reference, Closable* closable) {
   std::lock_guard lock(reference->resourcesMutex);
-  if (reference->resources.erase(closable) == 0) {
+  const auto resource = reference->resources.find(closable);
+  if (resource == reference->resources.end()) {
     return rocksdb::Status::OK();
   }
-  const auto status = closable->CloseResources();
+
+  rocksdb::Status status;
+  try {
+    status = closable->CloseResources();
+  } catch (...) {
+    // Keep the raw pointer registered and make destruction retry cleanup. A
+    // resource that set its flag before throwing must not silently detach from
+    // the database while still holding RocksDB-owned state.
+    closable->closed = false;
+    throw;
+  }
   closable->closed = true;
+  reference->resources.erase(resource);
   return status;
+}
+
+void Database::AbandonReferenceResourcesForCleanup(
+    const std::shared_ptr<DatabaseReference>& reference) noexcept {
+  try {
+    std::lock_guard lock(reference->resourcesMutex);
+    while (!reference->resources.empty()) {
+      const auto resource = reference->resources.begin();
+      auto* const closable = *resource;
+
+      // Cleanup hooks cannot retain a raw pointer for a public retry. Erase it
+      // before running the no-throw fallback so later finalization is a no-op.
+      reference->resources.erase(resource);
+      closable->AbandonResources();
+      closable->closed = true;
+    }
+  } catch (...) {
+    // Environment teardown and N-API finalizers cannot propagate exceptions.
+  }
+}
+
+void Database::DetachOnDestroy(const std::shared_ptr<DatabaseReference>& reference,
+                               Closable* closable) noexcept {
+  try {
+    std::lock_guard lock(reference->resourcesMutex);
+    const auto resource = reference->resources.find(closable);
+    if (resource == reference->resources.end()) return;
+
+    // Erase first: once the most-derived destructor returns this raw pointer
+    // can never be retried safely, even if native cleanup throws again.
+    reference->resources.erase(resource);
+
+    try {
+      const auto status = closable->CloseResources();
+      if (!status.ok()) {
+        closable->AbandonResources();
+      }
+    } catch (...) {
+      closable->AbandonResources();
+    }
+    closable->closed = true;
+  } catch (...) {
+    // Destructors and N-API finalizers must never allow C++ exceptions to cross
+    // their noexcept / C ABI boundary. A mutex failure is not recoverable here.
+  }
 }
 
 bool Database::IsOpen(const std::shared_ptr<DatabaseReference>& reference) const {
   std::lock_guard lock(stateMutex_);
   return state_ == State::Open && reference->phase == DatabaseReference::Phase::Open &&
          reference->generation == generation_;
+}
+
+bool Database::IsClosed(const std::shared_ptr<DatabaseReference>& reference) const {
+  std::lock_guard lock(stateMutex_);
+  return reference->phase == DatabaseReference::Phase::Inactive;
 }
 
 static constexpr napi_type_tag kDatabaseReferenceTag = {0x5fe2d764a8c6f421ULL, 0xbdd04ba698b447f1ULL};
@@ -1179,9 +1456,9 @@ struct BaseIterator : public Closable {
     }
   }
 
-  virtual ~BaseIterator() {
+  ~BaseIterator() noexcept override {
     if (!closed.load()) {
-      database_->Close(reference_, this);
+      database_->DetachOnDestroy(reference_, this);
     }
   }
 
@@ -1214,6 +1491,31 @@ struct BaseIterator : public Closable {
     upper_bound_.reset();
     ReleaseSnapshot();
     return rocksdb::Status::OK();
+  }
+
+  void AbandonResources() noexcept override {
+    closed = true;
+    // No operation can retain a shared_ptr once this destructor starts. Clear
+    // every RocksDB-owned pointer independently so one failed cleanup step does
+    // not prevent the remaining best-effort releases.
+    try {
+      iterator_.reset();
+    } catch (...) {
+    }
+    readOptions_.iterate_lower_bound = nullptr;
+    readOptions_.iterate_upper_bound = nullptr;
+    try {
+      lower_bound_.reset();
+    } catch (...) {
+    }
+    try {
+      upper_bound_.reset();
+    } catch (...) {
+    }
+    try {
+      ReleaseSnapshot();
+    } catch (...) {
+    }
   }
 
   virtual rocksdb::Status Initialize(const std::optional<std::string>& initialTarget = std::nullopt) {
@@ -2077,7 +2379,29 @@ class Iterator final : public BaseIterator, public std::enable_shared_from_this<
  * already-scheduled napi_async_work items have finished, which gives us
  * the guarantee that no db operations will be in-flight at this time.
  */
-static void env_cleanup_hook(void* data) {
+static void CloseDatabaseReferenceNoThrow(
+    const std::shared_ptr<DatabaseReference>& reference) noexcept {
+  // A normal close deliberately keeps a reference open when resource cleanup
+  // throws so JavaScript can observe the error and retry. Finalizers and env
+  // cleanup hooks have no future caller, so abandon attached resources only on
+  // this cleanup-only path and make bounded attempts to reach a terminal state.
+  // The bound also contains unrelated persistent native faults.
+  for (int attempt = 0; attempt < 3; ++attempt) {
+    try {
+      reference->database->Close(reference).PermitUncheckedError();
+    } catch (...) {
+    }
+
+    try {
+      if (reference->database->IsClosed(reference)) return;
+    } catch (...) {
+    }
+
+    reference->database->AbandonReferenceResourcesForCleanup(reference);
+  }
+}
+
+static void env_cleanup_hook(void* data) noexcept {
   auto holder = reinterpret_cast<std::shared_ptr<DatabaseReference>*>(data);
 
   // Do everything that db_close() does but synchronously. We're expecting that GC
@@ -2087,16 +2411,16 @@ static void env_cleanup_hook(void* data) {
   // where it's our responsibility to clean up. Note also, the following code must
   // be a safe noop if called before db_open() or after db_close().
   if (holder && *holder) {
-    (*holder)->database->Close(*holder);
+    CloseDatabaseReferenceNoThrow(*holder);
   }
 }
 
-static void FinalizeDatabase(napi_env env, void* data, void* hint) {
+static void FinalizeDatabase(napi_env env, void* data, void* hint) noexcept {
   auto holder = reinterpret_cast<std::shared_ptr<DatabaseReference>*>(data);
   if (holder) {
     napi_remove_env_cleanup_hook(env, env_cleanup_hook, holder);
     if (*holder) {
-      (*holder)->database->Close(*holder);
+      CloseDatabaseReferenceNoThrow(*holder);
     }
     delete holder;
   }
@@ -2176,7 +2500,7 @@ NAPI_METHOD(db_init) {
   napi_value result;
   const auto status = napi_create_external(env, holder.get(), FinalizeDatabase, nullptr, &result);
   if (status != napi_ok) {
-    reference->database->Close(reference);
+    CloseDatabaseReferenceNoThrow(reference);
     NAPI_STATUS_THROWS(status);
   }
   holder.release();
@@ -2212,6 +2536,26 @@ NAPI_METHOD(db_get_location) {
 
   return result;
 }
+
+NAPI_METHOD(db_is_closed) {
+  NAPI_ARGV(1);
+
+  Database* database;
+  std::shared_ptr<DatabaseReference> reference;
+  NAPI_STATUS_THROWS(GetDatabase(env, argv[0], database, &reference, false));
+
+  napi_value result;
+  NAPI_STATUS_THROWS(napi_get_boolean(env, database->IsClosed(reference), &result));
+  return result;
+}
+
+#if defined(ROCKS_LEVEL_TEST_FAULTS)
+NAPI_METHOD(test_faults_enabled) {
+  napi_value result;
+  NAPI_STATUS_THROWS(napi_get_boolean(env, true, &result));
+  return result;
+}
+#endif
 
 NAPI_METHOD(db_query_sync) {
   NAPI_ARGV(2);
@@ -4389,19 +4733,30 @@ struct Updates : public BatchIterator, public Closable {
     }
   }
 
-  virtual ~Updates() {
+  ~Updates() noexcept override {
     if (!closed.load()) {
-      database_->Close(reference_, this);
+      database_->DetachOnDestroy(reference_, this);
     }
   }
 
   rocksdb::Status Close() { return database_->Close(reference_, this); }
 
   rocksdb::Status CloseResources() override {
+    if (InjectUpdatesCloseExceptionForTest()) {
+      throw std::runtime_error("Injected updates resource close exception");
+    }
     std::lock_guard operationLock(operationMutex_);
     closed = true;
     iterator_.reset();
     return rocksdb::Status::OK();
+  }
+
+  void AbandonResources() noexcept override {
+    closed = true;
+    try {
+      iterator_.reset();
+    } catch (...) {
+    }
   }
 
   rocksdb::Status Next(rocksdb::BatchResult& result) {
@@ -4923,6 +5278,10 @@ NAPI_INIT() {
   NAPI_EXPORT_FUNCTION(db_get_identity);
   NAPI_EXPORT_FUNCTION(db_get_handle);
   NAPI_EXPORT_FUNCTION(db_get_location);
+  NAPI_EXPORT_FUNCTION(db_is_closed);
+#if defined(ROCKS_LEVEL_TEST_FAULTS)
+  NAPI_EXPORT_FUNCTION(test_faults_enabled);
+#endif
   NAPI_EXPORT_FUNCTION(db_close);
   NAPI_EXPORT_FUNCTION(db_dispose);
   NAPI_EXPORT_FUNCTION(db_get_many);
