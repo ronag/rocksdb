@@ -1199,7 +1199,9 @@ struct BaseIterator : public Closable {
     // otherwise an iterator that already yielded `limit` rows returns nothing
     // after a refresh even though every other piece of state was reset.
     count_ = 0;
-    ROCKS_STATUS_RETURN(iterator_->Refresh());
+    // Passing nullptr explicitly retargets the live iterator to the latest DB
+    // state and clears its internal snapshot before we release our ownership.
+    ROCKS_STATUS_RETURN(iterator_->Refresh(nullptr));
     if (snapshot_) {
       database_->db->ReleaseSnapshot(snapshot_);
       snapshot_ = nullptr;
