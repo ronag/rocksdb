@@ -78,23 +78,34 @@ function supportsSha1ObjectFormat (version) {
   return major > 2 || (major === 2 && minor >= 27)
 }
 
-function ensureSha1ObjectFormatSupport () {
-  let version
-  try {
-    version = gitOutput(['--version'])
-  } catch (err) {
-    throw new Error(
-      'rocks-level: Git 2.27 or newer is required to verify native dependency commits',
-      { cause: err }
-    )
-  }
+function createSha1ObjectFormatCheck (getVersion) {
+  let verified = false
 
-  if (!supportsSha1ObjectFormat(version)) {
-    throw new Error(
-      `rocks-level: Git 2.27 or newer is required for --object-format=sha1 (found: ${version})`
-    )
+  return function ensureSha1ObjectFormatSupport () {
+    if (verified) return
+
+    let version
+    try {
+      version = getVersion()
+    } catch (err) {
+      const detail = err instanceof Error ? err.message : String(err)
+      throw new Error(
+        `rocks-level: Git 2.27 or newer is required to verify native dependency commits: ${detail}`,
+        { cause: err }
+      )
+    }
+
+    if (!supportsSha1ObjectFormat(version)) {
+      throw new Error(
+        `rocks-level: Git 2.27 or newer is required for --object-format=sha1 (found: ${version})`
+      )
+    }
+
+    verified = true
   }
 }
+
+const ensureSha1ObjectFormatSupport = createSha1ObjectFormatCheck(() => gitOutput(['--version']))
 
 // Fetch the immutable object ID directly rather than resolving a mutable tag
 // or branch. Verify the detached checkout before any upstream build script is
@@ -338,6 +349,7 @@ if (require.main === module) {
 module.exports = {
   DEPENDENCIES,
   cloneAtCommit,
+  createSha1ObjectFormatCheck,
   ensure,
   jobs,
   stampMatches,
