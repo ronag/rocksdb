@@ -3,6 +3,10 @@ set -e
 
 cd "$(dirname "$0")"
 
+# Never let an explicit local fault-injection build leak into published
+# artifacts. Both dependency and addon builds inherit this shell environment.
+export ROCKS_LEVEL_TEST_FAULTS=0
+
 # Fail fast: npm publish needs a valid login, so check before the slow builds.
 if ! npm whoami --registry https://registry.npmjs.org > /dev/null 2>&1; then
   echo "Not logged in to npm, run 'npm login' first." >&2

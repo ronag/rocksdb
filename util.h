@@ -10,6 +10,7 @@
 
 #include <array>
 #include <cmath>
+#include <exception>
 #include <limits>
 #include <memory>
 #include <optional>
@@ -64,16 +65,66 @@ static void FinalizeFree(napi_env env, void* data, void* hint) {
   }
 }
 
-static napi_value CreateError(napi_env env, const std::optional<std::string_view>& code, const std::string_view& msg) {
+static napi_status CreateErrorValue(napi_env env,
+                                    const std::optional<std::string_view>& code,
+                                    const std::string_view& msg,
+                                    napi_value* result) noexcept {
   napi_value codeValue = nullptr;
   if (code) {
-    NAPI_STATUS_THROWS(napi_create_string_utf8(env, code->data(), code->size(), &codeValue));
+    NAPI_STATUS_RETURN(napi_create_string_utf8(env, code->data(), code->size(), &codeValue));
   }
   napi_value msgValue;
-  NAPI_STATUS_THROWS(napi_create_string_utf8(env, msg.data(), msg.size(), &msgValue));
+  NAPI_STATUS_RETURN(napi_create_string_utf8(env, msg.data(), msg.size(), &msgValue));
+  return napi_create_error(env, codeValue, msgValue, result);
+}
+
+static napi_value CreateError(napi_env env, const std::optional<std::string_view>& code, const std::string_view& msg) {
   napi_value error;
-  NAPI_STATUS_THROWS(napi_create_error(env, codeValue, msgValue, &error));
+  NAPI_STATUS_THROWS(CreateErrorValue(env, code, msg, &error));
   return error;
+}
+
+static napi_status GetAsyncCallbackError(napi_env env, napi_value* result) noexcept {
+  bool pending = false;
+  NAPI_STATUS_RETURN(napi_is_exception_pending(env, &pending));
+  if (pending) {
+    // A conversion helper may have thrown while returning a failing
+    // napi_status. Claim that exception before calling into JavaScript; a
+    // pending exception otherwise prevents napi_call_function from invoking
+    // the callback and leaves the JS promise unsettled.
+    return napi_get_and_clear_last_exception(env, result);
+  }
+
+  const napi_extended_error_info* errInfo = nullptr;
+  NAPI_STATUS_RETURN(napi_get_last_error_info(env, &errInfo));
+  const std::string_view message =
+      !errInfo || !errInfo->error_message ? "Native result conversion failed" : errInfo->error_message;
+  return CreateErrorValue(env, std::nullopt, message, result);
+}
+
+static napi_status GetNativeExceptionError(napi_env env,
+                                           const std::string_view& message,
+                                           napi_value* result) noexcept {
+  // If conversion first caused a pending JS exception and then unwound via
+  // C++, clear the pending exception so the callback can actually run. The C++
+  // exception is the terminal failure and gets one stable error code.
+  bool pending = false;
+  NAPI_STATUS_RETURN(napi_is_exception_pending(env, &pending));
+  if (pending) {
+    napi_value ignored;
+    NAPI_STATUS_RETURN(napi_get_and_clear_last_exception(env, &ignored));
+  }
+
+  const auto status = CreateErrorValue(env, "LEVEL_NATIVE_EXCEPTION", message, result);
+  if (status == napi_ok) {
+    return napi_ok;
+  }
+
+  // Error allocation can itself fail with a pending JS exception (usually an
+  // out-of-memory error). Deliver that exception rather than silently dropping
+  // the callback. If N-API cannot even retrieve it, teardown is already beyond
+  // a recoverable callback path.
+  return GetAsyncCallbackError(env, result);
 }
 
 static napi_value ToError(napi_env env, const rocksdb::Status& status) {
@@ -573,57 +624,99 @@ napi_status runAsyncKeepAlive(napi_value asyncResourceName,
                               T1&& execute,
                               T2&& then) {
   struct Worker final {
-    static void Execute(napi_env env, void* data) {
+    static void Execute(napi_env env, void* data) noexcept {
       auto worker = reinterpret_cast<Worker*>(data);
       try {
         worker->status = worker->execute(worker->state);
-      } catch (const std::exception& e) {
-        worker->status = rocksdb::Status::Aborted(e.what());
       } catch (...) {
-        worker->status = rocksdb::Status::Aborted("unknown exception");
+        // Preserve the original exception without allocating a diagnostic in
+        // the failure handler. It is rethrown into Complete's one JS-thread
+        // exception boundary, where std::exception::what() is still valid.
+        worker->executionException = std::current_exception();
       }
     }
 
-    static void Complete(napi_env env, napi_status status, void* data) {
+    static void Complete(napi_env env, napi_status completionStatus, void* data) noexcept {
       auto worker = std::unique_ptr<Worker>(reinterpret_cast<Worker*>(data));
 
-      if (status == napi_cancelled) {
+      if (completionStatus == napi_cancelled) {
         return;  // env is tearing down, just clean up
       }
 
       HandleScope scope;
-      NAPI_STATUS_THROWS_VOID(HandleScope::Create(env, scope));
-
-      napi_value callback;
-      NAPI_STATUS_THROWS_VOID(napi_get_reference_value(env, worker->ref, &callback));
-
-      napi_value global;
-      NAPI_STATUS_THROWS_VOID(napi_get_global(env, &global));
-
-      std::array<napi_value, 2> argv;
-      NAPI_STATUS_THROWS_VOID(napi_get_null(env, &argv[0]));
-      NAPI_STATUS_THROWS_VOID(napi_get_null(env, &argv[1]));
-
-      if (!worker->status.ok()) {
-        argv[0] = ToError(env, worker->status);
-      } else if (worker->then(worker->state, env, &argv[1]) != napi_ok) {
-        bool pending = false;
-        NAPI_STATUS_THROWS_VOID(napi_is_exception_pending(env, &pending));
-        if (pending) {
-          // A conversion helper may have thrown while returning a failing
-          // napi_status. Claim that exception and deliver it to the callback;
-          // otherwise the pending exception prevents the callback call and
-          // leaves the JS promise permanently unsettled.
-          NAPI_STATUS_THROWS_VOID(napi_get_and_clear_last_exception(env, &argv[0]));
-        } else {
-          const napi_extended_error_info* errInfo = nullptr;
-          NAPI_STATUS_THROWS_VOID(napi_get_last_error_info(env, &errInfo));
-          argv[0] = CreateError(env, std::nullopt,
-                                !errInfo || !errInfo->error_message ? "empty error message" : errInfo->error_message);
-        }
+      if (HandleScope::Create(env, scope) != napi_ok) {
+        return;
       }
 
-      napi_call_function(env, global, callback, argv.size(), argv.data(), nullptr);
+      napi_value callback;
+      if (napi_get_reference_value(env, worker->ref, &callback) != napi_ok) {
+        return;
+      }
+
+      napi_value global;
+      if (napi_get_global(env, &global) != napi_ok) {
+        return;
+      }
+
+      napi_value nullValue;
+      if (napi_get_null(env, &nullValue) != napi_ok) {
+        return;
+      }
+
+      bool callbackStarted = false;
+      const auto callCallback = [&](napi_value error, napi_value result) noexcept {
+        const std::array<napi_value, 2> argv{error, result};
+        // Set this before entering JavaScript. A throwing JS callback still ran
+        // exactly once and must never be called again by the C++ catch blocks.
+        callbackStarted = true;
+        napi_call_function(env, global, callback, argv.size(), argv.data(), nullptr);
+      };
+
+      try {
+        napi_value error = nullValue;
+        napi_value result = nullValue;
+
+        if (completionStatus != napi_ok) {
+          if (GetNativeExceptionError(env, "Native async work completion failed", &error) != napi_ok) {
+            return;
+          }
+        } else if (worker->executionException) {
+          std::rethrow_exception(worker->executionException);
+        } else if (!worker->status.ok()) {
+          error = ToError(env, worker->status);
+          if (error == nullptr && GetAsyncCallbackError(env, &error) != napi_ok) {
+            return;
+          }
+        } else {
+          const auto conversionStatus = worker->then(worker->state, env, &result);
+          if (conversionStatus != napi_ok) {
+            // Never expose an object that a converter only partially built.
+            // Its handles remain scoped for GC/finalizers, while the callback
+            // receives the conventional (error, null) pair exactly once.
+            result = nullValue;
+            if (GetAsyncCallbackError(env, &error) != napi_ok) {
+              return;
+            }
+          }
+        }
+
+        callCallback(error, result);
+      } catch (const std::exception& exception) {
+        if (!callbackStarted) {
+          napi_value error;
+          if (GetNativeExceptionError(env, exception.what(), &error) == napi_ok) {
+            callCallback(error, nullValue);
+          }
+        }
+      } catch (...) {
+        if (!callbackStarted) {
+          napi_value error;
+          if (GetNativeExceptionError(env, "Unknown native exception during async work completion", &error) ==
+              napi_ok) {
+            callCallback(error, nullValue);
+          }
+        }
+      }
     }
 
     ~Worker() {
@@ -652,6 +745,7 @@ napi_status runAsyncKeepAlive(napi_value asyncResourceName,
     napi_ref keepAliveRef = nullptr;
     napi_async_work asyncWork = nullptr;
     rocksdb::Status status = rocksdb::Status::OK();
+    std::exception_ptr executionException;
   };
 
   auto worker = std::unique_ptr<Worker>(new Worker{env, std::forward<T1>(execute), std::forward<T2>(then)});
