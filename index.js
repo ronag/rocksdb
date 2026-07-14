@@ -27,6 +27,14 @@ const { getPackedMode, kRef, kUnref, setPackedResult } = require('./util')
 
 const kEmpty = Object.freeze({})
 
+function isUtf8Encoding (encoding) {
+  return encoding === 'utf8' || encoding === 'utf-8'
+}
+
+function isJavaScriptEncoding (encoding) {
+  return encoding === 'slice' || isUtf8Encoding(encoding)
+}
+
 function prepareRawGetManyOptions (options, packed) {
   if ((typeof options !== 'object' || options === null) && typeof options !== 'function') {
     return { bindingOptions: options ?? kEmpty, valueEncoding: 'buffer' }
@@ -42,18 +50,19 @@ function prepareRawGetManyOptions (options, packed) {
 
   if (packed !== false) {
     const encoding = readValueEncoding()
-    if (encoding !== 'buffer' && encoding !== 'slice') {
-      throw new TypeError('Packed getMany only supports buffer or slice value encoding')
+    if (encoding !== 'buffer' && !isJavaScriptEncoding(encoding)) {
+      throw new TypeError('Packed getMany only supports buffer, slice or utf8 value encoding')
     }
   }
 
-  const bindingOptions = new Proxy(options, {
+  const target = typeof options === 'function' ? function () {} : {}
+  const bindingOptions = new Proxy(target, {
     get (target, property) {
       if (property === 'valueEncoding') {
         const encoding = readValueEncoding()
-        return encoding === 'slice' ? 'buffer' : encoding
+        return isJavaScriptEncoding(encoding) ? 'buffer' : encoding
       }
-      return Reflect.get(target, property, target)
+      return Reflect.get(options, property, options)
     }
   })
 
@@ -66,18 +75,21 @@ function prepareRawGetManyOptions (options, packed) {
 }
 
 function convertRawGetManyResult (result, valueEncoding) {
-  if (valueEncoding !== 'slice') return result
+  if (!isJavaScriptEncoding(valueEncoding)) return result
+
+  const convert = (buffer, start = 0, end = buffer.byteLength) => valueEncoding === 'slice'
+    ? new Slice(buffer, start, end - start)
+    : buffer.toString('utf8', start, end)
 
   if (Array.isArray(result)) {
-    return result.map(value => Buffer.isBuffer(value) ? new Slice(value) : value)
+    return result.map(value => Buffer.isBuffer(value) ? convert(value) : value)
   }
 
   return Array.from(result.statuses, (status, index) => {
     if (status === 1) return undefined
     if (status === 2) return null
 
-    const start = result.offsets[index]
-    return new Slice(result.buffer, start, result.offsets[index + 1] - start)
+    return convert(result.buffer, result.offsets[index], result.offsets[index + 1])
   })
 }
 

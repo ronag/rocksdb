@@ -94,17 +94,22 @@ function emptyPackedResult () {
 }
 
 function isPackedEncoding (encoding) {
-  return encoding === 'buffer' || encoding === 'slice'
+  return encoding === 'buffer' || encoding === 'slice' ||
+    encoding === 'utf8' || encoding === 'utf-8'
+}
+
+function isJavaScriptEncoding (encoding) {
+  return encoding === 'slice' || encoding === 'utf8' || encoding === 'utf-8'
 }
 
 function prepareNativeIteratorOptions (options, keyEncoding, valueEncoding) {
-  if (keyEncoding !== 'slice' && valueEncoding !== 'slice') return options
+  if (!isJavaScriptEncoding(keyEncoding) && !isJavaScriptEncoding(valueEncoding)) return options
 
-  return new Proxy(options, {
+  return new Proxy({}, {
     get (target, property) {
-      if (property === 'keyEncoding' && keyEncoding === 'slice') return 'buffer'
-      if (property === 'valueEncoding' && valueEncoding === 'slice') return 'buffer'
-      return Reflect.get(target, property, target)
+      if (property === 'keyEncoding' && isJavaScriptEncoding(keyEncoding)) return 'buffer'
+      if (property === 'valueEncoding' && isJavaScriptEncoding(valueEncoding)) return 'buffer'
+      return Reflect.get(options, property, options)
     }
   })
 }
@@ -114,19 +119,26 @@ function validatePackedEncodings (iterator, packed) {
 
   if ((iterator[kKeys] && !isPackedEncoding(iterator[kKeyEncoding])) ||
       (iterator[kValues] && !isPackedEncoding(iterator[kValueEncoding]))) {
-    throw new TypeError('Packed iterator only supports buffer or slice key and value encodings')
+    throw new TypeError('Packed iterator only supports buffer, slice or utf8 key and value encodings')
   }
 }
 
 function convertIteratorResult (iterator, result) {
-  const convertKey = iterator[kKeyEncoding] === 'slice'
-  const convertValue = iterator[kValueEncoding] === 'slice'
+  const convertKey = isJavaScriptEncoding(iterator[kKeyEncoding])
+  const convertValue = isJavaScriptEncoding(iterator[kValueEncoding])
   if (!convertKey && !convertValue) return result
+
+  const convertField = (value, encoding) => {
+    if (encoding === 'slice') return value instanceof Slice ? value : new Slice(value)
+    if (typeof value === 'string') return value
+    return value.toString('utf8')
+  }
 
   if ('rows' in result) {
     const rows = result.rows.map((value, index) => {
-      const convert = index % 2 === 0 ? convertKey : convertValue
-      return convert && value !== undefined ? new Slice(value) : value
+      const shouldConvert = index % 2 === 0 ? convertKey : convertValue
+      const encoding = index % 2 === 0 ? iterator[kKeyEncoding] : iterator[kValueEncoding]
+      return shouldConvert && value !== undefined ? convertField(value, encoding) : value
     })
     return { ...result, rows }
   }
@@ -136,9 +148,11 @@ function convertIteratorResult (iterator, result) {
   const read = (encoding) => {
     const start = result.offsets[offsetIndex++]
     const length = result.offsets[offsetIndex] - start
-    return encoding === 'slice'
-      ? new Slice(result.buffer, start, length)
-      : result.buffer.subarray(start, start + length)
+    if (encoding === 'slice') return new Slice(result.buffer, start, length)
+    if (encoding === 'utf8' || encoding === 'utf-8') {
+      return result.buffer.toString('utf8', start, start + length)
+    }
+    return result.buffer.subarray(start, start + length)
   }
 
   for (let index = 0; index < result.count; index++) {
@@ -278,6 +292,7 @@ class Iterator extends AbstractIterator {
               if (err) {
                 callback(err)
               } else {
+                result = convertIteratorResult(this, result)
                 this[kCache] = result.rows
                 this[kFinished] = result.finished
                 this[kPosition] = 0
@@ -293,7 +308,11 @@ class Iterator extends AbstractIterator {
         }
       } else {
         try {
-          const { rows, finished } = binding.iterator_nextv_sync(this[kContext], size, null)
+          const result = convertIteratorResult(
+            this,
+            binding.iterator_nextv_sync(this[kContext], size, null)
+          )
+          const { rows, finished } = result
           this[kCache] = rows
           this[kFinished] = finished
           this[kPosition] = 0

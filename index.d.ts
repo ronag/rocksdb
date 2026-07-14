@@ -43,6 +43,7 @@ export type RocksNativeEncoding = 'buffer' | 'view' | 'utf8' | 'utf-8'
 export type RocksNativeValue = string | Buffer
 export type RocksDecoded<E extends RocksNativeEncoding> = E extends 'utf8' | 'utf-8' ? string : Buffer
 export type RocksRawEncoding = RocksNativeEncoding | 'slice'
+export type RocksJavaScriptEncoding = 'slice' | 'utf8' | 'utf-8'
 export type RocksRawDecoded<E extends RocksRawEncoding> = E extends 'slice'
   ? Slice
   : RocksDecoded<Extract<E, RocksNativeEncoding>>
@@ -315,7 +316,9 @@ export interface RocksRawGetManyOptions<
   E extends RocksRawEncoding = RocksRawEncoding,
   Packed extends RocksPackedReadMode = false
 > extends RocksReadOptions {
-  valueEncoding?: [Packed] extends [false] ? E : E & ('buffer' | 'slice')
+  valueEncoding?: [Packed] extends [false]
+    ? E
+    : E & ('buffer' | RocksJavaScriptEncoding)
   packed?: Packed
 }
 
@@ -403,9 +406,9 @@ export type RocksIteratorReadResult<
   Keys extends boolean,
   Values extends boolean,
   Packed extends RocksPackedReadMode
-> = [KRaw] extends [Slice]
+> = [KRaw] extends [Slice | string]
   ? RocksRawIteratorResult<KRaw, VRaw, Keys, Values, RocksSelectedPacked<Packed>>
-  : [VRaw] extends [Slice]
+  : [VRaw] extends [Slice | string]
     ? RocksRawIteratorResult<KRaw, VRaw, Keys, Values, RocksSelectedPacked<Packed>>
     : Packed extends true
       ? RocksPackedIteratorResult
@@ -416,7 +419,7 @@ export type RocksIteratorReadResult<
 export type RocksGetManyReadResult<
   E extends RocksRawEncoding,
   Packed extends RocksPackedReadMode
-> = E extends 'slice'
+> = E extends RocksJavaScriptEncoding
   ? RocksRawGetManyResult<E, RocksSelectedPacked<Packed>>
   : Packed extends true
     ? RocksPackedGetManyResult

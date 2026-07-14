@@ -101,6 +101,40 @@ test('slice nextv converts unpacked and packed native fields to Slice objects', 
   t.end()
 })
 
+test('utf8 nextv converts unpacked and packed native fields to strings', async function (t) {
+  for (const [name, read] of [
+    ['sync', (iterator, packed) => iterator._nextvSync(2, { packed })],
+    ['async', (iterator, packed) => iterator._nextvAsync(2, { packed })]
+  ]) {
+    for (const packed of [false, true, 'auto']) {
+      const iterator = db._iterator({ keyEncoding: 'utf8', valueEncoding: 'utf8' })
+      const result = await read(iterator, packed)
+
+      t.ok(Array.isArray(result.rows), `${name} ${packed} returns ordinary iterator rows`)
+      t.equal(result.packed, packed !== false, `${name} ${packed} reports the native mode`)
+      t.same(result.rows, ['a', 'one', 'b', 'two'],
+        `${name} ${packed} converts every enabled field to a string`)
+
+      await iterator.close()
+    }
+
+    const aliasIterator = db._iterator({ keyEncoding: 'utf-8', valueEncoding: 'utf-8' })
+    const alias = await read(aliasIterator, true)
+    t.equal(alias.packed, true, `${name} utf-8 alias preserves the packed choice`)
+    t.same(alias.rows, ['a', 'one', 'b', 'two'],
+      `${name} utf-8 alias converts every enabled field to a string`)
+    await aliasIterator.close()
+  }
+
+  const mixed = db._iterator({ keyEncoding: 'buffer', valueEncoding: 'utf8' })
+  const mixedResult = mixed._nextvSync(1, { packed: true })
+  t.ok(Buffer.isBuffer(mixedResult.rows[0]), 'mixed packed rows preserve buffer keys')
+  t.equal(mixedResult.rows[1], 'one', 'mixed packed rows convert utf8 values')
+  await mixed.close()
+
+  t.end()
+})
+
 test('packed nextv supports values-only and no-field iterators', async function (t) {
   const values = db._iterator({ keys: false, values: true, valueEncoding: 'buffer' })
   const valuesResult = await values._nextvAsync(10, { packed: true })
@@ -178,6 +212,32 @@ test('auto nextv packs values up to the 8 KiB threshold', async function (t) {
     t.ok(largeSlices.rows.every(value => value instanceof Slice),
       `${name} converts unpacked buffers to slices`)
     await largeSliceIterator.close()
+
+    const smallUtf8Iterator = autoDb._iterator({
+      gte: Buffer.from('small'),
+      lte: Buffer.from('small'),
+      keyEncoding: 'utf8',
+      valueEncoding: 'utf8'
+    })
+    const smallStrings = await read(smallUtf8Iterator)
+    t.equal(smallStrings.packed, true, `${name} utf8 rows preserve the packed choice`)
+    t.equal(smallStrings.rows[0], 'small', `${name} converts a packed key to a string`)
+    t.equal(smallStrings.rows[1].length, 8 * 1024,
+      `${name} converts a packed value to a string`)
+    await smallUtf8Iterator.close()
+
+    const largeUtf8Iterator = autoDb._iterator({
+      gte: Buffer.from('large'),
+      lte: Buffer.from('large'),
+      keyEncoding: 'utf8',
+      valueEncoding: 'utf8'
+    })
+    const largeStrings = await read(largeUtf8Iterator)
+    t.equal(largeStrings.packed, false, `${name} utf8 rows preserve the unpacked choice`)
+    t.equal(largeStrings.rows[0], 'large', `${name} converts an unpacked key to a string`)
+    t.equal(largeStrings.rows[1].length, 8 * 1024 + 1,
+      `${name} converts an unpacked value to a string`)
+    await largeUtf8Iterator.close()
   }
 
   await autoDb.close()
@@ -215,6 +275,20 @@ test('packed option does not change public iterator nextv results', async functi
   t.end()
 })
 
+test('packed UTF8 conversion does not change public iterator results', async function (t) {
+  for (const packed of [true, 'auto']) {
+    const iterator = db.iterator({ keyEncoding: 'utf8', valueEncoding: 'utf8' })
+    t.same(await iterator.nextv(1, { packed }), [['a', 'one']],
+      `public nextv returns decoded strings for ${packed}`)
+    await iterator.close()
+  }
+
+  const iterator = db.iterator({ keyEncoding: 'utf8', valueEncoding: 'utf8' })
+  t.same(await iterator.next(), ['a', 'one'], 'public next returns decoded strings')
+  await iterator.close()
+  t.end()
+})
+
 test('packed nextv rejects prefetched rows instead of changing their encoding', async function (t) {
   const iterator = db.iterator({ keyEncoding: 'buffer', valueEncoding: 'buffer' })
   await iterator.next()
@@ -234,19 +308,19 @@ test('packed nextv rejects prefetched rows instead of changing their encoding', 
   t.end()
 })
 
-test('packed nextv rejects decoded iterator encodings', async function (t) {
-  const expected = 'Packed iterator only supports buffer or slice key and value encodings'
+test('packed nextv rejects unsupported iterator encodings', async function (t) {
+  const expected = 'Packed iterator only supports buffer, slice or utf8 key and value encodings'
 
   for (const packed of [true, 'auto']) {
     for (const [name, options] of [
-      ['key', { keyEncoding: 'utf8', valueEncoding: 'buffer' }],
-      ['value', { keyEncoding: 'buffer', valueEncoding: 'utf8' }]
+      ['key', { keyEncoding: 'view', valueEncoding: 'buffer' }],
+      ['value', { keyEncoding: 'buffer', valueEncoding: 'view' }]
     ]) {
       const sync = db._iterator(options)
       t.throws(
         () => sync._nextvSync(1, { packed }),
         (err) => err instanceof TypeError && err.message === expected,
-        `sync rejects the decoded ${name} encoding for ${packed}`
+        `sync rejects the unsupported ${name} encoding for ${packed}`
       )
       await sync.close()
 
@@ -256,17 +330,17 @@ test('packed nextv rejects decoded iterator encodings', async function (t) {
         (err) => err
       )
       t.ok(err instanceof TypeError && err.message === expected,
-        `async rejects the decoded ${name} encoding for ${packed}`)
+        `async rejects the unsupported ${name} encoding for ${packed}`)
       await async.close()
     }
   }
 
-  const values = db._iterator({ keys: false, keyEncoding: 'utf8', valueEncoding: 'buffer' })
+  const values = db._iterator({ keys: false, keyEncoding: 'view', valueEncoding: 'buffer' })
   t.equal((await values._nextvAsync(1, { packed: true })).packed, true,
     'a disabled key field does not constrain its encoding')
   await values.close()
 
-  const keys = db._iterator({ values: false, keyEncoding: 'buffer', valueEncoding: 'utf8' })
+  const keys = db._iterator({ values: false, keyEncoding: 'buffer', valueEncoding: 'view' })
   t.equal(keys._nextvSync(1, { packed: true }).packed, true,
     'a disabled value field does not constrain its encoding')
   await keys.close()

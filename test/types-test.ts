@@ -109,12 +109,20 @@ expectType<RocksRawGetManyResult<'slice', boolean>>(
 expectType<RocksRawGetManyResult<'slice'>>(
   db._getManySync([slice], { valueEncoding: 'slice' })
 )
-// @ts-expect-error Packed getMany only supports buffer or slice output
-db._getManySync([slice], { packed: true, valueEncoding: 'utf8' })
-// @ts-expect-error Auto-packed getMany only supports buffer or slice output
-db._getManySync([slice], { packed: 'auto', valueEncoding: 'utf8' })
-// @ts-expect-error A runtime boolean can select packed output and therefore requires buffers
-db._getManySync([slice], { packed: booleanFlag, valueEncoding: 'utf8' })
+expectType<RocksRawGetManyResult<'utf8', true>>(
+  db._getManySync([slice], { packed: true, valueEncoding: 'utf8' })
+)
+expectType<RocksRawGetManyResult<'utf8', boolean>>(
+  db._getManySync([slice], { packed: 'auto', valueEncoding: 'utf8' })
+)
+expectType<RocksRawGetManyResult<'utf-8', true>>(
+  db._getManySync([slice], { packed: true, valueEncoding: 'utf-8' })
+)
+expectType<RocksRawGetManyResult<'utf8', boolean>>(
+  db._getManySync([slice], { packed: booleanFlag, valueEncoding: 'utf8' })
+)
+// @ts-expect-error Packed getMany does not support view output
+db._getManySync([slice], { packed: true, valueEncoding: 'view' })
 
 const boundedValues = db.getMany(['key'], { highWaterMarkBytes: 0 })
 expectTrue<Equal<
@@ -198,6 +206,19 @@ expectType<Promise<RocksRawIteratorResult<Slice, Slice, true, true, boolean>>>(
 const mixedSliceIterator = db._iterator({ keyEncoding: 'buffer', valueEncoding: 'slice' })
 expectType<RocksRawIteratorResult<Buffer, Slice, true, true, true>>(
   mixedSliceIterator._nextvSync(10, { packed: true })
+)
+
+const utf8Iterator = db._iterator({ keyEncoding: 'utf8', valueEncoding: 'utf8' })
+expectType<RocksRawIteratorResult<string, string, true, true, true>>(
+  utf8Iterator._nextvSync(10, { packed: true })
+)
+expectType<Promise<RocksRawIteratorResult<string, string, true, true, boolean>>>(
+  utf8Iterator._nextvAsync(10, { packed: 'auto' })
+)
+
+const mixedUtf8Iterator = db._iterator({ keyEncoding: 'buffer', valueEncoding: 'utf8' })
+expectType<RocksRawIteratorResult<Buffer, string, true, true, true>>(
+  mixedUtf8Iterator._nextvSync(10, { packed: true })
 )
 
 const publicValuesOnlyIterator = db.iterator({ keys: false, values: true })

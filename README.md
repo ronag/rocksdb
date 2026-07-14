@@ -6,8 +6,8 @@ A low-level RocksDB binding for Node.js 26 and later.
 
 The raw `_nextvSync()`, `_nextvAsync()`, `_getManySync()` and
 `_getManyAsync()` methods accept `{ packed: true | false | 'auto' }`. Packed
-reads return one byte arena and typed-array metadata instead of allocating a
-JavaScript buffer for every key or value.
+buffer reads return one byte arena and typed-array metadata instead of
+allocating a JavaScript buffer for every key or value.
 
 With `packed: 'auto'`, reads use the packed representation for values up to 8
 KiB and the unpacked representation for larger values. `getMany` selects based
@@ -18,7 +18,7 @@ Every raw result exposes a `packed: boolean` discriminator. Async callbacks
 also receive the selected mode as their third argument:
 
 ```js
-db._getManyAsync(keys, { packed: 'auto' }, (err, result, packed) => {
+db._getManyAsync(keys, { packed: 'auto', valueEncoding: 'buffer' }, (err, result, packed) => {
   if (err) throw err
   if (packed) consumePacked(result)
   else consumeValues(result)
@@ -32,11 +32,10 @@ Packed `getMany` results contain:
 - `statuses`: one status per key (`0` value, `1` not found, `2` incomplete)
 - `count`: number of requested keys
 
-The raw methods additionally support `valueEncoding: 'slice'` for `getMany`
-and `keyEncoding: 'slice'` / `valueEncoding: 'slice'` for iterators. This
-encoding is intentionally not part of the AbstractLevel encoding manifest.
-It is only available through `_getManySync()`, `_getManyAsync()`,
-`_nextvSync()` and `_nextvAsync()`.
+The raw methods additionally support JavaScript conversion for `slice`, `utf8`
+and its `utf-8` alias. This behavior is intentionally not added to the
+AbstractLevel encoding manifest. It is only exposed by `_getManySync()`,
+`_getManyAsync()`, `_nextvSync()` and `_nextvAsync()`.
 
 A slice-encoded `getMany` result is always an ordinary value array containing
 `@nxtedition/slice` `Slice` objects. A slice-encoded iterator result always has
@@ -45,9 +44,14 @@ packed, those objects are zero-copy views of its shared byte arena. The
 `packed` discriminator and async callback flag continue to report which native
 representation was selected.
 
-Both `packed: true` and `packed: 'auto'` require `buffer` or `slice` for every
-enabled raw field. Other encodings throw. Buffer-encoded packed reads preserve
-the arena result described above.
+UTF8-encoded raw results have the same ordinary array or `rows` shapes, with
+their enabled fields converted to strings in JavaScript. The `packed`
+discriminator still reports the native representation selected before that
+conversion.
+
+Both `packed: true` and `packed: 'auto'` require `buffer`, `slice`, `utf8` or
+`utf-8` for every enabled raw field. Other encodings throw. Buffer-encoded
+packed reads preserve the arena result described above.
 
 ## Packed `getMany` benchmark
 

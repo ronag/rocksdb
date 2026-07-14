@@ -59,28 +59,68 @@ test('packed option does not change public get or getMany result shapes', async 
   t.end()
 })
 
-test('packed raw getMany rejects decoded value encodings', async function (t) {
+test('packed raw getMany rejects unsupported value encodings', async function (t) {
   const db = testCommon.factory({ keyEncoding: 'buffer', valueEncoding: 'buffer' })
   await db.open()
 
-  const expected = 'Packed getMany only supports buffer or slice value encoding'
+  const expected = 'Packed getMany only supports buffer, slice or utf8 value encoding'
   for (const packed of [true, 'auto']) {
     let syncError
     try {
-      db._getManySync([Buffer.from('a')], { packed, valueEncoding: 'utf8' })
+      db._getManySync([Buffer.from('a')], { packed, valueEncoding: 'view' })
     } catch (err) {
       syncError = err
     }
 
     const asyncError = await db._getManyAsync(
       [Buffer.from('a')],
-      { packed, valueEncoding: 'utf8' }
+      { packed, valueEncoding: 'view' }
     ).then(() => null, (err) => err)
 
     t.ok(syncError instanceof TypeError, `sync rejects the incompatible encoding for ${packed}`)
     t.equal(syncError.message, expected)
     t.ok(asyncError instanceof TypeError, `async rejects the incompatible encoding for ${packed}`)
     t.equal(asyncError.message, expected)
+  }
+
+  await db.close()
+  t.end()
+})
+
+test('utf8 getMany converts unpacked and packed native values to strings', async function (t) {
+  const db = testCommon.factory({ keyEncoding: 'buffer', valueEncoding: 'buffer' })
+  await db.open()
+  await db.batch([
+    { type: 'put', key: 'a', value: Buffer.from('one') },
+    { type: 'put', key: 'empty', value: Buffer.alloc(0) },
+    { type: 'put', key: 'large', value: Buffer.alloc(8 * 1024 + 1, 0x78) }
+  ])
+
+  for (const [name, read] of [
+    ['sync', (packed, keys = ['a', 'missing', 'empty'], valueEncoding = 'utf8') => db._getManySync(keys, {
+      packed,
+      valueEncoding
+    })],
+    ['async', (packed, keys = ['a', 'missing', 'empty'], valueEncoding = 'utf8') => db._getManyAsync(keys, {
+      packed,
+      valueEncoding
+    })]
+  ]) {
+    for (const packed of [false, true, 'auto']) {
+      const result = await read(packed)
+      t.ok(Array.isArray(result), `${name} ${packed} returns the ordinary getMany shape`)
+      t.equal(result.packed, packed !== false, `${name} ${packed} reports the native mode`)
+      t.same(result, ['one', undefined, ''], `${name} ${packed} converts values to strings`)
+    }
+
+    const large = await read('auto', ['large'])
+    t.equal(large.packed, false, `${name} auto preserves the native unpacked choice`)
+    t.equal(typeof large[0], 'string', `${name} auto converts an unpacked value to a string`)
+    t.equal(large[0].length, 8 * 1024 + 1, `${name} auto preserves the large value`)
+
+    const alias = await read(true, ['a'], 'utf-8')
+    t.equal(alias.packed, true, `${name} utf-8 alias preserves the packed choice`)
+    t.same(alias, ['one'], `${name} utf-8 alias converts the value to a string`)
   }
 
   await db.close()
