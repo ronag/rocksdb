@@ -69,6 +69,44 @@ function verifyCheckout (dependency, src) {
   }
 }
 
+function supportsSha1ObjectFormat (version) {
+  const match = /^git version (\d+)\.(\d+)/.exec(version)
+  if (!match) return false
+
+  const major = Number(match[1])
+  const minor = Number(match[2])
+  return major > 2 || (major === 2 && minor >= 27)
+}
+
+function createSha1ObjectFormatCheck (getVersion) {
+  let verified = false
+
+  return function ensureSha1ObjectFormatSupport () {
+    if (verified) return
+
+    let version
+    try {
+      version = getVersion()
+    } catch (err) {
+      const detail = err instanceof Error ? err.message : String(err)
+      throw new Error(
+        `rocks-level: Git 2.27 or newer is required to verify native dependency commits: ${detail}`,
+        { cause: err }
+      )
+    }
+
+    if (!supportsSha1ObjectFormat(version)) {
+      throw new Error(
+        `rocks-level: Git 2.27 or newer is required for --object-format=sha1 (found: ${version})`
+      )
+    }
+
+    verified = true
+  }
+}
+
+const ensureSha1ObjectFormatSupport = createSha1ObjectFormatCheck(() => gitOutput(['--version']))
+
 // Fetch the immutable object ID directly rather than resolving a mutable tag
 // or branch. Verify the detached checkout before any upstream build script is
 // allowed to run, and remove partial source state on every failure.
@@ -79,6 +117,8 @@ function cloneAtCommit (dependency, src) {
         `rocks-level: dependency commit must be a full lowercase SHA-1: ${dependency.commit}`
       )
     }
+
+    ensureSha1ObjectFormatSupport()
 
     // GitHub's pinned object IDs use SHA-1. Explicitly choose the repository
     // format so a user's GIT_DEFAULT_HASH or init.defaultObjectFormat setting
@@ -309,8 +349,10 @@ if (require.main === module) {
 module.exports = {
   DEPENDENCIES,
   cloneAtCommit,
+  createSha1ObjectFormatCheck,
   ensure,
   jobs,
   stampMatches,
+  supportsSha1ObjectFormat,
   verifyCheckout
 }

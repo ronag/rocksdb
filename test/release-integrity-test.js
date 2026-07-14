@@ -8,7 +8,9 @@ const test = require('tape')
 const {
   DEPENDENCIES,
   cloneAtCommit,
+  createSha1ObjectFormatCheck,
   stampMatches,
+  supportsSha1ObjectFormat,
   verifyCheckout
 } = require('../scripts/build-deps.js')
 
@@ -34,6 +36,41 @@ test('native dependencies use exact audited upstream commits', function (t) {
   for (const dependency of Object.values(DEPENDENCIES)) {
     t.match(dependency.commit, /^[0-9a-f]{40}$/, 'pin is a full lowercase SHA-1')
   }
+  t.end()
+})
+
+test('dependency checkout requires Git object-format support', function (t) {
+  t.notOk(supportsSha1ObjectFormat('git version 2.26.3'), 'Git 2.26 is rejected')
+  t.ok(supportsSha1ObjectFormat('git version 2.27.0'), 'Git 2.27 is accepted')
+  t.ok(supportsSha1ObjectFormat('git version 3.0.0'), 'future major versions are accepted')
+  t.notOk(supportsSha1ObjectFormat('unknown'), 'unparseable versions fail closed')
+  t.end()
+})
+
+test('Git object-format preflight memoizes success and preserves failure detail', function (t) {
+  let calls = 0
+  const ensureSupport = createSha1ObjectFormatCheck(() => {
+    ++calls
+    return 'git version 2.27.0'
+  })
+
+  ensureSupport()
+  ensureSupport()
+  t.equal(calls, 1, 'successful Git version detection runs once')
+
+  const cause = new Error('spawnSync git ENOENT')
+  const fail = createSha1ObjectFormatCheck(() => {
+    throw cause
+  })
+
+  try {
+    fail()
+    t.fail('missing Git rejects the preflight')
+  } catch (err) {
+    t.equal(err.cause, cause, 'the original failure is retained as the cause')
+    t.match(err.message, /spawnSync git ENOENT/, 'the visible message contains the spawn failure')
+  }
+
   t.end()
 })
 
