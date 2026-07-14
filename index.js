@@ -35,9 +35,17 @@ function isJavaScriptEncoding (encoding) {
   return encoding === 'slice' || isUtf8Encoding(encoding)
 }
 
+function getDefaultPackedMode (encoding) {
+  return encoding === 'buffer' || encoding === 'slice' ? 'auto' : false
+}
+
 function prepareRawGetManyOptions (options, packed) {
   if ((typeof options !== 'object' || options === null) && typeof options !== 'function') {
-    return { bindingOptions: options ?? kEmpty, valueEncoding: 'buffer' }
+    return {
+      bindingOptions: options ?? kEmpty,
+      packed: packed ?? getPackedMode(options, 'auto'),
+      valueEncoding: 'buffer'
+    }
   }
 
   let valueEncoding
@@ -46,6 +54,10 @@ function prepareRawGetManyOptions (options, packed) {
       valueEncoding = Reflect.get(options, 'valueEncoding', options) ?? 'buffer'
     }
     return valueEncoding
+  }
+
+  if (packed == null) {
+    packed = getPackedMode(options, () => getDefaultPackedMode(readValueEncoding()))
   }
 
   if (packed !== false) {
@@ -70,6 +82,7 @@ function prepareRawGetManyOptions (options, packed) {
 
   return {
     bindingOptions,
+    packed,
     get valueEncoding () {
       return readValueEncoding()
     }
@@ -320,8 +333,8 @@ class RocksLevel extends AbstractLevel {
       }
       this[kRef]()
       referenced = true
-      if (packed == null) packed = getPackedMode(bindingOptions)
       const prepared = prepareRawGetManyOptions(bindingOptions, packed)
+      packed = prepared.packed
       bindingOptions = prepared.bindingOptions
       const getMany = packed === true
         ? binding.db_get_many_packed
@@ -416,8 +429,8 @@ class RocksLevel extends AbstractLevel {
 
     this[kRef]()
     try {
-      const packed = getPackedMode(options)
-      const prepared = prepareRawGetManyOptions(options, packed)
+      const prepared = prepareRawGetManyOptions(options)
+      const packed = prepared.packed
       const getMany = packed === true
         ? binding.db_get_many_packed_sync
         : packed === 'auto'

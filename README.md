@@ -5,8 +5,11 @@ A low-level RocksDB binding for Node.js 26 and later.
 ## Packed raw reads
 
 The raw `_nextvSync()`, `_nextvAsync()`, `_getManySync()` and
-`_getManyAsync()` methods accept `{ packed: true | false | 'auto' }`. Packed
-buffer reads return one byte arena and typed-array metadata instead of
+`_getManyAsync()` methods accept `{ packed: true | false | 'auto' }`. Omitted
+`packed` defaults to `'auto'` when every enabled raw encoding is `buffer` or
+`slice`; other encodings default to `false`. Explicit `'auto'` remains
+available for UTF8. Use `packed: false` to always request individual values.
+Packed buffer reads return one byte arena and typed-array metadata instead of
 allocating a JavaScript buffer for every key or value.
 
 With `packed: 'auto'`, reads use the packed representation for values up to 8
@@ -18,7 +21,7 @@ Every raw result exposes a `packed: boolean` discriminator. Async callbacks
 also receive the selected mode as their third argument:
 
 ```js
-db._getManyAsync(keys, { packed: 'auto', valueEncoding: 'buffer' }, (err, result, packed) => {
+db._getManyAsync(keys, { valueEncoding: 'buffer' }, (err, result, packed) => {
   if (err) throw err
   if (packed) consumePacked(result)
   else consumeValues(result)

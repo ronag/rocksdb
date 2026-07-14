@@ -106,10 +106,11 @@ test('utf8 getMany converts unpacked and packed native values to strings', async
       valueEncoding
     })]
   ]) {
-    for (const packed of [false, true, 'auto']) {
+    for (const packed of [undefined, false, true, 'auto']) {
       const result = await read(packed)
       t.ok(Array.isArray(result), `${name} ${packed} returns the ordinary getMany shape`)
-      t.equal(result.packed, packed !== false, `${name} ${packed} reports the native mode`)
+      t.equal(result.packed, packed === true || packed === 'auto',
+        `${name} ${packed} reports the native mode`)
       t.same(result, ['one', undefined, ''], `${name} ${packed} converts values to strings`)
     }
 
@@ -146,7 +147,7 @@ test('slice getMany converts unpacked and packed native values to Slice objects'
       valueEncoding: 'slice'
     })]
   ]) {
-    for (const packed of [false, true, 'auto']) {
+    for (const packed of [undefined, false, true, 'auto']) {
       const result = await read(packed)
       t.ok(Array.isArray(result), `${name} ${packed} returns the ordinary getMany shape`)
       t.equal(result.packed, packed !== false, `${name} ${packed} reports the native mode`)
@@ -192,7 +193,7 @@ test('raw getMany rejects invalid packed modes', async function (t) {
   t.end()
 })
 
-test('auto getMany packs values up to the 8 KiB average threshold', async function (t) {
+test('getMany defaults to auto packing at the 8 KiB average threshold', async function (t) {
   const db = testCommon.factory({ keyEncoding: 'buffer', valueEncoding: 'buffer' })
   await db.open()
   await db.batch([
@@ -201,8 +202,8 @@ test('auto getMany packs values up to the 8 KiB average threshold', async functi
   ])
 
   for (const [name, read] of [
-    ['sync', (keys) => db._getManySync(keys, { packed: 'auto' })],
-    ['async', (keys) => db._getManyAsync(keys, { packed: 'auto' })]
+    ['sync', (keys) => db._getManySync(keys)],
+    ['async', (keys) => db._getManyAsync(keys)]
   ]) {
     const small = await read(['small'])
     const large = await read(['large'])

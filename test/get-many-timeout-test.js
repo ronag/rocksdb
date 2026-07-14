@@ -28,7 +28,7 @@ test('getMany with a tight timeout never returns garbage and never throws', asyn
   // 1ms over 4000 large values may or may not complete; assert the shape holds
   // regardless: length matches, and each entry is a found value or null
   // (timed-out), never undefined (all keys exist) and never a crash.
-  const rows = db._getManySync(keys, { timeout: 1 })
+  const rows = db._getManySync(keys, { packed: false, timeout: 1 })
   t.equal(rows.length, keys.length, 'returns one slot per key')
   let bad = 0
   for (const r of rows) {

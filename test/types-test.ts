@@ -72,8 +72,10 @@ expectType<number>(statistics.getStatistics().bytesRead)
 expectType<true>(statistics.setStatisticsEnabled(false))
 
 const rawValues = db._getManySync([slice, Buffer.from('key'), 'key'])
-expectType<RocksRawGetManyResult<'buffer'>>(rawValues)
-expectType<Promise<RocksRawGetManyResult<'buffer'>>>(db._getManyAsync([slice]))
+expectType<RocksPackedGetManyResult | RocksRawGetManyResult<'buffer'>>(rawValues)
+expectType<Promise<RocksPackedGetManyResult | RocksRawGetManyResult<'buffer'>>>(
+  db._getManyAsync([slice])
+)
 expectType<RocksRawGetManyResult<'utf8'>>(
   db._getManySync([slice], { valueEncoding: 'utf8' })
 )
@@ -106,7 +108,7 @@ expectType<RocksRawGetManyResult<'slice', true>>(
 expectType<RocksRawGetManyResult<'slice', boolean>>(
   db._getManySync([slice], { packed: 'auto', valueEncoding: 'slice' })
 )
-expectType<RocksRawGetManyResult<'slice'>>(
+expectType<RocksRawGetManyResult<'slice', boolean>>(
   db._getManySync([slice], { valueEncoding: 'slice' })
 )
 expectType<RocksRawGetManyResult<'utf8', true>>(
@@ -170,7 +172,7 @@ expectType<Promise<void>>(db.compactRange({ start: slice, end: Buffer.from('z') 
 const iterator = db._iterator({ gte: slice, valueEncoding: 'buffer' })
 iterator._seekSync(slice)
 expectType<Promise<void>>(iterator._seekAsync(slice))
-expectType<Promise<RocksRawIteratorResult<Buffer, Buffer>>>(
+expectType<Promise<RocksPackedIteratorResult | RocksRawIteratorResult<Buffer, Buffer>>>(
   iterator._nextvAsync(10)
 )
 expectType<RocksPackedIteratorResult>(iterator._nextvSync(10, { packed: true }))
@@ -193,7 +195,7 @@ iterator._nextvAsync(10, { packed: 'auto' }, (err, result, packed) => {
 expectType<Promise<void>>(iterator[Symbol.asyncDispose]())
 
 const sliceIterator = db._iterator({ keyEncoding: 'slice', valueEncoding: 'slice' })
-expectType<RocksRawIteratorResult<Slice, Slice>>(
+expectType<RocksRawIteratorResult<Slice, Slice, true, true, boolean>>(
   sliceIterator._nextvSync(10)
 )
 expectType<RocksRawIteratorResult<Slice, Slice, true, true, true>>(
@@ -204,11 +206,17 @@ expectType<Promise<RocksRawIteratorResult<Slice, Slice, true, true, boolean>>>(
 )
 
 const mixedSliceIterator = db._iterator({ keyEncoding: 'buffer', valueEncoding: 'slice' })
+expectType<RocksRawIteratorResult<Buffer, Slice, true, true, boolean>>(
+  mixedSliceIterator._nextvSync(10)
+)
 expectType<RocksRawIteratorResult<Buffer, Slice, true, true, true>>(
   mixedSliceIterator._nextvSync(10, { packed: true })
 )
 
 const utf8Iterator = db._iterator({ keyEncoding: 'utf8', valueEncoding: 'utf8' })
+expectType<RocksRawIteratorResult<string, string>>(
+  utf8Iterator._nextvSync(10)
+)
 expectType<RocksRawIteratorResult<string, string, true, true, true>>(
   utf8Iterator._nextvSync(10, { packed: true })
 )
@@ -217,6 +225,9 @@ expectType<Promise<RocksRawIteratorResult<string, string, true, true, boolean>>>
 )
 
 const mixedUtf8Iterator = db._iterator({ keyEncoding: 'buffer', valueEncoding: 'utf8' })
+expectType<RocksRawIteratorResult<Buffer, string>>(
+  mixedUtf8Iterator._nextvSync(10)
+)
 expectType<RocksRawIteratorResult<Buffer, string, true, true, true>>(
   mixedUtf8Iterator._nextvSync(10, { packed: true })
 )
@@ -249,7 +260,7 @@ publicValuesOnlyIterator.next((err, key, value) => {
 })
 
 const publicHexIterator = db.iterator({ valueEncoding: 'hex' })
-const publicHexRows = publicHexIterator._nextvAsync(10)
+const publicHexRows = publicHexIterator._nextvAsync(10, { packed: false })
 expectTrue<Equal<
   Awaited<typeof publicHexRows>['rows'],
   Array<string | Buffer>
@@ -284,7 +295,7 @@ const valuesOnlyIterator = db._iterator({
   keyEncoding: 'utf8',
   valueEncoding: 'buffer'
 })
-expectType<Promise<RocksRawIteratorResult<string, Buffer, false, true>>>(
+expectType<Promise<RocksRawIteratorResult<string, Buffer, false, true, boolean>>>(
   valuesOnlyIterator._nextvAsync(10)
 )
 

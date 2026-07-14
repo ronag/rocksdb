@@ -73,7 +73,7 @@ test('slice nextv converts unpacked and packed native fields to Slice objects', 
     ['sync', (iterator, packed) => iterator._nextvSync(2, { packed })],
     ['async', (iterator, packed) => iterator._nextvAsync(2, { packed })]
   ]) {
-    for (const packed of [false, true, 'auto']) {
+    for (const packed of [undefined, false, true, 'auto']) {
       const iterator = db._iterator({ keyEncoding: 'slice', valueEncoding: 'slice' })
       const result = await read(iterator, packed)
 
@@ -106,12 +106,13 @@ test('utf8 nextv converts unpacked and packed native fields to strings', async f
     ['sync', (iterator, packed) => iterator._nextvSync(2, { packed })],
     ['async', (iterator, packed) => iterator._nextvAsync(2, { packed })]
   ]) {
-    for (const packed of [false, true, 'auto']) {
+    for (const packed of [undefined, false, true, 'auto']) {
       const iterator = db._iterator({ keyEncoding: 'utf8', valueEncoding: 'utf8' })
       const result = await read(iterator, packed)
 
       t.ok(Array.isArray(result.rows), `${name} ${packed} returns ordinary iterator rows`)
-      t.equal(result.packed, packed !== false, `${name} ${packed} reports the native mode`)
+      t.equal(result.packed, packed === true || packed === 'auto',
+        `${name} ${packed} reports the native mode`)
       t.same(result.rows, ['a', 'one', 'b', 'two'],
         `${name} ${packed} converts every enabled field to a string`)
 
@@ -132,6 +133,14 @@ test('utf8 nextv converts unpacked and packed native fields to strings', async f
   t.equal(mixedResult.rows[1], 'one', 'mixed packed rows convert utf8 values')
   await mixed.close()
 
+  const mixedDefault = db._iterator({ keyEncoding: 'buffer', valueEncoding: 'utf8' })
+  const mixedDefaultResult = mixedDefault._nextvSync(1)
+  t.equal(mixedDefaultResult.packed, false,
+    'an enabled utf8 field defaults mixed rows to unpacked')
+  t.equal(mixedDefaultResult.rows[1], 'one',
+    'the default mixed result still converts utf8 values')
+  await mixedDefault.close()
+
   t.end()
 })
 
@@ -144,6 +153,17 @@ test('packed nextv supports values-only and no-field iterators', async function 
     'values are packed without placeholder fields')
   await values.close()
 
+  const defaultValues = db._iterator({
+    keys: false,
+    values: true,
+    keyEncoding: 'utf8',
+    valueEncoding: 'buffer'
+  })
+  const defaultValuesResult = await defaultValues._nextvAsync(1)
+  t.equal(defaultValuesResult.packed, true,
+    'a disabled utf8 field does not prevent default auto packing')
+  await defaultValues.close()
+
   const none = db._iterator({ keys: false, values: false })
   const noneResult = await none._nextvAsync(10, { packed: true })
   t.equal(noneResult.count, 3, 'no-field iterator retains logical row count')
@@ -153,7 +173,7 @@ test('packed nextv supports values-only and no-field iterators', async function 
   t.end()
 })
 
-test('auto nextv packs values up to the 8 KiB threshold', async function (t) {
+test('nextv defaults to auto packing at the 8 KiB threshold', async function (t) {
   const autoDb = testCommon.factory({ keyEncoding: 'buffer', valueEncoding: 'buffer' })
   await autoDb.open()
   await autoDb.batch([
@@ -162,8 +182,8 @@ test('auto nextv packs values up to the 8 KiB threshold', async function (t) {
   ])
 
   for (const [name, read] of [
-    ['sync', (iterator) => iterator._nextvSync(1, { packed: 'auto' })],
-    ['async', (iterator) => iterator._nextvAsync(1, { packed: 'auto' })]
+    ['sync', (iterator) => iterator._nextvSync(1)],
+    ['async', (iterator) => iterator._nextvAsync(1)]
   ]) {
     const smallIterator = autoDb._iterator({
       gte: Buffer.from('small'),
@@ -220,10 +240,10 @@ test('auto nextv packs values up to the 8 KiB threshold', async function (t) {
       valueEncoding: 'utf8'
     })
     const smallStrings = await read(smallUtf8Iterator)
-    t.equal(smallStrings.packed, true, `${name} utf8 rows preserve the packed choice`)
-    t.equal(smallStrings.rows[0], 'small', `${name} converts a packed key to a string`)
+    t.equal(smallStrings.packed, false, `${name} defaults utf8 rows to unpacked`)
+    t.equal(smallStrings.rows[0], 'small', `${name} converts an unpacked key to a string`)
     t.equal(smallStrings.rows[1].length, 8 * 1024,
-      `${name} converts a packed value to a string`)
+      `${name} converts an unpacked value to a string`)
     await smallUtf8Iterator.close()
 
     const largeUtf8Iterator = autoDb._iterator({

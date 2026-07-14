@@ -102,6 +102,15 @@ function isJavaScriptEncoding (encoding) {
   return encoding === 'slice' || encoding === 'utf8' || encoding === 'utf-8'
 }
 
+function getDefaultPackedMode (iterator) {
+  if ((iterator[kKeys] && iterator[kKeyEncoding] !== 'buffer' && iterator[kKeyEncoding] !== 'slice') ||
+      (iterator[kValues] && iterator[kValueEncoding] !== 'buffer' && iterator[kValueEncoding] !== 'slice')) {
+    return false
+  }
+
+  return 'auto'
+}
+
 function prepareNativeIteratorOptions (options, keyEncoding, valueEncoding) {
   if (!isJavaScriptEncoding(keyEncoding) && !isJavaScriptEncoding(valueEncoding)) return options
 
@@ -353,7 +362,7 @@ class Iterator extends AbstractIterator {
 
     if (options?.[kNoFieldsNext] === true) {
       if (this[kPosition] < this[kCache].length || this[kFinished]) {
-        this._nextvAsync(size, null, done)
+        this._nextvAsync(size, null, done, false)
       } else {
         const prefetch = this[kFirst] ? 1 : 1000
         this[kFirst] = false
@@ -365,7 +374,7 @@ class Iterator extends AbstractIterator {
           this[kFinished] = result.finished
           this[kPosition] = 0
           done(null, this._nextvCached(size))
-        })
+        }, false)
       }
 
       return callback[kPromise]
@@ -501,7 +510,7 @@ class Iterator extends AbstractIterator {
     try {
       this[kDB][kRef]()
       referenced = true
-      const packed = getPackedMode(options)
+      const packed = getPackedMode(options, getDefaultPackedMode(this))
       validatePackedEncodings(this, packed)
 
       if (this[kPosition] < this[kCache].length) {
@@ -542,7 +551,7 @@ class Iterator extends AbstractIterator {
       this[kDB][kRef]()
       referenced = true
       this[kBusy] = true
-      if (packed == null) packed = getPackedMode(options)
+      if (packed == null) packed = getPackedMode(options, getDefaultPackedMode(this))
       validatePackedEncodings(this, packed)
 
       if (this[kPosition] < this[kCache].length) {

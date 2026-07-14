@@ -30,7 +30,10 @@ test('async getMany always snapshots Buffer and SliceLike keys before queueing',
       ])
       let blocker = occupyWorker()
       const bufferKey = Buffer.from('a')
-      let pending = db._getManyAsync([bufferKey], { valueEncoding: 'buffer' })
+      let pending = db._getManyAsync([bufferKey], {
+        valueEncoding: 'buffer',
+        packed: false
+      })
       bufferKey[0] = 0x62
       assert.equal((await pending)[0].toString(), 'value-a')
       await blocker
@@ -38,7 +41,10 @@ test('async getMany always snapshots Buffer and SliceLike keys before queueing',
       blocker = occupyWorker()
       const backing = Buffer.from('xa')
       const sliceKey = { buffer: backing, byteOffset: 1, byteLength: 1 }
-      pending = db._getManyAsync([sliceKey], { valueEncoding: 'buffer' })
+      pending = db._getManyAsync([sliceKey], {
+        valueEncoding: 'buffer',
+        packed: false
+      })
       sliceKey.buffer = Buffer.from('xb')
       backing[1] = 0x62
       assert.equal((await pending)[0].toString(), 'value-a')
@@ -48,6 +54,7 @@ test('async getMany always snapshots Buffer and SliceLike keys before queueing',
       const unsafeKey = Buffer.from('a')
       pending = db._getManyAsync([unsafeKey], {
         valueEncoding: 'buffer',
+        packed: false,
         unsafe: true
       })
       unsafeKey[0] = 0x62
