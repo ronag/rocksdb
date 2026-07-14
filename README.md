@@ -2,6 +2,24 @@
 
 A low-level RocksDB binding for Node.js 26 and later.
 
+## Background parallelism
+
+`parallelism` controls RocksDB's LOW-priority background pool used for
+compaction, while `flushParallelism` controls its HIGH-priority flush pool.
+Both options must be integers from 1 through 256, inclusive. RocksDB recommends
+starting with the number of CPU cores for total background parallelism. The
+upper bound still accommodates large hosts while preventing one database open
+from requesting an unbounded number of native threads. By default,
+`parallelism` is half the reported logical CPU count clamped to that range and
+`flushParallelism` is one quarter of `parallelism`, with a minimum of one.
+
+Both pools belong to RocksDB's process-wide default environment: every database
+in the process shares them. The most recent open attempt that passed synchronous
+option validation sets their sizes, even if RocksDB later rejects the open. An
+open can also fail when the operating system cannot create the requested
+threads; that failure is reported as a JavaScript error instead of escaping the
+native addon boundary.
+
 ## Packed raw reads
 
 The raw `_nextvSync()`, `_nextvAsync()`, `_getManySync()` and

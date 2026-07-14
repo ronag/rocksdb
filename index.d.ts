@@ -196,7 +196,9 @@ export interface RocksColumnOptions {
 }
 
 export interface RocksOpenOptions extends AbstractOpenOptions, RocksColumnOptions {
+  /** Process-wide RocksDB compaction parallelism. Must be an integer from 1 through 256. Defaults to half the logical CPU count, clamped to that range. */
   parallelism?: number
+  /** Process-wide RocksDB flush parallelism. Must be an integer from 1 through 256. Defaults to one quarter of `parallelism`, with a minimum of one. */
   flushParallelism?: number
   walDir?: string
   walTTL?: number
