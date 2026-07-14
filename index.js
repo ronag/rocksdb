@@ -307,15 +307,28 @@ class RocksLevel extends AbstractLevel {
   }
 
   _getManyAsync (keys, options, callback, allowPartial, packed, exposePacked = true) {
-    if (keys.some(key => typeof key === 'string')) {
-      keys = keys.map(key => typeof key === 'string' ? Buffer.from(key) : key)
+    callback = fromCallback(callback, kPromise)
+    if (this.status !== 'open') {
+      process.nextTick(callback, new ModuleError('Database is not open', {
+        code: 'LEVEL_DATABASE_NOT_OPEN'
+      }))
+      return callback[kPromise]
     }
 
-    callback = fromCallback(callback, kPromise)
     let referenced = false
     let bindingOptions = options
 
     try {
+      // Claim the database before reading user-controlled array elements or
+      // option accessors. A getter can call db.close(); the accepted read must
+      // keep the native database alive until its callback has completed.
+      this[kRef]()
+      referenced = true
+
+      if (keys.some(key => typeof key === 'string')) {
+        keys = keys.map(key => typeof key === 'string' ? Buffer.from(key) : key)
+      }
+
       if (allowPartial == null) {
         allowPartial = false
         if ((typeof options === 'object' && options !== null) || typeof options === 'function') {
@@ -332,8 +345,6 @@ class RocksLevel extends AbstractLevel {
           })
         }
       }
-      this[kRef]()
-      referenced = true
       const prepared = prepareRawGetManyOptions(bindingOptions, packed)
       packed = prepared.packed
       bindingOptions = prepared.bindingOptions
