@@ -133,8 +133,8 @@ function validatePackedEncodings (iterator, packed) {
 }
 
 function convertIteratorResult (iterator, result) {
-  const convertKey = isJavaScriptEncoding(iterator[kKeyEncoding])
-  const convertValue = isJavaScriptEncoding(iterator[kValueEncoding])
+  const convertKey = iterator[kKeys] && isJavaScriptEncoding(iterator[kKeyEncoding])
+  const convertValue = iterator[kValues] && isJavaScriptEncoding(iterator[kValueEncoding])
   if (!convertKey && !convertValue) return result
 
   const convertField = (value, encoding) => {

@@ -162,9 +162,16 @@ test('packed nextv supports values-only and no-field iterators', async function 
   const defaultValuesResult = await defaultValues._nextvAsync(1)
   t.equal(defaultValuesResult.packed, true,
     'a disabled utf8 field does not prevent default auto packing')
+  t.notOk('rows' in defaultValuesResult,
+    'a disabled utf8 field does not force packed values into rows')
   await defaultValues.close()
 
-  const none = db._iterator({ keys: false, values: false })
+  const none = db._iterator({
+    keys: false,
+    values: false,
+    keyEncoding: 'utf8',
+    valueEncoding: 'slice'
+  })
   const noneResult = await none._nextvAsync(10, { packed: true })
   t.equal(noneResult.count, 3, 'no-field iterator retains logical row count')
   t.same(noneResult.offsets, new Uint32Array([0]), 'no-field iterator emits no byte fields')
