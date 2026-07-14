@@ -103,6 +103,8 @@ expectType<RocksPackedGetManyResult>(
 db._getManySync([slice], { packed: true, valueEncoding: 'utf8' })
 // @ts-expect-error Auto-packed getMany can return raw buffer bytes
 db._getManySync([slice], { packed: 'auto', valueEncoding: 'utf8' })
+// @ts-expect-error A runtime boolean can select packed output and therefore requires buffers
+db._getManySync([slice], { packed: booleanFlag, valueEncoding: 'utf8' })
 
 const boundedValues = db.getMany(['key'], { highWaterMarkBytes: 0 })
 expectTrue<Equal<
