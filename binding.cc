@@ -1317,6 +1317,15 @@ struct BaseIterator : public Closable {
 
   bool IsInitialized() const { return iterator_ != nullptr; }
 
+  bool IsInitializedSafe() {
+    // This probe is used only after an async worker has completed, to
+    // distinguish a failed initializer (which closes native state) from a
+    // later read/conversion failure (which remains recoverable by seek). It
+    // takes no RocksDB action and cannot perform I/O.
+    std::lock_guard operationLock(operationMutex_);
+    return IsInitialized();
+  }
+
   rocksdb::Status PreflightStatus() const {
     // Every movement checks Status(), so replay a terminal failure before a
     // retry can call Next()/Prev() on RocksDB's invalid iterator. Keeping the
@@ -1605,7 +1614,9 @@ class Iterator final : public BaseIterator, public std::enable_shared_from_this<
                    uint32_t count,
                    uint32_t timeout,
                    napi_value callback,
-                   const PackedMode mode = PackedMode::Unpacked) {
+                   const PackedMode mode = PackedMode::Unpacked,
+                   const bool initialize = false,
+                   std::optional<std::string> initialTarget = std::nullopt) {
     if (!ValidatePackedEncodings(env, mode)) return nullptr;
 
     struct State {
@@ -1630,8 +1641,18 @@ class Iterator final : public BaseIterator, public std::enable_shared_from_this<
 
     NAPI_STATUS_THROWS(runAsync<State>(
         resourceName, env, callback,
-        [self, this, count, timeout, databaseOperation, mode](auto& state) {
+        [self, this, count, timeout, databaseOperation, mode, initialize,
+         initialTarget = std::move(initialTarget)](auto& state) {
           const DatabaseOperationScope operationScope(databaseOperation);
+
+          // Public next() can fuse lazy initialization and its first refill in
+          // one worker. Preserve iterator_init's failure contract: a failed
+          // initializer must detach and release its snapshot on this worker,
+          // rather than leaving cleanup to the JS thread.
+          if (initialize) {
+            ROCKS_STATUS_RETURN(InitializeAndCloseOnErrorSafe(initialTarget));
+          }
+
           std::lock_guard operationLock(operationMutex_);
           if (closed.load()) {
             return rocksdb::Status::InvalidArgument("Iterator is not open");
@@ -3630,6 +3651,50 @@ NAPI_METHOD(iterator_init) {
   return nullptr;
 }
 
+NAPI_METHOD(iterator_init_nextv) {
+  NAPI_ARGV(5);
+
+  try {
+    std::shared_ptr<Iterator> iterator;
+    NAPI_STATUS_THROWS(GetResourceExternal(env, argv[0], kIteratorReferenceTag, iterator));
+
+    std::optional<std::string> initialTarget;
+    napi_valuetype targetType;
+    NAPI_STATUS_THROWS(napi_typeof(env, argv[1], &targetType));
+    if (targetType != napi_undefined && targetType != napi_null) {
+      NAPI_STATUS_THROWS(GetValue(env, argv[1], initialTarget));
+    }
+
+    uint32_t count = 1024;
+    NAPI_STATUS_THROWS(GetValue(env, argv[2], count));
+
+    uint32_t timeout = 0;
+    NAPI_STATUS_THROWS(GetProperty(env, argv[3], "timeout", timeout));
+
+    return iterator->nextv(env, count, timeout, argv[4], PackedMode::Unpacked, true,
+                           std::move(initialTarget));
+  } catch (const std::exception& e) {
+    napi_throw_error(env, nullptr, e.what());
+    return nullptr;
+  }
+}
+
+NAPI_METHOD(iterator_is_initialized) {
+  NAPI_ARGV(1);
+
+  try {
+    std::shared_ptr<Iterator> iterator;
+    NAPI_STATUS_THROWS(GetResourceExternal(env, argv[0], kIteratorReferenceTag, iterator));
+
+    napi_value result;
+    NAPI_STATUS_THROWS(napi_get_boolean(env, iterator->IsInitializedSafe(), &result));
+    return result;
+  } catch (const std::exception& e) {
+    napi_throw_error(env, nullptr, e.what());
+    return nullptr;
+  }
+}
+
 NAPI_METHOD(iterator_init_sync) {
   NAPI_ARGV(2);
 
@@ -4745,6 +4810,8 @@ NAPI_INIT() {
   NAPI_EXPORT_FUNCTION(statistics_get_statistics);
 
   NAPI_EXPORT_FUNCTION(iterator_init);
+  NAPI_EXPORT_FUNCTION(iterator_init_nextv);
+  NAPI_EXPORT_FUNCTION(iterator_is_initialized);
   NAPI_EXPORT_FUNCTION(iterator_create);
   NAPI_EXPORT_FUNCTION(iterator_init_sync);
   NAPI_EXPORT_FUNCTION(iterator_refresh_sync);
