@@ -1071,6 +1071,7 @@ struct BaseIterator : public Closable {
     const auto status = database_->Attach(reference_, this);
     if (!status.ok()) {
       if (snapshot_) {
+        readOptions_.snapshot = nullptr;
         database_->db->ReleaseSnapshot(snapshot_);
         snapshot_ = nullptr;
       }
@@ -1107,6 +1108,7 @@ struct BaseIterator : public Closable {
     lower_bound_.reset();
     upper_bound_.reset();
     if (snapshot_) {
+      readOptions_.snapshot = nullptr;
       database_->db->ReleaseSnapshot(snapshot_);
       snapshot_ = nullptr;
     }
@@ -1203,9 +1205,9 @@ struct BaseIterator : public Closable {
     // state and clears its internal snapshot before we release our ownership.
     ROCKS_STATUS_RETURN(iterator_->Refresh(nullptr));
     if (snapshot_) {
+      readOptions_.snapshot = nullptr;
       database_->db->ReleaseSnapshot(snapshot_);
       snapshot_ = nullptr;
-      readOptions_.snapshot = nullptr;
     }
     // Refresh invalidates the iterator, so restore its comparator-aware start.
     ResetPosition();
