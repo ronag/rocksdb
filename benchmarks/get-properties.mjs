@@ -34,11 +34,14 @@ let db
 let failed = false
 
 try {
-  db = new RocksLevel(location, { keyEncoding: 'buffer', valueEncoding: 'buffer' })
+  db = new RocksLevel(location, {
+    keyEncoding: 'buffer',
+    valueEncoding: 'buffer',
+    columns: { default: {} }
+  })
   await db.open()
 
-  const column = db.columns?.default ?? undefined
-  const opts = column ? { column } : undefined
+  const opts = { column: db.columns.default }
 
   group('getProperties vs N×getProperty (18 props)', () => {
     bench('getProperty × N', () => {
