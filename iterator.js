@@ -13,6 +13,10 @@ const binding = require('./binding')
 const kPromise = Symbol('promise')
 const kDB = Symbol('db')
 const kContext = Symbol('context')
+const kInitState = Symbol('initState')
+const kInitCallbacks = Symbol('initCallbacks')
+const kInitError = Symbol('initError')
+const kInitialTarget = Symbol('initialTarget')
 const kCache = Symbol('cache')
 const kFinished = Symbol('finished')
 const kFirst = Symbol('first')
@@ -29,6 +33,12 @@ const kKeyEncoding = Symbol('keyEncoding')
 const kValueEncoding = Symbol('valueEncoding')
 
 const kEmpty = Object.freeze([])
+
+const kUninitialized = 0
+const kInitializing = 1
+const kReady = 2
+const kFailed = 3
+const kClosed = 4
 
 const getTypedArrayByteLength = Object.getOwnPropertyDescriptor(
   Object.getPrototypeOf(Object.getPrototypeOf(Buffer.prototype)),
@@ -69,11 +79,26 @@ function normalizeSeekTarget (target) {
   return { buffer, byteOffset, byteLength }
 }
 
+function snapshotSeekTarget (target) {
+  target = normalizeSeekTarget(target)
+  if (typeof target === 'string') return target
+  if (Buffer.isBuffer(target)) return Buffer.from(target)
+
+  return Buffer.from(target.buffer.subarray(
+    target.byteOffset,
+    target.byteOffset + target.byteLength
+  ))
+}
+
 function iteratorBusyError (operation) {
   return new ModuleError(
     `Iterator is busy: cannot call ${operation}() until the previous operation has completed`,
     { code: 'LEVEL_ITERATOR_BUSY' }
   )
+}
+
+function iteratorNotOpenError () {
+  return new ModuleError('Iterator is not open', { code: 'LEVEL_ITERATOR_NOT_OPEN' })
 }
 
 function packedCacheError () {
@@ -189,7 +214,14 @@ class Iterator extends AbstractIterator {
       this[kKeyEncoding],
       this[kValueEncoding]
     )
-    this[kContext] = binding.iterator_init_sync(context, bindingOptions)
+
+    // Capture the RocksDB snapshot synchronously, but defer NewIterator and
+    // its initial seek (the potentially blocking work) to the first operation.
+    this[kContext] = binding.iterator_create(context, bindingOptions)
+    this[kInitState] = kUninitialized
+    this[kInitCallbacks] = []
+    this[kInitError] = null
+    this[kInitialTarget] = null
 
     this[kFirst] = true
     this[kCache] = kEmpty
@@ -201,6 +233,86 @@ class Iterator extends AbstractIterator {
     this[kCloseRequested] = false
     this[kPublicSeek] = false
     this[kHasFilter] = options.keyFilter != null || options.valueFilter != null
+  }
+
+  _initialize (callback) {
+    if (this[kInitState] === kReady) {
+      process.nextTick(callback)
+      return
+    }
+    if (this[kInitState] === kFailed) {
+      process.nextTick(callback, this[kInitError])
+      return
+    }
+    if (this[kInitState] === kClosed) {
+      process.nextTick(callback, iteratorNotOpenError())
+      return
+    }
+
+    this[kInitCallbacks].push(callback)
+    if (this[kInitState] === kInitializing) return
+
+    this[kInitState] = kInitializing
+    this[kBusy] = true
+
+    let referenced = false
+    const complete = (err) => {
+      if (referenced) {
+        referenced = false
+        this[kDB][kUnref]()
+      }
+
+      if (err) {
+        this[kInitState] = kFailed
+        this[kInitError] = err
+      } else {
+        this[kInitState] = kReady
+        this[kInitialTarget] = null
+      }
+
+      this[kBusy] = false
+      const callbacks = this[kInitCallbacks]
+      this[kInitCallbacks] = []
+
+      try {
+        for (const callback of callbacks) callback(err)
+      } finally {
+        this._flushPendingClose()
+      }
+    }
+
+    try {
+      this[kDB][kRef]()
+      referenced = true
+      binding.iterator_init(
+        this[kContext],
+        this[kInitialTarget],
+        complete
+      )
+    } catch (err) {
+      process.nextTick(complete, err)
+    }
+  }
+
+  _initializeSync (initialTarget = this[kInitialTarget]) {
+    if (this[kInitState] === kReady) return
+    if (this[kInitState] === kInitializing) throw iteratorBusyError('initialize')
+    if (this[kInitState] === kFailed) throw this[kInitError]
+    if (this[kInitState] === kClosed) throw iteratorNotOpenError()
+
+    this[kDB][kRef]()
+    try {
+      binding.iterator_init_sync(this[kContext], initialTarget)
+
+      this[kInitState] = kReady
+      this[kInitialTarget] = null
+    } catch (err) {
+      this[kInitState] = kFailed
+      this[kInitError] = err
+      throw err
+    } finally {
+      this[kDB][kUnref]()
+    }
   }
 
   [Symbol.asyncDispose] () {
@@ -238,6 +350,14 @@ class Iterator extends AbstractIterator {
 
   _seek (target) {
     if (this[kCloseRequested]) return
+    if (this[kInitState] === kUninitialized) {
+      this[kInitialTarget] = snapshotSeekTarget(target)
+      this[kFirst] = true
+      this[kCache] = kEmpty
+      this[kFinished] = false
+      this[kPosition] = 0
+      return
+    }
     if (this[kPublicSeek]) return this._seekSyncOwned(target)
     this._seekSync(target)
   }
@@ -272,11 +392,20 @@ class Iterator extends AbstractIterator {
   }
 
   _next (callback) {
-    assert(this[kContext])
     if (this[kBusy]) {
       process.nextTick(callback, iteratorBusyError('next'))
       return this
     }
+
+    if (this[kInitState] !== kReady) {
+      this._initialize((err) => {
+        if (err) callback(err)
+        else this._next(callback)
+      })
+      return this
+    }
+
+    assert(this[kContext])
 
     if (this[kPosition] < this[kCache].length) {
       const key = this[kCache][this[kPosition]++]
@@ -336,8 +465,6 @@ class Iterator extends AbstractIterator {
   }
 
   _nextv (size, options, callback) {
-    assert(this[kContext])
-
     callback = fromCallback(callback, kPromise)
     if (this[kBusy]) {
       process.nextTick(callback, iteratorBusyError('nextv'))
@@ -387,8 +514,9 @@ class Iterator extends AbstractIterator {
   // nxt API
 
   _refreshSync () {
-    assert(this[kContext])
     assert(!this[kBusy])
+    this._initializeSync()
+    assert(this[kContext])
 
     this[kFirst] = true
     this[kCache] = kEmpty
@@ -399,7 +527,6 @@ class Iterator extends AbstractIterator {
   }
 
   _seekSync (target) {
-    assert(this[kContext])
     if (this[kBusy]) throw iteratorBusyError('seek')
 
     this[kBusy] = true
@@ -421,12 +548,15 @@ class Iterator extends AbstractIterator {
     this[kFinished] = false
     this[kPosition] = 0
 
-    binding.iterator_seek_sync(this[kContext], target, discardedCount)
+    if (this[kInitState] === kUninitialized) {
+      this._initializeSync(snapshotSeekTarget(target))
+    } else {
+      this._initializeSync()
+      binding.iterator_seek_sync(this[kContext], target, discardedCount)
+    }
   }
 
   _seekAsync (target, callback) {
-    assert(this[kContext])
-
     callback = fromCallback(callback, kPromise)
     if (this[kBusy]) {
       process.nextTick(callback, iteratorBusyError('seek'))
@@ -445,6 +575,21 @@ class Iterator extends AbstractIterator {
       }
 
       const discardedCount = (this[kCache].length - this[kPosition]) / 2
+      if (this[kInitState] === kUninitialized) {
+        this[kInitialTarget] = snapshotSeekTarget(target)
+        this[kFirst] = true
+        this[kCache] = kEmpty
+        this[kFinished] = false
+        this[kPosition] = 0
+
+        this._initialize((err) => {
+          if (err) callback(err)
+          else callback(null)
+        })
+        return callback[kPromise]
+      }
+
+      this._initializeSync()
       this[kDB][kRef]()
       referenced = true
       binding.iterator_seek(this[kContext], target, discardedCount, (err) => {
@@ -501,12 +646,13 @@ class Iterator extends AbstractIterator {
   }
 
   _nextvSync (size, options) {
-    assert(this[kContext])
-    assert(!this[kBusy])
+    if (this[kBusy]) throw iteratorBusyError('nextv')
 
     let referenced = false
     this[kBusy] = true
     try {
+      this._initializeSync()
+      assert(this[kContext])
       this[kDB][kRef]()
       referenced = true
       const packed = getPackedMode(options, getDefaultPackedMode(this))
@@ -540,10 +686,22 @@ class Iterator extends AbstractIterator {
   }
 
   _nextvAsync (size, options, callback, packed) {
-    assert(this[kContext])
-    assert(!this[kBusy])
-
     callback = fromCallback(callback, kPromise)
+
+    if (this[kBusy]) {
+      process.nextTick(callback, iteratorBusyError('nextv'))
+      return callback[kPromise]
+    }
+
+    if (this[kInitState] !== kReady) {
+      this._initialize((err) => {
+        if (err) callback(err)
+        else this._nextvAsync(size, options, callback, packed)
+      })
+      return callback[kPromise]
+    }
+
+    assert(this[kContext])
 
     let referenced = false
     try {
@@ -623,6 +781,9 @@ class Iterator extends AbstractIterator {
       binding.iterator_close_sync(this[kContext])
       this[kContext] = null
     }
+
+    this[kInitState] = kClosed
+    this[kInitialTarget] = null
   }
 
   _closeAsync (callback) {
