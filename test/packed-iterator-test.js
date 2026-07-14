@@ -144,39 +144,130 @@ test('utf8 nextv converts unpacked and packed native fields to strings', async f
   t.end()
 })
 
-test('packed nextv supports values-only and no-field iterators', async function (t) {
-  const values = db._iterator({ keys: false, values: true, valueEncoding: 'buffer' })
-  const valuesResult = await values._nextvAsync(10, { packed: true })
-  t.equal(valuesResult.count, 3, 'values-only iterator reports every row')
-  t.equal(valuesResult.offsets.length, 4, 'one boundary is emitted per value plus the origin')
-  t.same(fields(valuesResult).slice(0, 2), [Buffer.from('one'), Buffer.from('two')],
-    'values are packed without placeholder fields')
-  await values.close()
+test('packed nextv stores only enabled fields', async function (t) {
+  const layouts = [
+    {
+      name: 'keys-only',
+      options: {
+        keys: true,
+        values: false,
+        keyEncoding: 'buffer',
+        valueEncoding: 'slice'
+      },
+      expected: [Buffer.from('a'), Buffer.from('b'), Buffer.from('c')]
+    },
+    {
+      name: 'values-only',
+      options: {
+        keys: false,
+        values: true,
+        keyEncoding: 'utf8',
+        valueEncoding: 'buffer'
+      },
+      expected: [Buffer.from('one'), Buffer.from('two'), Buffer.alloc(2048, 0x63)]
+    },
+    {
+      name: 'no-fields',
+      options: {
+        keys: false,
+        values: false,
+        keyEncoding: 'utf8',
+        valueEncoding: 'slice'
+      },
+      expected: []
+    }
+  ]
 
-  const defaultValues = db._iterator({
-    keys: false,
-    values: true,
-    keyEncoding: 'utf8',
-    valueEncoding: 'buffer'
-  })
-  const defaultValuesResult = await defaultValues._nextvAsync(1)
-  t.equal(defaultValuesResult.packed, true,
-    'a disabled utf8 field does not prevent default auto packing')
-  t.notOk('rows' in defaultValuesResult,
-    'a disabled utf8 field does not force packed values into rows')
-  await defaultValues.close()
+  for (const [readName, read] of [
+    ['sync', (iterator, options) => iterator._nextvSync(10, options)],
+    ['async', (iterator, options) => iterator._nextvAsync(10, options)]
+  ]) {
+    for (const [modeName, readOptions] of [
+      ['true', { packed: true }],
+      ['auto', { packed: 'auto' }],
+      ['default', undefined]
+    ]) {
+      for (const layout of layouts) {
+        const iterator = db._iterator(layout.options)
+        const result = await read(iterator, readOptions)
+        const prefix = `${readName} ${modeName} ${layout.name}`
 
-  const none = db._iterator({
-    keys: false,
-    values: false,
-    keyEncoding: 'utf8',
-    valueEncoding: 'slice'
-  })
-  const noneResult = await none._nextvAsync(10, { packed: true })
-  t.equal(noneResult.count, 3, 'no-field iterator retains logical row count')
-  t.same(noneResult.offsets, new Uint32Array([0]), 'no-field iterator emits no byte fields')
-  t.equal(noneResult.buffer.byteLength, 0, 'no-field iterator arena is empty')
-  await none.close()
+        t.equal(result.packed, true, `${prefix} selects packed mode`)
+        t.notOk('rows' in result, `${prefix} preserves the arena shape`)
+        t.equal(result.count, 3, `${prefix} preserves the logical row count`)
+        t.equal(result.offsets.length, layout.expected.length + 1,
+          `${prefix} emits one boundary per enabled field plus the origin`)
+        t.same(fields(result), layout.expected, `${prefix} stores enabled fields without placeholders`)
+        t.equal(result.finished, true, `${prefix} reports exhaustion`)
+        t.equal(result.limited, false, `${prefix} is not count-limited`)
+        await iterator.close()
+      }
+    }
+  }
+
+  t.end()
+})
+
+test('default auto packing ignores disabled field sizes', async function (t) {
+  const autoDb = testCommon.factory({ keyEncoding: 'buffer', valueEncoding: 'buffer' })
+  await autoDb.open()
+  await autoDb.put(Buffer.from('small-key'), Buffer.alloc(8 * 1024 + 1, 0x76))
+
+  for (const [name, read] of [
+    ['sync', (iterator) => iterator._nextvSync(1)],
+    ['async', (iterator) => iterator._nextvAsync(1)]
+  ]) {
+    const keys = autoDb._iterator({ keys: true, values: false })
+    const keyResult = await read(keys)
+    t.equal(keyResult.packed, true, `${name} ignores a disabled large value`)
+    t.same(fields(keyResult), [Buffer.from('small-key')], `${name} packs only the enabled key`)
+    await keys.close()
+
+    const values = autoDb._iterator({ keys: false, values: true })
+    const valueResult = await read(values)
+    t.equal(valueResult.packed, false, `${name} selects from the enabled large value`)
+    t.equal(valueResult.rows[0], undefined, `${name} retains the disabled key placeholder`)
+    t.equal(valueResult.rows[1].byteLength, 8 * 1024 + 1, `${name} retains the enabled value`)
+    await values.close()
+
+    const none = autoDb._iterator({ keys: false, values: false })
+    const noneResult = await read(none)
+    t.equal(noneResult.packed, true, `${name} packs a no-field row`)
+    t.same(noneResult.offsets, new Uint32Array([0]), `${name} emits only the origin boundary`)
+    t.equal(noneResult.count, 1, `${name} retains the no-field logical row count`)
+    await none.close()
+  }
+
+  await autoDb.close()
+  t.end()
+})
+
+test('public iterators preserve disabled-field entry shapes', async function (t) {
+  for (const [name, options, expected] of [
+    ['keys-only', { keys: true, values: false }, [
+      [Buffer.from('a'), undefined],
+      [Buffer.from('b'), undefined],
+      [Buffer.from('c'), undefined]
+    ]],
+    ['values-only', { keys: false, values: true }, [
+      [undefined, Buffer.from('one')],
+      [undefined, Buffer.from('two')],
+      [undefined, Buffer.alloc(2048, 0x63)]
+    ]],
+    ['no-fields', { keys: false, values: false }, [
+      [undefined, undefined],
+      [undefined, undefined],
+      [undefined, undefined]
+    ]]
+  ]) {
+    const entries = await db.iterator({
+      ...options,
+      keyEncoding: 'buffer',
+      valueEncoding: 'buffer'
+    }).all()
+    t.same(entries, expected, `${name} keeps the AbstractLevel entry shape`)
+  }
+
   t.end()
 })
 

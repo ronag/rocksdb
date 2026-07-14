@@ -412,21 +412,31 @@ export type RocksSelectedPacked<Packed extends RocksPackedReadMode> = Packed ext
   ? true
   : Packed extends 'auto' ? boolean : false
 
+export type RocksIsJavaScriptRaw<T> = [T] extends [Slice | string] ? true : false
+export type RocksIteratorNeedsJavaScriptRows<
+  KRaw,
+  VRaw,
+  Keys extends boolean,
+  Values extends boolean
+> = [Keys] extends [false]
+  ? [Values] extends [false] ? false : RocksIsJavaScriptRaw<VRaw>
+  : [Values] extends [false]
+    ? RocksIsJavaScriptRaw<KRaw>
+    : RocksIsJavaScriptRaw<KRaw> extends true ? true : RocksIsJavaScriptRaw<VRaw>
+
 export type RocksIteratorReadResult<
   KRaw,
   VRaw,
   Keys extends boolean,
   Values extends boolean,
   Packed extends RocksPackedReadMode
-> = [KRaw] extends [Slice | string]
+> = RocksIteratorNeedsJavaScriptRows<KRaw, VRaw, Keys, Values> extends true
   ? RocksRawIteratorResult<KRaw, VRaw, Keys, Values, RocksSelectedPacked<Packed>>
-  : [VRaw] extends [Slice | string]
-    ? RocksRawIteratorResult<KRaw, VRaw, Keys, Values, RocksSelectedPacked<Packed>>
-    : Packed extends true
-      ? RocksPackedIteratorResult
-      : Packed extends 'auto'
-        ? RocksPackedIteratorResult | RocksRawIteratorResult<KRaw, VRaw, Keys, Values>
-        : RocksRawIteratorResult<KRaw, VRaw, Keys, Values>
+  : Packed extends true
+    ? RocksPackedIteratorResult
+    : Packed extends 'auto'
+      ? RocksPackedIteratorResult | RocksRawIteratorResult<KRaw, VRaw, Keys, Values>
+      : RocksRawIteratorResult<KRaw, VRaw, Keys, Values>
 
 export type RocksGetManyReadResult<
   E extends RocksRawEncoding,

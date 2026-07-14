@@ -295,8 +295,43 @@ const valuesOnlyIterator = db._iterator({
   keyEncoding: 'utf8',
   valueEncoding: 'buffer'
 })
-expectType<Promise<RocksRawIteratorResult<string, Buffer, false, true, boolean>>>(
+expectType<Promise<
+  RocksPackedIteratorResult | RocksRawIteratorResult<string, Buffer, false, true>
+>>(
   valuesOnlyIterator._nextvAsync(10)
+)
+expectType<Promise<RocksPackedIteratorResult>>(
+  valuesOnlyIterator._nextvAsync(10, { packed: true })
+)
+
+const keysOnlyIterator = db._iterator({
+  keys: true,
+  values: false,
+  keyEncoding: 'buffer',
+  valueEncoding: 'utf8'
+})
+expectType<Promise<
+  RocksPackedIteratorResult | RocksRawIteratorResult<Buffer, string, true, false>
+>>(
+  keysOnlyIterator._nextvAsync(10)
+)
+expectType<RocksPackedIteratorResult>(
+  keysOnlyIterator._nextvSync(10, { packed: true })
+)
+
+const noFieldsRawIterator = db._iterator({
+  keys: false,
+  values: false,
+  keyEncoding: 'utf8',
+  valueEncoding: 'slice'
+})
+expectType<Promise<
+  RocksPackedIteratorResult | RocksRawIteratorResult<string, Slice, false, false>
+>>(
+  noFieldsRawIterator._nextvAsync(10)
+)
+expectType<RocksPackedIteratorResult>(
+  noFieldsRawIterator._nextvSync(10, { packed: true })
 )
 
 const batch = db.batch()
