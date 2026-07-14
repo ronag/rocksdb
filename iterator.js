@@ -112,12 +112,12 @@ function getDefaultPackedMode (iterator) {
 }
 
 function prepareNativeIteratorOptions (options, keyEncoding, valueEncoding) {
-  if (!isJavaScriptEncoding(keyEncoding) && !isJavaScriptEncoding(valueEncoding)) return options
+  if (keyEncoding !== 'slice' && valueEncoding !== 'slice') return options
 
   return new Proxy({}, {
     get (target, property) {
-      if (property === 'keyEncoding' && isJavaScriptEncoding(keyEncoding)) return 'buffer'
-      if (property === 'valueEncoding' && isJavaScriptEncoding(valueEncoding)) return 'buffer'
+      if (property === 'keyEncoding' && keyEncoding === 'slice') return 'buffer'
+      if (property === 'valueEncoding' && valueEncoding === 'slice') return 'buffer'
       return Reflect.get(options, property, options)
     }
   })
@@ -133,24 +133,23 @@ function validatePackedEncodings (iterator, packed) {
 }
 
 function convertIteratorResult (iterator, result) {
-  const convertKey = iterator[kKeys] && isJavaScriptEncoding(iterator[kKeyEncoding])
-  const convertValue = iterator[kValues] && isJavaScriptEncoding(iterator[kValueEncoding])
-  if (!convertKey && !convertValue) return result
-
-  const convertField = (value, encoding) => {
-    if (encoding === 'slice') return value instanceof Slice ? value : new Slice(value)
-    if (typeof value === 'string') return value
-    return value.toString('utf8')
-  }
-
   if ('rows' in result) {
+    const convertKey = iterator[kKeys] && iterator[kKeyEncoding] === 'slice'
+    const convertValue = iterator[kValues] && iterator[kValueEncoding] === 'slice'
+    if (!convertKey && !convertValue) return result
+
     const rows = result.rows.map((value, index) => {
       const shouldConvert = index % 2 === 0 ? convertKey : convertValue
-      const encoding = index % 2 === 0 ? iterator[kKeyEncoding] : iterator[kValueEncoding]
-      return shouldConvert && value !== undefined ? convertField(value, encoding) : value
+      return shouldConvert && value !== undefined && !(value instanceof Slice)
+        ? new Slice(value)
+        : value
     })
     return { ...result, rows }
   }
+
+  const convertKey = iterator[kKeys] && isJavaScriptEncoding(iterator[kKeyEncoding])
+  const convertValue = iterator[kValues] && isJavaScriptEncoding(iterator[kValueEncoding])
+  if (!convertKey && !convertValue) return result
 
   let offsetIndex = 0
   const rows = []

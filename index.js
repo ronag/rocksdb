@@ -74,7 +74,7 @@ function prepareRawGetManyOptions (options, packed) {
     get (target, property) {
       if (property === 'valueEncoding') {
         const encoding = readValueEncoding()
-        return isJavaScriptEncoding(encoding) ? 'buffer' : encoding
+        return encoding === 'slice' ? 'buffer' : encoding
       }
       return Reflect.get(options, property, options)
     }
@@ -97,6 +97,7 @@ function convertRawGetManyResult (result, valueEncoding) {
     : buffer.toString('utf8', start, end)
 
   if (Array.isArray(result)) {
+    if (valueEncoding !== 'slice') return result
     return result.map(value => Buffer.isBuffer(value) ? convert(value) : value)
   }
 
