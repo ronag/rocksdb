@@ -20,6 +20,28 @@ open can also fail when the operating system cannot create the requested
 threads; that failure is reported as a JavaScript error instead of escaping the
 native addon boundary.
 
+## Unsafe low-level methods
+
+Every method whose name starts with `_` is an unsafe low-level API. These
+methods bypass the lifecycle, serialization and argument checks provided by the
+corresponding public API. They are intended for callers that already enforce
+the following invariants:
+
+- The database, iterator or batch is open and remains open until the operation
+  returns or its callback or promise settles.
+- No other operation or close overlaps on the same iterator or batch.
+- Arguments satisfy the TypeScript declarations. Getters and proxies do not
+  reenter the same resource, and any explicitly borrowed memory remains valid
+  for the duration required by its option.
+
+Production builds intentionally avoid adding checks for those invariants to
+the `_` methods. Development builds may assert them to catch integration bugs.
+Use the non-prefixed methods when the caller cannot guarantee this contract.
+This also applies when an underscore method is an implementation hook such as
+`_get()`, `_put()`, `_clear()`, `_batch()`, `_next()`, `_seek()`, `_write()` or
+`_close()`: public methods may establish temporary ownership before dispatching
+through the same hook, while direct calls deliberately do not.
+
 ## Packed raw reads
 
 The raw `_nextvSync()`, `_nextvAsync()`, `_getManySync()` and

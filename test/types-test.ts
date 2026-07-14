@@ -73,8 +73,12 @@ expectType<true>(statistics.setStatisticsEnabled(false))
 
 const rawValues = db._getManySync([slice, Buffer.from('key'), 'key'])
 expectType<RocksPackedGetManyResult | RocksRawGetManyResult<'buffer'>>(rawValues)
+const readonlyRawKeys = [slice, Buffer.from('key'), 'key'] as const
+expectType<RocksPackedGetManyResult | RocksRawGetManyResult<'buffer'>>(
+  db._getManySync(readonlyRawKeys)
+)
 expectType<Promise<RocksPackedGetManyResult | RocksRawGetManyResult<'buffer'>>>(
-  db._getManyAsync([slice])
+  db._getManyAsync(readonlyRawKeys)
 )
 expectType<RocksRawGetManyResult<'utf8'>>(
   db._getManySync([slice], { valueEncoding: 'utf8' })

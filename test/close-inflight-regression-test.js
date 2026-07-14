@@ -2,6 +2,7 @@
 
 const test = require('tape')
 const testCommon = require('./common')
+const binding = require('../binding')
 
 // Number of open/op/close cycles per scenario. The bugs are races, so we repeat
 // to give them a chance to surface; on the fixed code every cycle is clean.
@@ -60,23 +61,52 @@ test('close() waits for in-flight flushWAL', async function (t) {
   t.end()
 })
 
-// #3: closing an iterator (triggered by db.close()) while an async nextv is in
-// flight on a worker thread must defer freeing the native rocksdb iterator until
-// the read completes. _nextvAsync is the direct entry point that does not set
-// abstract-level's kWorking flag, i.e. the path the abstract close() does not
-// otherwise guard.
+test('flushWAL owns its lifetime before reading public options', async function (t) {
+  const db = testCommon.factory()
+  await db.open()
 
-test('close() while an async iterator nextv is in flight', async function (t) {
-  for (let i = 0; i < ITERATIONS; i++) {
-    const db = testCommon.factory()
-    await db.open()
-    await seed(db, 200)
-    const it = db.iterator()
-    const p = it._nextvAsync(50, {})
-    const [, result] = await Promise.all([db.close(), p])
-    t.equal(result.rows.length, 100, 'in-flight iterator read completed before close')
+  const originalClose = binding.db_close
+  const originalFlushWAL = binding.db_flush_wal
+  const closeCalls = []
+  let flushScheduled = false
+  let closePromise
+  let closeCompleted = false
+
+  binding.db_close = function (context, callback) {
+    closeCalls.push([context, callback])
+    t.ok(flushScheduled, 'native close starts only after flushWAL is scheduled')
   }
-  t.pass('survived iterator-nextv+close')
+  binding.db_flush_wal = function (context, sync, callback) {
+    flushScheduled = true
+    t.equal(closeCalls.length, 0, 'the reentrant close waits for the public flushWAL')
+    process.nextTick(callback, null)
+  }
+
+  try {
+    const options = {}
+    Object.defineProperty(options, 'sync', {
+      get () {
+        closePromise = db.close()
+        closePromise.then(() => { closeCompleted = true })
+        return false
+      }
+    })
+
+    await db.flushWAL(options)
+    t.pass('flushWAL completes after the reentrant close request')
+
+    await new Promise(resolve => setImmediate(resolve))
+    t.equal(closeCalls.length, 1, 'native close is admitted after flushWAL completes')
+    t.notOk(closeCompleted, 'close waits for native teardown')
+  } finally {
+    binding.db_close = originalClose
+    binding.db_flush_wal = originalFlushWAL
+  }
+
+  const [context, callback] = closeCalls[0]
+  originalClose(context, callback)
+  await closePromise
+  t.pass('close completes after the flushWAL lifetime is released')
   t.end()
 })
 

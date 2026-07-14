@@ -6,12 +6,12 @@ const { Slice } = require('@nxtedition/slice')
 const ModuleError = require('module-error')
 const assert = require('node:assert')
 const { Buffer } = require('node:buffer')
-const { getPackedMode, kRef, kUnref, setPackedResult } = require('./util')
+const { getPackedMode, setPackedResult } = require('./util')
+const { rethrowingCallback } = require('./public-lifecycle')
 
 const binding = require('./binding')
 
 const kPromise = Symbol('promise')
-const kDB = Symbol('db')
 const kContext = Symbol('context')
 const kInitState = Symbol('initState')
 const kInitCallbacks = Symbol('initCallbacks')
@@ -25,13 +25,18 @@ const kBusy = Symbol('busy')
 const kPendingClose = Symbol('pendingClose')
 const kCloseRequested = Symbol('closeRequested')
 const kPublicSeek = Symbol('publicSeek')
+const kUnsafeBusy = Symbol('unsafeBusy')
 const kNoFieldsNext = Symbol('noFieldsNext')
 const kKeys = Symbol('keys')
 const kValues = Symbol('values')
 const kKeyEncoding = Symbol('keyEncoding')
 const kValueEncoding = Symbol('valueEncoding')
+const kSeekSync = Symbol('seekSync')
+const kNextvSync = Symbol('nextvSync')
+const kNextvAsync = Symbol('nextvAsync')
 
 const kEmpty = Object.freeze([])
+const DEBUG = process.env.NODE_ENV !== 'production'
 
 const kUninitialized = 0
 const kInitializing = 1
@@ -96,6 +101,22 @@ function iteratorBusyError (operation) {
 
 function iteratorNotOpenError () {
   return new ModuleError('Iterator is not open', { code: 'LEVEL_ITERATOR_NOT_OPEN' })
+}
+
+function assertIteratorIdle (iterator, operation) {
+  if (DEBUG) {
+    assert(
+      iterator[kContext] || iterator[kInitState] === kFailed,
+      `unsafe ${operation}() requires an open iterator`
+    )
+    assert(
+      iterator[kInitState] !== kInitializing,
+      `unsafe ${operation}() must not overlap iterator initialization`
+    )
+    assert(!iterator[kCloseRequested], `unsafe ${operation}() must not overlap close()`)
+    assert(!iterator[kBusy], `unsafe ${operation}() must not overlap another operation`)
+    assert(!iterator[kUnsafeBusy], `unsafe ${operation}() must not overlap another unsafe operation`)
+  }
 }
 
 function packedCacheError () {
@@ -225,11 +246,11 @@ class Iterator extends AbstractIterator {
       this[kCache] = kEmpty
       this[kFinished] = false
       this[kPosition] = 0
-      this[kDB] = db
       this[kBusy] = false
       this[kPendingClose] = null
       this[kCloseRequested] = false
       this[kPublicSeek] = false
+      if (DEBUG) this[kUnsafeBusy] = false
     } catch (err) {
       // AbstractIterator attaches itself to the database in super(). A failed
       // native/options construction must undo that ownership immediately or
@@ -257,20 +278,13 @@ class Iterator extends AbstractIterator {
     if (this[kInitState] === kInitializing) return
 
     this[kInitState] = kInitializing
-    this[kBusy] = true
 
-    let referenced = false
     let initializationScheduled = false
     const complete = (err) => {
       // A scheduled native initializer closes failed state in its worker. Only
       // a synchronous scheduling failure still needs fallback cleanup here.
       if (err && !initializationScheduled) {
         err = this._cleanupFailedInitialization(err)
-      }
-
-      if (referenced) {
-        referenced = false
-        this[kDB][kUnref]()
       }
 
       if (err) {
@@ -281,20 +295,13 @@ class Iterator extends AbstractIterator {
       }
       this[kInitialTarget] = null
 
-      this[kBusy] = false
       const callbacks = this[kInitCallbacks]
       this[kInitCallbacks] = []
 
-      try {
-        for (const callback of callbacks) callback(err)
-      } finally {
-        this._flushPendingClose()
-      }
+      for (const callback of callbacks) callback(err)
     }
 
     try {
-      this[kDB][kRef]()
-      referenced = true
       binding.iterator_init(
         this[kContext],
         this[kInitialTarget],
@@ -312,7 +319,6 @@ class Iterator extends AbstractIterator {
     if (this[kInitState] === kFailed) throw this[kInitError]
     if (this[kInitState] === kClosed) throw iteratorNotOpenError()
 
-    this[kDB][kRef]()
     try {
       binding.iterator_init_sync(this[kContext], initialTarget)
 
@@ -324,7 +330,6 @@ class Iterator extends AbstractIterator {
       throw initializationError
     } finally {
       this[kInitialTarget] = null
-      this[kDB][kUnref]()
     }
   }
 
@@ -348,7 +353,29 @@ class Iterator extends AbstractIterator {
     return this.close()
   }
 
+  next (callback) {
+    if (DEBUG) assert(!this[kUnsafeBusy], 'public next() must not overlap an unsafe operation')
+    if (!this[kBusy] || this[kCloseRequested]) return super.next(callback)
+
+    callback = fromCallback(callback, kPromise)
+    process.nextTick(callback, iteratorBusyError('next'))
+    return callback[kPromise]
+  }
+
+  nextv (size, options, callback) {
+    if (DEBUG) assert(!this[kUnsafeBusy], 'public nextv() must not overlap an unsafe operation')
+    if (!this[kBusy] || this[kCloseRequested]) return super.nextv(size, options, callback)
+
+    callback = fromCallback(typeof options === 'function' ? options : callback, kPromise)
+    const err = Number.isInteger(size)
+      ? iteratorBusyError('nextv')
+      : new TypeError("The first argument 'size' must be an integer")
+    process.nextTick(callback, err)
+    return callback[kPromise]
+  }
+
   all (options, callback) {
+    if (DEBUG) assert(!this[kUnsafeBusy], 'public all() must not overlap an unsafe operation')
     if (!this[kBusy] || this[kCloseRequested]) return super.all(options, callback)
 
     callback = fromCallback(typeof options === 'function' ? options : callback, kPromise)
@@ -357,6 +384,7 @@ class Iterator extends AbstractIterator {
   }
 
   seek (target, options) {
+    if (DEBUG) assert(!this[kUnsafeBusy], 'public seek() must not overlap an unsafe operation')
     if (this[kCloseRequested]) return super.seek(target, options)
     if (this[kBusy]) throw iteratorBusyError('seek')
 
@@ -372,16 +400,17 @@ class Iterator extends AbstractIterator {
   }
 
   close (callback) {
-    const result = super.close(callback)
+    if (DEBUG) assert(!this[kUnsafeBusy], 'public close() must not overlap an unsafe operation')
+    const result = super.close(rethrowingCallback(callback))
     this[kCloseRequested] = true
     return result
   }
 
   _seek (target) {
-    if (this[kCloseRequested]) return
+    if (this[kPublicSeek] && this[kCloseRequested]) return
     if (this[kInitState] === kUninitialized) {
       const initialTarget = snapshotSeekTarget(target)
-      if (this[kCloseRequested]) return
+      if (this[kPublicSeek] && this[kCloseRequested]) return
 
       this[kInitialTarget] = initialTarget
       this[kFirst] = true
@@ -390,15 +419,14 @@ class Iterator extends AbstractIterator {
       this[kPosition] = 0
       return
     }
-    if (this[kPublicSeek]) return this._seekSyncOwned(target)
+    if (this[kPublicSeek]) return this[kSeekSync](target, true)
     this._seekSync(target)
   }
 
   _close (callback) {
-    // If an async nextv/seek is in flight on a worker thread, defer the close
-    // until it completes so we never free the native rocksdb iterator while the
-    // worker is still reading it. The pending close is flushed from the async
-    // op's completion callback (see _flushPendingClose).
+    // AbstractIterator serializes its async public operations. kBusy is only
+    // needed for synchronous public seek accessors that reenter close(). Raw
+    // methods deliberately do not acquire close ownership.
     if (this[kBusy]) {
       this[kPendingClose] = callback
     } else {
@@ -424,10 +452,7 @@ class Iterator extends AbstractIterator {
   }
 
   _next (callback) {
-    if (this[kBusy]) {
-      process.nextTick(callback, iteratorBusyError('next'))
-      return this
-    }
+    if (DEBUG) assert(!this[kUnsafeBusy], 'unsafe _next() must not overlap an unsafe operation')
 
     if (this[kInitState] !== kReady && this[kInitState] !== kUninitialized) {
       this._initialize((err) => {
@@ -437,7 +462,7 @@ class Iterator extends AbstractIterator {
       return this
     }
 
-    assert(this[kContext])
+    if (DEBUG) assert(this[kContext])
 
     if (this[kPosition] < this[kCache].length) {
       const key = this[kCache][this[kPosition]++]
@@ -455,7 +480,6 @@ class Iterator extends AbstractIterator {
   }
 
   _refill (size, callback, initialize) {
-    let referenced = false
     let initializationScheduled = false
     if (initialize) this[kInitState] = kInitializing
 
@@ -488,35 +512,23 @@ class Iterator extends AbstractIterator {
         this[kInitialTarget] = null
       }
 
-      // Keep the database lease until the combined operation's native state
-      // has been classified. This also prevents a deferred database close
-      // from racing the in-memory initialized-state probe above.
-      if (referenced) {
-        referenced = false
-        this[kDB][kUnref]()
-      }
-
-      this[kBusy] = false
-      try {
-        if (err) {
-          callback(err)
-        } else {
+      if (err) {
+        callback(err)
+      } else {
+        try {
           result = convertIteratorResult(this, result)
           this[kCache] = result.rows
           this[kFinished] = result.finished
           this[kPosition] = 0
-          this._next(callback)
+        } catch (err) {
+          callback(err)
+          return
         }
-      } finally {
-        this._flushPendingClose()
+        this._next(callback)
       }
     }
 
     try {
-      this[kDB][kRef]()
-      referenced = true
-      this[kBusy] = true
-
       if (initialize) {
         binding.iterator_init_nextv(
           this[kContext],
@@ -540,20 +552,13 @@ class Iterator extends AbstractIterator {
         this[kInitialTarget] = null
       }
 
-      if (referenced) {
-        referenced = false
-        this[kDB][kUnref]()
-      }
       this._deferNextResult(callback, error)
     }
   }
 
   _nextv (size, options, callback) {
+    if (DEBUG) assert(!this[kUnsafeBusy], 'unsafe _nextv() must not overlap an unsafe operation')
     callback = fromCallback(callback, kPromise)
-    if (this[kBusy]) {
-      process.nextTick(callback, iteratorBusyError('nextv'))
-      return callback[kPromise]
-    }
 
     const done = (err, val) => {
       if (err) {
@@ -572,12 +577,12 @@ class Iterator extends AbstractIterator {
 
     if (options?.[kNoFieldsNext] === true) {
       if (this[kPosition] < this[kCache].length || this[kFinished]) {
-        this._nextvAsync(size, null, done, false)
+        this[kNextvAsync](size, null, done, false)
       } else {
         const prefetch = this[kFirst] ? 1 : 1000
         this[kFirst] = false
 
-        this._nextvAsync(prefetch, null, (err, result) => {
+        this[kNextvAsync](prefetch, null, (err, result) => {
           if (err) return done(err)
 
           this[kCache] = result.rows
@@ -590,7 +595,7 @@ class Iterator extends AbstractIterator {
       return callback[kPromise]
     }
 
-    this._nextvAsync(size, options, done, false)
+    this[kNextvAsync](size, options, done, false)
 
     return callback[kPromise]
   }
@@ -598,9 +603,9 @@ class Iterator extends AbstractIterator {
   // nxt API
 
   _refreshSync () {
-    if (this[kBusy]) throw iteratorBusyError('refresh')
+    assertIteratorIdle(this, '_refreshSync')
     this._initializeSync()
-    assert(this[kContext])
+    if (DEBUG) assert(this[kContext])
 
     this[kFirst] = true
     this[kCache] = kEmpty
@@ -611,20 +616,20 @@ class Iterator extends AbstractIterator {
   }
 
   _seekSync (target) {
-    if (this[kBusy]) throw iteratorBusyError('seek')
+    assertIteratorIdle(this, '_seekSync')
+    if (!DEBUG) return this[kSeekSync](target, false)
 
-    this[kBusy] = true
+    this[kUnsafeBusy] = true
     try {
-      this._seekSyncOwned(target)
+      return this[kSeekSync](target, false)
     } finally {
-      this[kBusy] = false
-      this._flushPendingClose()
+      this[kUnsafeBusy] = false
     }
   }
 
-  _seekSyncOwned (target) {
+  [kSeekSync] (target, owned) {
     target = normalizeSeekTarget(target)
-    if (this[kCloseRequested]) return
+    if (owned && this[kCloseRequested]) return
 
     const discardedCount = (this[kCache].length - this[kPosition]) / 2
     this[kFirst] = true
@@ -634,7 +639,7 @@ class Iterator extends AbstractIterator {
 
     if (this[kInitState] === kUninitialized) {
       const initialTarget = snapshotSeekTarget(target)
-      if (this[kCloseRequested]) return
+      if (owned && this[kCloseRequested]) return
       this._initializeSync(initialTarget)
     } else {
       this._initializeSync()
@@ -643,31 +648,15 @@ class Iterator extends AbstractIterator {
   }
 
   _seekAsync (target, callback) {
+    assertIteratorIdle(this, '_seekAsync')
     callback = fromCallback(callback, kPromise)
-    if (this[kBusy]) {
-      process.nextTick(callback, iteratorBusyError('seek'))
-      return callback[kPromise]
-    }
-
-    // SliceLike fields may be accessors. Claim the iterator before reading
-    // them so user code cannot schedule a second operation during validation.
-    this[kBusy] = true
-    let referenced = false
+    if (DEBUG) this[kUnsafeBusy] = true
     try {
       target = normalizeSeekTarget(target)
-      if (this[kCloseRequested]) {
-        this._deferSeekResult(callback)
-        return callback[kPromise]
-      }
 
       const discardedCount = (this[kCache].length - this[kPosition]) / 2
       if (this[kInitState] === kUninitialized) {
         const initialTarget = snapshotSeekTarget(target)
-        if (this[kCloseRequested]) {
-          this._deferSeekResult(callback)
-          return callback[kPromise]
-        }
-
         this[kInitialTarget] = initialTarget
         this[kFirst] = true
         this[kCache] = kEmpty
@@ -675,6 +664,7 @@ class Iterator extends AbstractIterator {
         this[kPosition] = 0
 
         this._initialize((err) => {
+          if (DEBUG) this[kUnsafeBusy] = false
           if (err) callback(err)
           else callback(null)
         })
@@ -682,21 +672,10 @@ class Iterator extends AbstractIterator {
       }
 
       this._initializeSync()
-      this[kDB][kRef]()
-      referenced = true
       binding.iterator_seek(this[kContext], target, discardedCount, (err) => {
-        this[kBusy] = false
-        this[kDB][kUnref]()
-
-        try {
-          if (err) {
-            callback(err)
-          } else {
-            callback(null)
-          }
-        } finally {
-          this._flushPendingClose()
-        }
+        if (DEBUG) this[kUnsafeBusy] = false
+        if (err) callback(err)
+        else callback(null)
       })
 
       // Keep cached state intact if native argument validation throws before
@@ -707,23 +686,13 @@ class Iterator extends AbstractIterator {
       this[kFinished] = false
       this[kPosition] = 0
     } catch (err) {
-      if (referenced) this[kDB][kUnref]()
-      this._deferSeekResult(callback, err)
+      process.nextTick(() => {
+        if (DEBUG) this[kUnsafeBusy] = false
+        callback(err)
+      })
     }
 
     return callback[kPromise]
-  }
-
-  _deferSeekResult (callback, err) {
-    process.nextTick(() => {
-      this[kBusy] = false
-      try {
-        if (err) callback(err)
-        else callback(null)
-      } finally {
-        this._flushPendingClose()
-      }
-    })
   }
 
   _nextvCached (size) {
@@ -738,82 +707,78 @@ class Iterator extends AbstractIterator {
   }
 
   _nextvSync (size, options) {
-    if (this[kBusy]) throw iteratorBusyError('nextv')
+    assertIteratorIdle(this, '_nextvSync')
+    if (!DEBUG) return this[kNextvSync](size, options)
 
-    let referenced = false
-    this[kBusy] = true
+    this[kUnsafeBusy] = true
     try {
-      this._initializeSync()
-      assert(this[kContext])
-      this[kDB][kRef]()
-      referenced = true
-      const packed = getPackedMode(options, getDefaultPackedMode(this))
-      validatePackedEncodings(this, packed)
-
-      if (this[kPosition] < this[kCache].length) {
-        if (packed === true) throw packedCacheError()
-        return setPackedResult(convertIteratorResult(this, this._nextvCached(size)), false)
-      }
-
-      if (this[kFinished]) {
-        const result = packed === true ? emptyPackedResult() : { rows: [], finished: true }
-        return setPackedResult(convertIteratorResult(this, result), packed === true)
-      }
-
-      const nextv = packed === true
-        ? binding.iterator_nextv_packed_sync
-        : packed === 'auto'
-          ? binding.iterator_nextv_auto_sync
-          : binding.iterator_nextv_sync
-      const result = nextv(this[kContext], size, options)
-      this[kFinished] = result.finished
-
-      const packedResult = !('rows' in result)
-      return setPackedResult(convertIteratorResult(this, result), packedResult)
+      return this[kNextvSync](size, options)
     } finally {
-      this[kBusy] = false
-      if (referenced) this[kDB][kUnref]()
-      this._flushPendingClose()
+      this[kUnsafeBusy] = false
     }
   }
 
-  _nextvAsync (size, options, callback, packed) {
-    callback = fromCallback(callback, kPromise)
+  [kNextvSync] (size, options) {
+    this._initializeSync()
+    if (DEBUG) assert(this[kContext])
+    const packed = getPackedMode(options, getDefaultPackedMode(this))
+    validatePackedEncodings(this, packed)
 
-    if (this[kBusy]) {
-      process.nextTick(callback, iteratorBusyError('nextv'))
-      return callback[kPromise]
+    if (this[kPosition] < this[kCache].length) {
+      if (packed === true) throw packedCacheError()
+      return setPackedResult(convertIteratorResult(this, this._nextvCached(size)), false)
     }
 
+    if (this[kFinished]) {
+      const result = packed === true ? emptyPackedResult() : { rows: [], finished: true }
+      return setPackedResult(convertIteratorResult(this, result), packed === true)
+    }
+
+    const nextv = packed === true
+      ? binding.iterator_nextv_packed_sync
+      : packed === 'auto'
+        ? binding.iterator_nextv_auto_sync
+        : binding.iterator_nextv_sync
+    const result = nextv(this[kContext], size, options)
+    this[kFinished] = result.finished
+
+    const packedResult = !('rows' in result)
+    return setPackedResult(convertIteratorResult(this, result), packedResult)
+  }
+
+  _nextvAsync (size, options, callback, packed) {
+    assertIteratorIdle(this, '_nextvAsync')
+    callback = fromCallback(callback, kPromise)
+    if (DEBUG) this[kUnsafeBusy] = true
+    return this[kNextvAsync](size, options, callback, packed, DEBUG)
+  }
+
+  [kNextvAsync] (size, options, callback, packed, unsafe) {
     if (this[kInitState] !== kReady) {
       this._initialize((err) => {
-        if (err) callback(err)
-        else this._nextvAsync(size, options, callback, packed)
+        if (err) {
+          if (unsafe) this[kUnsafeBusy] = false
+          callback(err)
+        } else {
+          this[kNextvAsync](size, options, callback, packed, unsafe)
+        }
       })
       return callback[kPromise]
     }
 
-    assert(this[kContext])
+    if (DEBUG) assert(this[kContext])
 
-    let referenced = false
     try {
-      this[kDB][kRef]()
-      referenced = true
-      this[kBusy] = true
       if (packed == null) packed = getPackedMode(options, getDefaultPackedMode(this))
       validatePackedEncodings(this, packed)
 
       if (this[kPosition] < this[kCache].length) {
         if (packed === true) throw packedCacheError()
         const result = this._nextvCached(size)
-        this[kDB][kUnref]()
-        referenced = false
-        this._deferNextResult(callback, null, result, false)
+        this._deferNextResult(callback, null, result, false, unsafe)
       } else if (this[kFinished]) {
         const result = packed === true ? emptyPackedResult() : { rows: [], finished: true }
-        this[kDB][kUnref]()
-        referenced = false
-        this._deferNextResult(callback, null, result, packed === true)
+        this._deferNextResult(callback, null, result, packed === true, unsafe)
       } else {
         const nextv = packed === true
           ? binding.iterator_nextv_packed
@@ -821,51 +786,54 @@ class Iterator extends AbstractIterator {
             ? binding.iterator_nextv_auto
             : binding.iterator_nextv
         nextv(this[kContext], size, options, (err, result) => {
-          this[kBusy] = false
-          this[kDB][kUnref]()
-
-          try {
-            if (err) {
-              callback(err)
-            } else {
+          if (unsafe) this[kUnsafeBusy] = false
+          if (err) {
+            callback(err)
+          } else {
+            let packedResult
+            try {
               this[kFinished] = result.finished
-              const packedResult = !('rows' in result)
+              packedResult = !('rows' in result)
               result = convertIteratorResult(this, result)
               setPackedResult(result, packedResult)
-              callback(null, result, packedResult)
+            } catch (err) {
+              callback(err)
+              return
             }
-          } finally {
-            this._flushPendingClose()
+            callback(null, result, packedResult)
           }
         })
       }
     } catch (err) {
-      if (referenced) this[kDB][kUnref]()
-      this._deferNextResult(callback, err)
+      this._deferNextResult(callback, err, undefined, undefined, unsafe)
     }
 
     return callback[kPromise]
   }
 
-  _deferNextResult (callback, err, result, packed) {
+  _deferNextResult (callback, err, result, packed, unsafe) {
     process.nextTick(() => {
-      this[kBusy] = false
-      try {
-        if (err) {
-          callback(err)
-        } else {
+      if (unsafe) this[kUnsafeBusy] = false
+      if (err) {
+        callback(err)
+      } else {
+        try {
           result = convertIteratorResult(this, result)
           setPackedResult(result, packed)
-          callback(null, result, packed)
+        } catch (err) {
+          callback(err)
+          return
         }
-      } finally {
-        this._flushPendingClose()
+        callback(null, result, packed)
       }
     })
   }
 
   _closeSync () {
-    if (this[kBusy]) throw iteratorBusyError('close')
+    if (DEBUG) {
+      assert(!this[kBusy], 'unsafe _closeSync() must not overlap a public operation')
+      assert(!this[kUnsafeBusy], 'unsafe _closeSync() must not overlap an unsafe operation')
+    }
 
     this[kCache] = kEmpty
 

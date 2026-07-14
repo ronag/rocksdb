@@ -451,6 +451,11 @@ export type RocksGetManyReadResult<
       ? RocksPackedGetManyResult | RocksRawGetManyResult<E>
       : RocksRawGetManyResult<E>
 
+/**
+ * Unsafe iterator operations that bypass public lifecycle and serialization
+ * checks. Keep the iterator and database open, do not overlap operations, and
+ * pass values matching the declared types until each operation settles.
+ */
 export interface RocksIteratorNative<
   KRaw,
   VRaw,
@@ -551,6 +556,10 @@ export interface RocksBatchToArrayOptions<
   valueEncoding?: VEncoding
 }
 
+/**
+ * A chained batch with unsafe `_` methods for callers that own lifecycle and
+ * serialization. Do not overlap those methods with another operation or close.
+ */
 export interface RocksChainedBatch<TDatabase, KDefault, VDefault>
   extends AbstractChainedBatch<TDatabase, KDefault, VDefault> {
   put (key: KDefault, value: VDefault): this
@@ -764,18 +773,22 @@ export class RocksLevel<KDefault = string, VDefault = string>
   clear<K = KDefault> (options: RocksClearOptions<K>): Promise<void>
   clear<K = KDefault> (options: RocksClearOptions<K>, callback: NodeCallback<void>): void
 
+  /**
+   * Unsafe raw read. The database must remain open and keys must be a stable,
+   * non-reentrant array satisfying the declared element type until admission.
+   */
   _getManyAsync<
     E extends RocksRawEncoding = 'buffer',
     Packed extends RocksPackedReadMode = RocksDefaultPackedMode<E>
   > (
-    keys: RocksSlice[],
+    keys: readonly RocksSlice[],
     options?: RocksRawGetManyOptions<E, Packed>
   ): Promise<RocksGetManyReadResult<E, Packed>>
   _getManyAsync<
     E extends RocksRawEncoding = 'buffer',
     Packed extends RocksPackedReadMode = RocksDefaultPackedMode<E>
   > (
-    keys: RocksSlice[],
+    keys: readonly RocksSlice[],
     options: RocksRawGetManyOptions<E, Packed> | undefined,
     callback: undefined,
     allowPartial?: boolean
@@ -784,18 +797,20 @@ export class RocksLevel<KDefault = string, VDefault = string>
     E extends RocksRawEncoding = 'buffer',
     Packed extends RocksPackedReadMode = RocksDefaultPackedMode<E>
   > (
-    keys: RocksSlice[],
+    keys: readonly RocksSlice[],
     options: RocksRawGetManyOptions<E, Packed> | undefined,
     callback: RocksPackedReadCallback<RocksGetManyReadResult<E, Packed>>,
     allowPartial?: boolean
   ): void
+  /** Unsafe synchronous raw read with the same invariants as `_getManyAsync`. */
   _getManySync<
     E extends RocksRawEncoding = 'buffer',
     Packed extends RocksPackedReadMode = RocksDefaultPackedMode<E>
   > (
-    keys: RocksSlice[],
+    keys: readonly RocksSlice[],
     options?: RocksRawGetManyOptions<E, Packed>
   ): RocksGetManyReadResult<E, Packed>
+  /** Unsafe raw iterator construction. The database must already be open. */
   _iterator<
     KEncoding extends RocksRawEncoding = 'buffer',
     VEncoding extends RocksRawEncoding = 'buffer',
@@ -812,6 +827,7 @@ export class RocksLevel<KDefault = string, VDefault = string>
     KEncoding,
     VEncoding
   >
+  /** Unsafe raw batch construction. The database must already be open. */
   _chainedBatch (): RocksChainedBatch<this, KDefault, VDefault>
 
   getProperty (property: string, options?: RocksColumnOperationOptions): string
