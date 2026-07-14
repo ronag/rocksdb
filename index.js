@@ -551,6 +551,30 @@ class RocksLevel extends AbstractLevel {
     return binding.db_get_property(this[kContext], property, options ?? kEmpty)
   }
 
+  // Batch form of getProperty: read many properties from one column family in a
+  // single native call. Returns a plain object mapping each property name to its
+  // (string) value; a missing property maps to '' (same as getProperty). This
+  // avoids one JS<->native transition per property when sampling many at once.
+  getProperties (properties, options) {
+    if (!Array.isArray(properties)) {
+      throw new TypeError("The first argument 'properties' must be an array")
+    }
+    for (const property of properties) {
+      if (typeof property !== 'string') {
+        throw new TypeError("The 'properties' array must contain only strings")
+      }
+    }
+
+    // Is synchronous, so can't be deferred
+    if (this.status !== 'open') {
+      throw new ModuleError('Database is not open', {
+        code: 'LEVEL_DATABASE_NOT_OPEN'
+      })
+    }
+
+    return binding.db_get_properties(this[kContext], properties, options ?? kEmpty)
+  }
+
   // Toggle ticker collection at runtime. Returns true when a collector is
   // attached and false otherwise. On a RocksStatistics resource this changes
   // collection globally for every DB sharing that resource.
