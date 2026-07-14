@@ -32,8 +32,9 @@ Packed `getMany` results contain:
 - `statuses`: one status per key (`0` value, `1` not found, `2` incomplete)
 - `count`: number of requested keys
 
-Packed reads always return raw bytes, so `valueEncoding` must be omitted or set
-to `buffer`.
+Packed reads always return raw bytes. Packed `getMany` reads therefore require
+`valueEncoding: 'buffer'` (or no encoding), while packed iterator reads require
+`keyEncoding` and `valueEncoding` to be `buffer` for each enabled field.
 
 ## Packed `getMany` benchmark
 

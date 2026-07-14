@@ -176,6 +176,41 @@ test('packed nextv rejects prefetched rows instead of changing their encoding', 
   t.end()
 })
 
+test('packed nextv rejects decoded iterator encodings', async function (t) {
+  const expected = 'Packed iterator only supports buffer key and value encodings'
+
+  for (const packed of [true, 'auto']) {
+    const sync = db._iterator({ keyEncoding: 'utf8', valueEncoding: 'utf8' })
+    t.throws(
+      () => sync._nextvSync(1, { packed }),
+      (err) => err instanceof TypeError && err.message === expected,
+      `sync rejects decoded encodings for ${packed}`
+    )
+    await sync.close()
+
+    const async = db._iterator({ keyEncoding: 'utf8', valueEncoding: 'utf8' })
+    const err = await async._nextvAsync(1, { packed }).then(
+      () => null,
+      (err) => err
+    )
+    t.ok(err instanceof TypeError && err.message === expected,
+      `async rejects decoded encodings for ${packed}`)
+    await async.close()
+  }
+
+  const values = db._iterator({ keys: false, keyEncoding: 'utf8', valueEncoding: 'buffer' })
+  t.equal((await values._nextvAsync(1, { packed: true })).packed, true,
+    'a disabled key field does not constrain its encoding')
+  await values.close()
+
+  const keys = db._iterator({ values: false, keyEncoding: 'buffer', valueEncoding: 'utf8' })
+  t.equal(keys._nextvSync(1, { packed: true }).packed, true,
+    'a disabled value field does not constrain its encoding')
+  await keys.close()
+
+  t.end()
+})
+
 test('packed nextv flushes a close requested by a throwing option accessor', async function (t) {
   const iterator = db._iterator({ keyEncoding: 'buffer', valueEncoding: 'buffer' })
   const expected = new Error('timeout getter failed')

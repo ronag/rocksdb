@@ -1258,6 +1258,17 @@ class Iterator final : public BaseIterator, public std::enable_shared_from_this<
     return true;
   }
 
+  bool ValidatePackedEncodings(napi_env env, const PackedMode mode) const {
+    if (mode == PackedMode::Unpacked ||
+        ((!keys_ || keyEncoding_ == Encoding::Buffer) &&
+         (!values_ || valueEncoding_ == Encoding::Buffer))) {
+      return true;
+    }
+
+    napi_throw_type_error(env, nullptr, "Packed iterator only supports buffer key and value encodings");
+    return false;
+  }
+
  public:
   Iterator(Database* database,
            std::shared_ptr<DatabaseReference> reference,
@@ -1418,6 +1429,8 @@ class Iterator final : public BaseIterator, public std::enable_shared_from_this<
                    uint32_t timeout,
                    napi_value callback,
                    const PackedMode mode = PackedMode::Unpacked) {
+    if (!ValidatePackedEncodings(env, mode)) return nullptr;
+
     struct State {
       std::vector<rocksdb::PinnableSlice> keys;
       std::vector<rocksdb::PinnableSlice> values;
@@ -1653,6 +1666,8 @@ class Iterator final : public BaseIterator, public std::enable_shared_from_this<
                    uint32_t count,
                    const uint32_t timeout = 0,
                    const PackedMode mode = PackedMode::Unpacked) {
+    if (!ValidatePackedEncodings(env, mode)) return nullptr;
+
     std::shared_ptr<DatabaseOperation> databaseOperation;
     NAPI_STATUS_THROWS(BeginDatabaseOperation(env, database_, reference_, databaseOperation));
     std::lock_guard operationLock(operationMutex_);
