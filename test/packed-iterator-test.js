@@ -348,6 +348,19 @@ test('packed nextv rejects unsupported iterator encodings', async function (t) {
   t.end()
 })
 
+test('raw iterator rejects callable options before encoding proxy preparation', function (t) {
+  const options = function () {}
+  options.keyEncoding = 'utf8'
+  options.valueEncoding = 'utf8'
+
+  t.throws(
+    () => db._iterator(options),
+    (err) => err instanceof TypeError && err.message === 'The second argument must be an options object',
+    'AbstractIterator preserves callable options as invalid'
+  )
+  t.end()
+})
+
 test('packed nextv flushes a close requested by a throwing option accessor', async function (t) {
   const iterator = db._iterator({ keyEncoding: 'buffer', valueEncoding: 'buffer' })
   const expected = new Error('timeout getter failed')
