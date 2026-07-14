@@ -9,6 +9,7 @@ const {
   DEPENDENCIES,
   cloneAtCommit,
   stampMatches,
+  supportsSha1ObjectFormat,
   verifyCheckout
 } = require('../scripts/build-deps.js')
 
@@ -34,6 +35,14 @@ test('native dependencies use exact audited upstream commits', function (t) {
   for (const dependency of Object.values(DEPENDENCIES)) {
     t.match(dependency.commit, /^[0-9a-f]{40}$/, 'pin is a full lowercase SHA-1')
   }
+  t.end()
+})
+
+test('dependency checkout requires Git object-format support', function (t) {
+  t.notOk(supportsSha1ObjectFormat('git version 2.26.3'), 'Git 2.26 is rejected')
+  t.ok(supportsSha1ObjectFormat('git version 2.27.0'), 'Git 2.27 is accepted')
+  t.ok(supportsSha1ObjectFormat('git version 3.0.0'), 'future major versions are accepted')
+  t.notOk(supportsSha1ObjectFormat('unknown'), 'unparseable versions fail closed')
   t.end()
 })
 
