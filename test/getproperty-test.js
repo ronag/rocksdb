@@ -92,6 +92,16 @@ test('test empty getProperties() returns empty object', function (t) {
   t.end()
 })
 
+test('test getProperties() validates indexed elements', function (t) {
+  const properties = ['rocksdb.num-files-at-level0']
+  properties[Symbol.iterator] = function () {
+    throw new Error('custom iterator must not be called')
+  }
+
+  t.equal(db.getProperties(properties)[properties[0]], '0')
+  t.end()
+})
+
 test('test getProperties() batches values keyed by name', function (t) {
   const names = ['rocksdb.num-files-at-level0', 'rocksdb.num-files-at-level1', 'foo', '__proto__']
   const props = db.getProperties(names)

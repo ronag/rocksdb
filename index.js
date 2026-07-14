@@ -559,8 +559,8 @@ class RocksLevel extends AbstractLevel {
     if (!Array.isArray(properties)) {
       throw new TypeError("The first argument 'properties' must be an array")
     }
-    for (const property of properties) {
-      if (typeof property !== 'string') {
+    for (let n = 0; n < properties.length; n++) {
+      if (typeof properties[n] !== 'string') {
         throw new TypeError("The 'properties' array must contain only strings")
       }
     }
