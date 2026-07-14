@@ -55,6 +55,8 @@ function prepareRawGetManyOptions (options, packed) {
     }
   }
 
+  // Preserve callable options as napi_function so native validation continues
+  // to reject them. An object target would accidentally make them valid.
   const target = typeof options === 'function' ? function () {} : {}
   const bindingOptions = new Proxy(target, {
     get (target, property) {
