@@ -57,6 +57,11 @@ echo "Building darwin-arm64 prebuilds (node $NODE_TARGET)..."
 npm run build-deps
 JOBS=16 npx prebuildify -t "$NODE_TARGET" --napi --strip --arch arm64
 
+echo "Testing darwin-arm64 prebuilds..."
+# PREBUILDS_ONLY makes node-gyp-build fail instead of silently falling back to
+# build/Release, proving the artifact that will be published actually loads.
+npm run test-prebuild
+
 read -r -p "Version bump (patch/minor/major): " BUMP
 case "$BUMP" in
   patch | minor | major) ;;

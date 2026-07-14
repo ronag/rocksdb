@@ -2,7 +2,8 @@
 
 Building from source needs `git`, `cmake`, and a C/C++ toolchain. The native
 dependencies (abseil, re2, zstd) are downloaded and built automatically — see
-[scripts/build-deps.js](scripts/build-deps.js).
+[scripts/build-deps.js](scripts/build-deps.js). The dependency script fetches
+audited full commit IDs and verifies each detached checkout before building it.
 
 # Installing from source
 
@@ -36,5 +37,5 @@ runtime dependency on a Homebrew install.
 
 # Releasing
 
-`npm run release` ([release.sh](release.sh)) generates both platforms' prebuilds,
-then prompts for a version bump and publishes.
+`npm run release` ([release.sh](release.sh)) generates and smoke-tests both
+platforms' prebuilds, then prompts for a version bump and publishes.

@@ -21,24 +21,77 @@
 // tune the deps — the Docker prebuild flow does this for the shipped Linux
 // prebuild.
 //
-// The prefix carries a .stamp.json recording the tags and tuning that built
-// it; ensure() wipes and rebuilds a prefix whose stamp doesn't match, so a
-// tag bump or a different ROCKS_LEVEL_MARCH can never silently reuse stale
-// archives.
+// The prefix carries a .stamp.json recording the exact upstream commits and
+// tuning that built it; ensure() wipes and rebuilds a prefix whose stamp
+// doesn't match, so a dependency update or different ROCKS_LEVEL_MARCH can
+// never silently reuse stale archives.
 
-const fs = require('fs')
-const os = require('os')
-const path = require('path')
-const { execFileSync } = require('child_process')
+const fs = require('node:fs')
+const os = require('node:os')
+const path = require('node:path')
+const { execFileSync } = require('node:child_process')
 const { persistentPrefixDir } = require('./deps-prefix.js')
 
-const ABSEIL_TAG = '20240722.0'
-const RE2_TAG = '2025-11-05'
-const ZSTD_TAG = 'v1.5.7'
+const DEPENDENCIES = Object.freeze({
+  abseil: Object.freeze({
+    repository: 'https://github.com/abseil/abseil-cpp.git',
+    commit: '4447c7562e3bc702ade25105912dce503f0c4010'
+  }),
+  re2: Object.freeze({
+    repository: 'https://github.com/google/re2.git',
+    commit: '927f5d53caf8111721e734cf24724686bb745f55'
+  }),
+  zstd: Object.freeze({
+    repository: 'https://github.com/facebook/zstd.git',
+    commit: 'f8745da6ff1ad1e7bab384bd1f9d742439278e99'
+  })
+})
 const MACOS_DEPLOYMENT_TARGET = '13.4.0'
 
 function sh (cmd, args, opts = {}) {
   execFileSync(cmd, args, { stdio: 'inherit', ...opts })
+}
+
+function gitOutput (args) {
+  return execFileSync('git', args, {
+    encoding: 'utf8',
+    stdio: ['ignore', 'pipe', 'inherit']
+  }).trim()
+}
+
+function verifyCheckout (dependency, src) {
+  const head = gitOutput(['-C', src, 'rev-parse', '--verify', 'HEAD^{commit}'])
+  if (head !== dependency.commit) {
+    throw new Error(
+      `rocks-level: dependency checkout verification failed for ${src}: ` +
+      `expected ${dependency.commit}, got ${head}`
+    )
+  }
+}
+
+// Fetch the immutable object ID directly rather than resolving a mutable tag
+// or branch. Verify the detached checkout before any upstream build script is
+// allowed to run, and remove partial source state on every failure.
+function cloneAtCommit (dependency, src) {
+  try {
+    if (!/^[0-9a-f]{40}$/.test(dependency.commit)) {
+      throw new Error(
+        `rocks-level: dependency commit must be a full lowercase SHA-1: ${dependency.commit}`
+      )
+    }
+
+    // GitHub's pinned object IDs use SHA-1. Explicitly choose the repository
+    // format so a user's GIT_DEFAULT_HASH or init.defaultObjectFormat setting
+    // cannot create an incompatible SHA-256 repository.
+    sh('git', ['init', '--quiet', '--object-format=sha1', src])
+    sh('git', ['-C', src, 'remote', 'add', 'origin', dependency.repository])
+    sh('git', ['-C', src, 'fetch', '--quiet', '--depth', '1', '--no-tags', 'origin', dependency.commit])
+    sh('git', ['-C', src, 'checkout', '--quiet', '--detach', 'FETCH_HEAD'])
+    verifyCheckout(dependency, src)
+  } catch (err) {
+    fs.rmSync(src, { recursive: true, force: true })
+    throw err
+  }
 }
 
 function ensureTool (bin, hint) {
@@ -101,9 +154,9 @@ function currentStamp () {
   return {
     march: marchValue(),
     macosDeploymentTarget: process.platform === 'darwin' ? MACOS_DEPLOYMENT_TARGET : null,
-    abseil: ABSEIL_TAG,
-    re2: RE2_TAG,
-    zstd: ZSTD_TAG
+    abseil: DEPENDENCIES.abseil.commit,
+    re2: DEPENDENCIES.re2.commit,
+    zstd: DEPENDENCIES.zstd.commit
   }
 }
 
@@ -148,7 +201,7 @@ function buildAbseil (prefix, src) {
   if (hasAbsl(prefix)) return
 
   const build = path.join(src, 'build')
-  sh('git', ['clone', '--depth', '1', '--branch', ABSEIL_TAG, 'https://github.com/abseil/abseil-cpp.git', src])
+  cloneAtCommit(DEPENDENCIES.abseil, src)
   fs.mkdirSync(build, { recursive: true })
   sh('cmake', [
     '-S', src,
@@ -169,7 +222,7 @@ function buildRe2 (prefix, src) {
   if (fs.existsSync(path.join(prefix, 'lib', 'libre2.a'))) return
 
   const build = path.join(src, 'build')
-  sh('git', ['clone', '--depth', '1', '--branch', RE2_TAG, 'https://github.com/google/re2.git', src])
+  cloneAtCommit(DEPENDENCIES.re2, src)
   fs.mkdirSync(build, { recursive: true })
   sh('cmake', [
     '-S', src,
@@ -196,7 +249,7 @@ function buildRe2 (prefix, src) {
 function buildZstd (prefix, src) {
   if (fs.existsSync(path.join(prefix, 'lib', 'libzstd.a'))) return
 
-  sh('git', ['clone', '--depth', '1', '--branch', ZSTD_TAG, 'https://github.com/facebook/zstd.git', src])
+  cloneAtCommit(DEPENDENCIES.zstd, src)
   const lib = path.join(src, 'lib')
   const deploymentFlag = process.platform === 'darwin' ? `-mmacosx-version-min=${MACOS_DEPLOYMENT_TARGET}` : ''
   const cflags = ['-fPIC', '-O2', marchFlags(), deploymentFlag].filter(Boolean).join(' ')
@@ -209,7 +262,7 @@ function buildZstd (prefix, src) {
 }
 
 // Populates `prefix` with abseil/re2/zstd built from source. Idempotent: a
-// prefix whose stamp matches the current tags+tuning keeps its artifacts; a
+// prefix whose stamp matches the current commits+tuning keeps its artifacts; a
 // mismatching (or stampless) prefix is wiped and rebuilt. Source checkouts
 // live under <prefix>/_src and are removed on success.
 function ensure (prefix) {
@@ -253,4 +306,11 @@ if (require.main === module) {
   }
 }
 
-module.exports = { ensure, jobs, stampMatches }
+module.exports = {
+  DEPENDENCIES,
+  cloneAtCommit,
+  ensure,
+  jobs,
+  stampMatches,
+  verifyCheckout
+}
