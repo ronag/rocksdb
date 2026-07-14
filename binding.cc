@@ -27,6 +27,7 @@
 #include <atomic>
 #include <cmath>
 #include <condition_variable>
+#include <exception>
 #include <iostream>
 #include <limits>
 #include <map>
@@ -56,6 +57,83 @@
 #include "util.h"
 
 static const napi_type_tag kStatisticsTypeTag = {0x0d186ac9202c4fe5, 0xa6c8045ce0bb653d};
+
+// RocksDB recommends sizing its background pool to the number of CPU cores.
+// 256 leaves ample room for large hosts while preventing one open call from
+// attempting to create an effectively unbounded process-wide thread pool.
+static constexpr int kMaxBackgroundParallelism = 256;
+
+static constexpr int DefaultBackgroundParallelism(unsigned int hardwareConcurrency) {
+  return static_cast<int>(
+      std::clamp(hardwareConcurrency / 2, 1u, static_cast<unsigned int>(kMaxBackgroundParallelism)));
+}
+
+static_assert(DefaultBackgroundParallelism(0) == 1);
+static_assert(DefaultBackgroundParallelism(8) == 4);
+static_assert(DefaultBackgroundParallelism(1024) == kMaxBackgroundParallelism);
+
+static std::mutex& GetBackgroundParallelismMutex() {
+  // The default RocksDB Env and its thread pools are process-wide, so pool
+  // reconfiguration must also be serialized process-wide across JS workers.
+  static std::mutex mutex;
+  return mutex;
+}
+
+static bool ConfigureBackgroundParallelism(napi_env env,
+                                           rocksdb::Options& options,
+                                           int parallelism,
+                                           int flushParallelism) {
+  try {
+    std::lock_guard lock(GetBackgroundParallelismMutex());
+    auto* sharedEnv = options.env;
+    const int previousParallelism = sharedEnv->GetBackgroundThreads(rocksdb::Env::LOW);
+    const int previousFlushParallelism = sharedEnv->GetBackgroundThreads(rocksdb::Env::HIGH);
+
+    try {
+      // IncreaseParallelism() also immediately resizes LOW and forces HIGH to
+      // one. Set its option field directly so both validated pool targets can
+      // be applied in a controlled order behind the same exception barrier.
+      options.max_background_jobs = parallelism;
+
+      // Apply increases before reductions. If native thread creation fails,
+      // restoring the previous sizes only has to shrink partially-grown pools
+      // and therefore cannot require another thread allocation.
+      if (parallelism > previousParallelism) {
+        sharedEnv->SetBackgroundThreads(parallelism, rocksdb::Env::LOW);
+      }
+      if (flushParallelism > previousFlushParallelism) {
+        sharedEnv->SetBackgroundThreads(flushParallelism, rocksdb::Env::HIGH);
+      }
+      if (parallelism < previousParallelism) {
+        sharedEnv->SetBackgroundThreads(parallelism, rocksdb::Env::LOW);
+      }
+      if (flushParallelism < previousFlushParallelism) {
+        sharedEnv->SetBackgroundThreads(flushParallelism, rocksdb::Env::HIGH);
+      }
+    } catch (...) {
+      // SetBackgroundThreads() starts std::threads synchronously and can leave
+      // a pool partially enlarged when construction throws. Restore both
+      // process-wide limits before surfacing the original error to JavaScript.
+      try {
+        sharedEnv->SetBackgroundThreads(previousParallelism, rocksdb::Env::LOW);
+      } catch (...) {
+      }
+      try {
+        sharedEnv->SetBackgroundThreads(previousFlushParallelism, rocksdb::Env::HIGH);
+      } catch (...) {
+      }
+      throw;
+    }
+  } catch (const std::exception& error) {
+    napi_throw_error(env, "LEVEL_RESOURCE_LIMIT", error.what());
+    return false;
+  } catch (...) {
+    napi_throw_error(env, "LEVEL_RESOURCE_LIMIT", "Failed to configure RocksDB background threads");
+    return false;
+  }
+
+  return true;
+}
 
 enum ResourceName {
   ResourceIteratorNextv = 0,
@@ -2373,17 +2451,24 @@ NAPI_METHOD(db_open) {
 
     const auto options = argv[1];
 
-    int parallelism = std::max<int>(1, std::thread::hardware_concurrency() / 2);
+    int parallelism = DefaultBackgroundParallelism(std::thread::hardware_concurrency());
     NAPI_STATUS_THROWS(GetProperty(env, options, "parallelism", parallelism));
-    dbOptions.IncreaseParallelism(parallelism);
+    if (parallelism < 1 || parallelism > kMaxBackgroundParallelism) {
+      napi_throw_range_error(env, nullptr, "parallelism must be an integer between 1 and 256");
+      return nullptr;
+    }
 
     // IncreaseParallelism sizes the (process-wide) Env LOW pool to `parallelism`
     // but pins the HIGH pool — where every flush of every DB sharing the default
     // Env runs — at a single thread, so flushes across DBs serialize behind one
-    // thread. Both pools are process-wide: the last opened DB's value wins.
+    // thread. Both pools are process-wide: the last validated open attempt's
+    // value wins.
     int flushParallelism = std::max(1, parallelism / 4);
     NAPI_STATUS_THROWS(GetProperty(env, options, "flushParallelism", flushParallelism));
-    dbOptions.env->SetBackgroundThreads(std::max(1, flushParallelism), rocksdb::Env::HIGH);
+    if (flushParallelism < 1 || flushParallelism > kMaxBackgroundParallelism) {
+      napi_throw_range_error(env, nullptr, "flushParallelism must be an integer between 1 and 256");
+      return nullptr;
+    }
 
     NAPI_STATUS_THROWS(GetProperty(env, options, "walDir", dbOptions.wal_dir));
 
@@ -2595,6 +2680,12 @@ NAPI_METHOD(db_open) {
 
     napi_value resourceName;
     NAPI_STATUS_THROWS(GetResourceName(env, ResourceLeveldownOpen, resourceName));
+
+    // Do not mutate RocksDB's process-wide Env until all JavaScript options and
+    // column descriptors have passed synchronous validation.
+    if (!ConfigureBackgroundParallelism(env, dbOptions, parallelism, flushParallelism)) {
+      return nullptr;
+    }
 
     NAPI_STATUS_THROWS(runAsyncKeepAlive<OpenSnapshot>(
         resourceName, env, callback, argv[0],
