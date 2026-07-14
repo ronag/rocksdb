@@ -17,6 +17,7 @@
     "release": "./release.sh"
   },
   "dependencies": {
+    "@nxtedition/slice": "^2.0.0",
     "abstract-level": "^1.0.2",
     "catering": "^2.1.1",
     "module-error": "^1.0.2",

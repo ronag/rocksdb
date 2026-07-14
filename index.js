@@ -2,6 +2,7 @@
 
 const { fromCallback } = require('catering')
 const { AbstractLevel } = require('abstract-level')
+const { Slice } = require('@nxtedition/slice')
 const ModuleError = require('module-error')
 const binding = require('./binding')
 const { ChainedBatch } = require('./chained-batch')
@@ -26,17 +27,86 @@ const { getPackedMode, kRef, kUnref, setPackedResult } = require('./util')
 
 const kEmpty = Object.freeze({})
 
-function isPackedGetMany (options) {
-  const packed = getPackedMode(options)
+function isUtf8Encoding (encoding) {
+  return encoding === 'utf8' || encoding === 'utf-8'
+}
 
-  if (packed !== false) {
-    const valueEncoding = options?.valueEncoding
-    if (valueEncoding !== undefined && valueEncoding !== 'buffer') {
-      throw new TypeError('Packed getMany only supports buffer value encoding')
+function isJavaScriptEncoding (encoding) {
+  return encoding === 'slice' || isUtf8Encoding(encoding)
+}
+
+function getDefaultPackedMode (encoding) {
+  return encoding === 'buffer' || encoding === 'slice' ? 'auto' : false
+}
+
+function prepareRawGetManyOptions (options, packed) {
+  if ((typeof options !== 'object' || options === null) && typeof options !== 'function') {
+    return {
+      bindingOptions: options ?? kEmpty,
+      packed: packed ?? getPackedMode(options, 'auto'),
+      valueEncoding: 'buffer'
     }
   }
 
-  return packed
+  let valueEncoding
+  const readValueEncoding = () => {
+    if (valueEncoding === undefined) {
+      valueEncoding = Reflect.get(options, 'valueEncoding', options) ?? 'buffer'
+    }
+    return valueEncoding
+  }
+
+  if (packed == null) {
+    packed = getPackedMode(options, () => getDefaultPackedMode(readValueEncoding()))
+  }
+
+  if (packed !== false) {
+    const encoding = readValueEncoding()
+    if (encoding !== 'buffer' && !isJavaScriptEncoding(encoding)) {
+      throw new TypeError('Packed getMany only supports buffer, slice or utf8 value encoding')
+    }
+  }
+
+  // Preserve callable options as napi_function so native validation continues
+  // to reject them. An object target would accidentally make them valid.
+  const target = typeof options === 'function' ? function () {} : {}
+  const bindingOptions = new Proxy(target, {
+    get (target, property) {
+      if (property === 'valueEncoding') {
+        const encoding = readValueEncoding()
+        return encoding === 'slice' ? 'buffer' : encoding
+      }
+      return Reflect.get(options, property, options)
+    }
+  })
+
+  return {
+    bindingOptions,
+    packed,
+    get valueEncoding () {
+      return readValueEncoding()
+    }
+  }
+}
+
+function convertRawGetManyResult (result, valueEncoding) {
+  if (!isJavaScriptEncoding(valueEncoding)) return result
+
+  const convert = (buffer, start = 0, end = buffer.byteLength) => valueEncoding === 'slice'
+    ? new Slice(buffer, start, end - start)
+    : buffer.toString('utf8', start, end)
+
+  if (Array.isArray(result)) {
+    if (valueEncoding !== 'slice') return result
+    return result.map(value => Buffer.isBuffer(value) ? convert(value) : value)
+  }
+
+  return Array.from(result.statuses, (status, index) => {
+    if (status === 1) return undefined
+    if (status === 2) return null
+
+    return convert(result.buffer, result.offsets[index], result.offsets[index + 1])
+  })
 }
 
 class RocksLevel extends AbstractLevel {
@@ -264,13 +334,15 @@ class RocksLevel extends AbstractLevel {
       }
       this[kRef]()
       referenced = true
-      if (packed == null) packed = isPackedGetMany(bindingOptions)
+      const prepared = prepareRawGetManyOptions(bindingOptions, packed)
+      packed = prepared.packed
+      bindingOptions = prepared.bindingOptions
       const getMany = packed === true
         ? binding.db_get_many_packed
         : packed === 'auto'
           ? binding.db_get_many_auto
           : binding.db_get_many
-      getMany(this[kContext], keys, bindingOptions ?? kEmpty, (err, val) => {
+      getMany(this[kContext], keys, bindingOptions, (err, val) => {
         this[kUnref]()
         if (err) {
           callback(err)
@@ -288,6 +360,8 @@ class RocksLevel extends AbstractLevel {
             if (val[i] === null) indexes.push(i)
           }
         }
+
+        val = convertRawGetManyResult(val, prepared.valueEncoding)
 
         if (indexes.length === 0) {
           if (exposePacked) setPackedResult(val, packedResult)
@@ -356,14 +430,17 @@ class RocksLevel extends AbstractLevel {
 
     this[kRef]()
     try {
-      const packed = isPackedGetMany(options)
+      const prepared = prepareRawGetManyOptions(options)
+      const packed = prepared.packed
       const getMany = packed === true
         ? binding.db_get_many_packed_sync
         : packed === 'auto'
           ? binding.db_get_many_auto_sync
           : binding.db_get_many_sync
-      const result = getMany(this[kContext], keys, options ?? kEmpty)
-      return setPackedResult(result, !Array.isArray(result))
+      const nativeResult = getMany(this[kContext], keys, prepared.bindingOptions)
+      const packedResult = !Array.isArray(nativeResult)
+      const result = convertRawGetManyResult(nativeResult, prepared.valueEncoding)
+      return setPackedResult(result, packedResult)
     } finally {
       this[kUnref]()
     }

@@ -245,7 +245,8 @@ test('raw bounded getMany preserves partial markers', async function (t) {
     }
 
     const rows = await db._getManyAsync(['found', 'missing', 'partial'], {
-      highWaterMarkBytes: 0
+      highWaterMarkBytes: 0,
+      packed: false
     })
     t.equal(rows[0].toString(), 'value', 'found values remain buffers')
     t.equal(rows[1], undefined, 'missing keys remain undefined')
@@ -399,7 +400,7 @@ test('raw getMany observes bounded options in native order', async function (t) 
   const dbGetMany = binding.db_get_many
   let timeout = 0
   const reads = []
-  const options = {}
+  const options = { packed: false }
   Object.defineProperties(options, {
     column: {
       get () {

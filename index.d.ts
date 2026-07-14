@@ -1,4 +1,5 @@
 import { Buffer } from 'node:buffer'
+import { Slice } from '@nxtedition/slice'
 
 import {
   AbstractLevel,
@@ -41,6 +42,11 @@ export type RocksBatchSlice = RocksSlicePart | RocksSliceParts
 export type RocksNativeEncoding = 'buffer' | 'view' | 'utf8' | 'utf-8'
 export type RocksNativeValue = string | Buffer
 export type RocksDecoded<E extends RocksNativeEncoding> = E extends 'utf8' | 'utf-8' ? string : Buffer
+export type RocksRawEncoding = RocksNativeEncoding | 'slice'
+export type RocksJavaScriptEncoding = 'slice' | 'utf8' | 'utf-8'
+export type RocksRawDecoded<E extends RocksRawEncoding> = E extends 'slice'
+  ? Slice
+  : RocksDecoded<Extract<E, RocksNativeEncoding>>
 
 declare const columnHandleBrand: unique symbol
 declare const cacheHandleBrand: unique symbol
@@ -299,6 +305,18 @@ export interface RocksValueIteratorOptions<K, V>
   extends AbstractValueIteratorOptions<K, V>, RocksIteratorReadOptions {}
 
 export type RocksPackedReadMode = boolean | 'auto'
+export type RocksDefaultPackedMode<E extends RocksRawEncoding> =
+  [E] extends ['buffer' | 'slice'] ? 'auto' : false
+export type RocksDefaultIteratorPackedMode<
+  KEncoding extends RocksRawEncoding,
+  VEncoding extends RocksRawEncoding,
+  Keys extends boolean,
+  Values extends boolean
+> = Keys extends false
+  ? Values extends false ? 'auto' : RocksDefaultPackedMode<VEncoding>
+  : Values extends false
+    ? RocksDefaultPackedMode<KEncoding>
+    : [KEncoding | VEncoding] extends ['buffer' | 'slice'] ? 'auto' : false
 
 export type RocksPackedReadCallback<T> = (
   err: Error | undefined | null,
@@ -307,10 +325,12 @@ export type RocksPackedReadCallback<T> = (
 ) => void
 
 export interface RocksRawGetManyOptions<
-  E extends RocksNativeEncoding = RocksNativeEncoding,
-  Packed extends RocksPackedReadMode = false
+  E extends RocksRawEncoding = RocksRawEncoding,
+  Packed extends RocksPackedReadMode = RocksDefaultPackedMode<E>
 > extends RocksReadOptions {
-  valueEncoding?: [Packed] extends [false] ? E : 'buffer'
+  valueEncoding?: [Packed] extends [false]
+    ? E
+    : E & ('buffer' | RocksJavaScriptEncoding)
   packed?: Packed
 }
 
@@ -341,9 +361,10 @@ export interface RocksRawIteratorResult<
   K = Buffer,
   V = Buffer,
   Keys extends boolean = true,
-  Values extends boolean = true
+  Values extends boolean = true,
+  Packed extends boolean = false
 > {
-  readonly packed: false
+  readonly packed: Packed
   readonly rows: Array<RocksRows<K, V, Keys, Values>>
   readonly finished: boolean
   readonly limited?: boolean
@@ -377,13 +398,31 @@ export interface RocksPackedGetManyResult {
   readonly count: number
 }
 
-export type RocksRawGetManyResult<E extends RocksNativeEncoding> =
-  Array<RocksDecoded<E> | null | undefined> & { readonly packed: false }
+export type RocksRawGetManyResult<
+  E extends RocksRawEncoding,
+  Packed extends boolean = false
+> = Array<RocksRawDecoded<E> | null | undefined> & { readonly packed: Packed }
 
 export interface RocksRawIteratorReadOptions<Packed extends RocksPackedReadMode = false> {
   timeout?: number
   packed?: Packed
 }
+
+export type RocksSelectedPacked<Packed extends RocksPackedReadMode> = Packed extends true
+  ? true
+  : Packed extends 'auto' ? boolean : false
+
+export type RocksIsJavaScriptRaw<T> = [T] extends [Slice | string] ? true : false
+export type RocksIteratorNeedsJavaScriptRows<
+  KRaw,
+  VRaw,
+  Keys extends boolean,
+  Values extends boolean
+> = [Keys] extends [false]
+  ? [Values] extends [false] ? false : RocksIsJavaScriptRaw<VRaw>
+  : [Values] extends [false]
+    ? RocksIsJavaScriptRaw<KRaw>
+    : RocksIsJavaScriptRaw<KRaw> extends true ? true : RocksIsJavaScriptRaw<VRaw>
 
 export type RocksIteratorReadResult<
   KRaw,
@@ -391,26 +430,32 @@ export type RocksIteratorReadResult<
   Keys extends boolean,
   Values extends boolean,
   Packed extends RocksPackedReadMode
-> = Packed extends true
-  ? RocksPackedIteratorResult
-  : Packed extends 'auto'
-    ? RocksPackedIteratorResult | RocksRawIteratorResult<KRaw, VRaw, Keys, Values>
-    : RocksRawIteratorResult<KRaw, VRaw, Keys, Values>
+> = RocksIteratorNeedsJavaScriptRows<KRaw, VRaw, Keys, Values> extends true
+  ? RocksRawIteratorResult<KRaw, VRaw, Keys, Values, RocksSelectedPacked<Packed>>
+  : Packed extends true
+    ? RocksPackedIteratorResult
+    : Packed extends 'auto'
+      ? RocksPackedIteratorResult | RocksRawIteratorResult<KRaw, VRaw, Keys, Values>
+      : RocksRawIteratorResult<KRaw, VRaw, Keys, Values>
 
 export type RocksGetManyReadResult<
-  E extends RocksNativeEncoding,
+  E extends RocksRawEncoding,
   Packed extends RocksPackedReadMode
-> = Packed extends true
-  ? RocksPackedGetManyResult
-  : Packed extends 'auto'
-    ? RocksPackedGetManyResult | RocksRawGetManyResult<E>
-    : RocksRawGetManyResult<E>
+> = E extends RocksJavaScriptEncoding
+  ? RocksRawGetManyResult<E, RocksSelectedPacked<Packed>>
+  : Packed extends true
+    ? RocksPackedGetManyResult
+    : Packed extends 'auto'
+      ? RocksPackedGetManyResult | RocksRawGetManyResult<E>
+      : RocksRawGetManyResult<E>
 
 export interface RocksIteratorNative<
   KRaw,
   VRaw,
   Keys extends boolean = true,
-  Values extends boolean = true
+  Values extends boolean = true,
+  KEncoding extends RocksRawEncoding = RocksRawEncoding,
+  VEncoding extends RocksRawEncoding = RocksRawEncoding
 > {
   readonly cached: number
   [Symbol.asyncDispose] (): Promise<void>
@@ -418,15 +463,30 @@ export interface RocksIteratorNative<
   _seekSync (target: RocksSlice): void
   _seekAsync (target: RocksSlice): Promise<void>
   _seekAsync (target: RocksSlice, callback: NodeCallback<void>): void
-  _nextvSync<Packed extends RocksPackedReadMode = false> (
+  _nextvSync<Packed extends RocksPackedReadMode = RocksDefaultIteratorPackedMode<
+    KEncoding,
+    VEncoding,
+    Keys,
+    Values
+  >> (
     size: number,
     options?: RocksRawIteratorReadOptions<Packed>
   ): RocksIteratorReadResult<KRaw, VRaw, Keys, Values, Packed>
-  _nextvAsync<Packed extends RocksPackedReadMode = false> (
+  _nextvAsync<Packed extends RocksPackedReadMode = RocksDefaultIteratorPackedMode<
+    KEncoding,
+    VEncoding,
+    Keys,
+    Values
+  >> (
     size: number,
     options?: RocksRawIteratorReadOptions<Packed>
   ): Promise<RocksIteratorReadResult<KRaw, VRaw, Keys, Values, Packed>>
-  _nextvAsync<Packed extends RocksPackedReadMode = false> (
+  _nextvAsync<Packed extends RocksPackedReadMode = RocksDefaultIteratorPackedMode<
+    KEncoding,
+    VEncoding,
+    Keys,
+    Values
+  >> (
     size: number,
     options: RocksRawIteratorReadOptions<Packed> | undefined,
     callback: RocksPackedReadCallback<RocksIteratorReadResult<KRaw, VRaw, Keys, Values, Packed>>
@@ -443,7 +503,9 @@ export type RocksIterator<
   Keys extends boolean = true,
   Values extends boolean = true,
   KRaw = K,
-  VRaw = V
+  VRaw = V,
+  KEncoding extends RocksRawEncoding = RocksRawEncoding,
+  VEncoding extends RocksRawEncoding = RocksRawEncoding
 > = Omit<
   AbstractIterator<
     TDatabase,
@@ -451,7 +513,7 @@ export type RocksIterator<
     RocksIteratorValue<V, Values>
   >,
   'seek' | 'next' | typeof Symbol.asyncIterator
-> & RocksIteratorNative<KRaw, VRaw, Keys, Values> & {
+> & RocksIteratorNative<KRaw, VRaw, Keys, Values, KEncoding, VEncoding> & {
   next (): Promise<RocksIteratorEntry<K, V, Keys, Values> | undefined>
   next (callback: RocksIteratorNextCallback<K, V, Keys, Values>): void
   [Symbol.asyncIterator] (): AsyncGenerator<RocksIteratorEntry<K, V, Keys, Values>, void, unknown>
@@ -534,6 +596,19 @@ export interface RocksQueryOptions<
   limit?: number
   keys?: Keys
   values?: Values
+  keyEncoding?: KEncoding
+  valueEncoding?: VEncoding
+}
+
+export type RocksRawIteratorOptions<
+  KEncoding extends RocksRawEncoding = RocksRawEncoding,
+  VEncoding extends RocksRawEncoding = RocksRawEncoding,
+  Keys extends boolean = boolean,
+  Values extends boolean = boolean
+> = Omit<
+  RocksQueryOptions<RocksNativeEncoding, RocksNativeEncoding, Keys, Values>,
+  'keyEncoding' | 'valueEncoding'
+> & {
   keyEncoding?: KEncoding
   valueEncoding?: VEncoding
 }
@@ -688,15 +763,15 @@ export class RocksLevel<KDefault = string, VDefault = string>
   clear<K = KDefault> (options: RocksClearOptions<K>, callback: NodeCallback<void>): void
 
   _getManyAsync<
-    E extends RocksNativeEncoding = 'buffer',
-    Packed extends RocksPackedReadMode = false
+    E extends RocksRawEncoding = 'buffer',
+    Packed extends RocksPackedReadMode = RocksDefaultPackedMode<E>
   > (
     keys: RocksSlice[],
     options?: RocksRawGetManyOptions<E, Packed>
   ): Promise<RocksGetManyReadResult<E, Packed>>
   _getManyAsync<
-    E extends RocksNativeEncoding = 'buffer',
-    Packed extends RocksPackedReadMode = false
+    E extends RocksRawEncoding = 'buffer',
+    Packed extends RocksPackedReadMode = RocksDefaultPackedMode<E>
   > (
     keys: RocksSlice[],
     options: RocksRawGetManyOptions<E, Packed> | undefined,
@@ -704,8 +779,8 @@ export class RocksLevel<KDefault = string, VDefault = string>
     allowPartial?: boolean
   ): Promise<RocksGetManyReadResult<E, Packed>>
   _getManyAsync<
-    E extends RocksNativeEncoding = 'buffer',
-    Packed extends RocksPackedReadMode = false
+    E extends RocksRawEncoding = 'buffer',
+    Packed extends RocksPackedReadMode = RocksDefaultPackedMode<E>
   > (
     keys: RocksSlice[],
     options: RocksRawGetManyOptions<E, Packed> | undefined,
@@ -713,25 +788,27 @@ export class RocksLevel<KDefault = string, VDefault = string>
     allowPartial?: boolean
   ): void
   _getManySync<
-    E extends RocksNativeEncoding = 'buffer',
-    Packed extends RocksPackedReadMode = false
+    E extends RocksRawEncoding = 'buffer',
+    Packed extends RocksPackedReadMode = RocksDefaultPackedMode<E>
   > (
     keys: RocksSlice[],
     options?: RocksRawGetManyOptions<E, Packed>
   ): RocksGetManyReadResult<E, Packed>
   _iterator<
-    KEncoding extends RocksNativeEncoding = 'buffer',
-    VEncoding extends RocksNativeEncoding = 'buffer',
+    KEncoding extends RocksRawEncoding = 'buffer',
+    VEncoding extends RocksRawEncoding = 'buffer',
     Keys extends boolean = true,
     Values extends boolean = true
-  > (options: RocksQueryOptions<KEncoding, VEncoding, Keys, Values>): RocksIterator<
+  > (options: RocksRawIteratorOptions<KEncoding, VEncoding, Keys, Values>): RocksIterator<
     this,
-    RocksDecoded<KEncoding>,
-    RocksDecoded<VEncoding>,
+    RocksRawDecoded<KEncoding>,
+    RocksRawDecoded<VEncoding>,
     Keys,
     Values,
-    RocksDecoded<KEncoding>,
-    RocksDecoded<VEncoding>
+    RocksRawDecoded<KEncoding>,
+    RocksRawDecoded<VEncoding>,
+    KEncoding,
+    VEncoding
   >
   _chainedBatch (): RocksChainedBatch<this, KDefault, VDefault>
 

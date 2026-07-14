@@ -24,8 +24,12 @@ test('unsafe getMany returns correct values', async function (t) {
   await batch.write()
 
   const keys = expected.map((_, i) => Buffer.from('key' + String(i).padStart(4, '0')))
-  const safe = db._getManySync(keys, { valueEncoding: 'buffer' })
-  const unsafe = db._getManySync(keys, { valueEncoding: 'buffer', unsafe: true })
+  const safe = db._getManySync(keys, { valueEncoding: 'buffer', packed: false })
+  const unsafe = db._getManySync(keys, {
+    valueEncoding: 'buffer',
+    packed: false,
+    unsafe: true
+  })
   const asyncUnsafe = await db._getMany(keys, { valueEncoding: 'buffer', unsafe: true })
 
   t.equal(unsafe.length, n, 'returns all values')
@@ -38,8 +42,14 @@ test('unsafe getMany returns correct values', async function (t) {
 
   // Retain the external buffers, force GC pressure, and re-read: the retained
   // buffers must still hold valid (pinned) bytes — i.e. no use-after-free.
-  const retained = db._getManySync(keys, { valueEncoding: 'buffer', unsafe: true })
-  for (let r = 0; r < 50; r++) db._getManySync(keys, { valueEncoding: 'buffer', unsafe: true })
+  const retained = db._getManySync(keys, {
+    valueEncoding: 'buffer',
+    packed: false,
+    unsafe: true
+  })
+  for (let r = 0; r < 50; r++) {
+    db._getManySync(keys, { valueEncoding: 'buffer', packed: false, unsafe: true })
+  }
   if (global.gc) global.gc()
   let stillValid = true
   for (let i = 0; i < n; i++) if (!retained[i].equals(expected[i])) stillValid = false
@@ -154,7 +164,11 @@ test('unsafe with empty values', async function (t) {
   const db = testCommon.factory({ keyEncoding: 'buffer', valueEncoding: 'buffer' })
   await db.open()
   await db.put(Buffer.from('empty'), Buffer.alloc(0))
-  const [val] = db._getManySync([Buffer.from('empty')], { valueEncoding: 'buffer', unsafe: true })
+  const [val] = db._getManySync([Buffer.from('empty')], {
+    valueEncoding: 'buffer',
+    packed: false,
+    unsafe: true
+  })
   t.ok(Buffer.isBuffer(val), 'empty value returns a buffer')
   t.equal(val.length, 0, 'empty value has length 0')
   await db.close()
@@ -185,6 +199,7 @@ test('unsafe cache-backed buffers can be collected after db close', async functi
   await db.open()
   let value = db._getManySync([Buffer.from('cached')], {
     valueEncoding: 'buffer',
+    packed: false,
     unsafe: true,
     fillCache: true
   })[0]

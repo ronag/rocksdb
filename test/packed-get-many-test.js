@@ -1,6 +1,7 @@
 'use strict'
 
 const test = require('tape')
+const { Slice } = require('@nxtedition/slice')
 const testCommon = require('./common')
 
 function unpack (result) {
@@ -58,27 +59,112 @@ test('packed option does not change public get or getMany result shapes', async 
   t.end()
 })
 
-test('packed raw getMany rejects decoded value encodings', async function (t) {
+test('packed raw getMany rejects unsupported value encodings', async function (t) {
   const db = testCommon.factory({ keyEncoding: 'buffer', valueEncoding: 'buffer' })
   await db.open()
 
+  const expected = 'Packed getMany only supports buffer, slice or utf8 value encoding'
   for (const packed of [true, 'auto']) {
     let syncError
     try {
-      db._getManySync([Buffer.from('a')], { packed, valueEncoding: 'utf8' })
+      db._getManySync([Buffer.from('a')], { packed, valueEncoding: 'view' })
     } catch (err) {
       syncError = err
     }
 
     const asyncError = await db._getManyAsync(
       [Buffer.from('a')],
-      { packed, valueEncoding: 'utf8' }
+      { packed, valueEncoding: 'view' }
     ).then(() => null, (err) => err)
 
     t.ok(syncError instanceof TypeError, `sync rejects the incompatible encoding for ${packed}`)
-    t.equal(syncError.message, 'Packed getMany only supports buffer value encoding')
+    t.equal(syncError.message, expected)
     t.ok(asyncError instanceof TypeError, `async rejects the incompatible encoding for ${packed}`)
-    t.equal(asyncError.message, 'Packed getMany only supports buffer value encoding')
+    t.equal(asyncError.message, expected)
+  }
+
+  await db.close()
+  t.end()
+})
+
+test('utf8 getMany converts unpacked and packed native values to strings', async function (t) {
+  const db = testCommon.factory({ keyEncoding: 'buffer', valueEncoding: 'buffer' })
+  await db.open()
+  await db.batch([
+    { type: 'put', key: 'a', value: Buffer.from('one') },
+    { type: 'put', key: 'empty', value: Buffer.alloc(0) },
+    { type: 'put', key: 'large', value: Buffer.alloc(8 * 1024 + 1, 0x78) }
+  ])
+
+  for (const [name, read] of [
+    ['sync', (packed, keys = ['a', 'missing', 'empty'], valueEncoding = 'utf8') => db._getManySync(keys, {
+      packed,
+      valueEncoding
+    })],
+    ['async', (packed, keys = ['a', 'missing', 'empty'], valueEncoding = 'utf8') => db._getManyAsync(keys, {
+      packed,
+      valueEncoding
+    })]
+  ]) {
+    for (const packed of [undefined, false, true, 'auto']) {
+      const result = await read(packed)
+      t.ok(Array.isArray(result), `${name} ${packed} returns the ordinary getMany shape`)
+      t.equal(result.packed, packed === true || packed === 'auto',
+        `${name} ${packed} reports the native mode`)
+      t.same(result, ['one', undefined, ''], `${name} ${packed} converts values to strings`)
+    }
+
+    const large = await read('auto', ['large'])
+    t.equal(large.packed, false, `${name} auto preserves the native unpacked choice`)
+    t.equal(typeof large[0], 'string', `${name} auto converts an unpacked value to a string`)
+    t.equal(large[0].length, 8 * 1024 + 1, `${name} auto preserves the large value`)
+
+    const alias = await read(true, ['a'], 'utf-8')
+    t.equal(alias.packed, true, `${name} utf-8 alias preserves the packed choice`)
+    t.same(alias, ['one'], `${name} utf-8 alias converts the value to a string`)
+  }
+
+  await db.close()
+  t.end()
+})
+
+test('slice getMany converts unpacked and packed native values to Slice objects', async function (t) {
+  const db = testCommon.factory({ keyEncoding: 'buffer', valueEncoding: 'buffer' })
+  await db.open()
+  await db.batch([
+    { type: 'put', key: 'a', value: Buffer.from('one') },
+    { type: 'put', key: 'empty', value: Buffer.alloc(0) },
+    { type: 'put', key: 'large', value: Buffer.alloc(8 * 1024 + 1, 0x78) }
+  ])
+
+  for (const [name, read] of [
+    ['sync', (packed, keys = ['a', 'missing', 'empty']) => db._getManySync(keys, {
+      packed,
+      valueEncoding: 'slice'
+    })],
+    ['async', (packed, keys = ['a', 'missing', 'empty']) => db._getManyAsync(keys, {
+      packed,
+      valueEncoding: 'slice'
+    })]
+  ]) {
+    for (const packed of [undefined, false, true, 'auto']) {
+      const result = await read(packed)
+      t.ok(Array.isArray(result), `${name} ${packed} returns the ordinary getMany shape`)
+      t.equal(result.packed, packed !== false, `${name} ${packed} reports the native mode`)
+      t.ok(result[0] instanceof Slice, `${name} ${packed} converts a value to Slice`)
+      t.equal(result[0].toString(), 'one', `${name} ${packed} preserves value bytes`)
+      t.equal(result[1], undefined, `${name} ${packed} preserves a missing value`)
+      t.ok(result[2] instanceof Slice, `${name} ${packed} converts an empty value to Slice`)
+      t.equal(result[2].byteLength, 0, `${name} ${packed} preserves an empty value`)
+      if (result.packed) {
+        t.equal(result[0].buffer, result[2].buffer,
+          `${name} ${packed} slices share the packed arena`)
+      }
+    }
+
+    const large = await read('auto', ['large'])
+    t.equal(large.packed, false, `${name} auto preserves the native unpacked choice`)
+    t.ok(large[0] instanceof Slice, `${name} auto converts an unpacked value to Slice`)
   }
 
   await db.close()
@@ -107,7 +193,7 @@ test('raw getMany rejects invalid packed modes', async function (t) {
   t.end()
 })
 
-test('auto getMany packs values up to the 8 KiB average threshold', async function (t) {
+test('getMany defaults to auto packing at the 8 KiB average threshold', async function (t) {
   const db = testCommon.factory({ keyEncoding: 'buffer', valueEncoding: 'buffer' })
   await db.open()
   await db.batch([
@@ -116,8 +202,8 @@ test('auto getMany packs values up to the 8 KiB average threshold', async functi
   ])
 
   for (const [name, read] of [
-    ['sync', (keys) => db._getManySync(keys, { packed: 'auto' })],
-    ['async', (keys) => db._getManyAsync(keys, { packed: 'auto' })]
+    ['sync', (keys) => db._getManySync(keys)],
+    ['async', (keys) => db._getManyAsync(keys)]
   ]) {
     const small = await read(['small'])
     const large = await read(['large'])
@@ -134,7 +220,7 @@ test('auto getMany packs values up to the 8 KiB average threshold', async functi
   t.end()
 })
 
-test('auto getMany observes valueEncoding once and preserves raw buffers', async function (t) {
+test('auto getMany observes valueEncoding once', async function (t) {
   const db = testCommon.factory({ keyEncoding: 'buffer', valueEncoding: 'buffer' })
   await db.open()
   await db.put('large', Buffer.alloc(8 * 1024 + 1, 0x61))
@@ -155,7 +241,7 @@ test('auto getMany observes valueEncoding once and preserves raw buffers', async
     const result = await read(options)
     t.equal(reads, 1, `${name} snapshots valueEncoding once`)
     t.equal(result.packed, false, `${name} selects unpacked mode for the large value`)
-    t.ok(Buffer.isBuffer(result[0]), `${name} preserves the validated buffer encoding`)
+    t.ok(Buffer.isBuffer(result[0]), `${name} preserves the observed buffer encoding`)
   }
 
   await db.close()

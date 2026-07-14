@@ -1238,6 +1238,10 @@ enum class PackedMode {
   Auto,
 };
 
+static bool SupportsPackedReads(const Encoding encoding) {
+  return encoding == Encoding::Buffer || encoding == Encoding::String;
+}
+
 static constexpr size_t kAutoPackedValueBytes = 8 * 1024;
 
 class Iterator final : public BaseIterator, public std::enable_shared_from_this<Iterator> {
@@ -1260,12 +1264,12 @@ class Iterator final : public BaseIterator, public std::enable_shared_from_this<
 
   bool ValidatePackedEncodings(napi_env env, const PackedMode mode) const {
     if (mode == PackedMode::Unpacked ||
-        ((!keys_ || keyEncoding_ == Encoding::Buffer) &&
-         (!values_ || valueEncoding_ == Encoding::Buffer))) {
+        ((!keys_ || SupportsPackedReads(keyEncoding_)) &&
+         (!values_ || SupportsPackedReads(valueEncoding_)))) {
       return true;
     }
 
-    napi_throw_type_error(env, nullptr, "Packed iterator only supports buffer key and value encodings");
+    napi_throw_type_error(env, nullptr, "Packed iterator only supports buffer or utf8 key and value encodings");
     return false;
   }
 
@@ -2743,7 +2747,7 @@ static napi_value db_get_many_sync_impl(napi_env env, napi_callback_info info, c
   NAPI_STATUS_THROWS(GetColumnProperty(env, argv[2], database, column));
 
   Encoding valueEncoding = Encoding::Buffer;
-  if (mode == PackedMode::Unpacked) {
+  if (mode != PackedMode::Packed) {
     NAPI_STATUS_THROWS(GetProperty(env, argv[2], "valueEncoding", valueEncoding));
   }
 
@@ -2852,7 +2856,7 @@ static napi_value db_get_many_impl(napi_env env, napi_callback_info info, const 
   NAPI_STATUS_THROWS(GetColumnProperty(env, argv[2], database, column));
 
   Encoding valueEncoding = Encoding::Buffer;
-  if (mode == PackedMode::Unpacked) {
+  if (mode != PackedMode::Packed) {
     NAPI_STATUS_THROWS(GetProperty(env, argv[2], "valueEncoding", valueEncoding));
   }
 
