@@ -31,6 +31,7 @@ const PROPERTIES = [
 
 const location = await mkdtemp(join(tmpdir(), 'rocks-get-properties-'))
 let db
+let failed = false
 
 try {
   db = new RocksLevel(location, { keyEncoding: 'buffer', valueEncoding: 'buffer' })
@@ -54,8 +55,12 @@ try {
   })
 
   await run()
+} catch (err) {
+  failed = true
+  throw err
 } finally {
-  if (db) await db.close().catch(() => {})
-  await rm(location, { recursive: true, force: true }).catch(() => {})
-  await cleanupAfterBenchmark()
+  await cleanupAfterBenchmark(failed, [
+    async () => { if (db) await db.close() },
+    () => rm(location, { recursive: true, force: true })
+  ])
 }

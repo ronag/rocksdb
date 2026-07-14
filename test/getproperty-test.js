@@ -71,6 +71,19 @@ test('test non-string element getProperties() throws', function (t) {
     name: 'TypeError',
     message: "The 'properties' array must contain only strings"
   })
+
+  let reads = 0
+  const unstable = []
+  Object.defineProperty(unstable, 0, {
+    get () {
+      return reads++ === 0 ? 'rocksdb.stats' : {}
+    }
+  })
+  unstable.length = 1
+  t.throws(db.getProperties.bind(db, unstable), {
+    name: 'TypeError',
+    message: "The 'properties' array must contain only strings"
+  }, 'native validation catches an element changed after JS validation')
   t.end()
 })
 
@@ -80,13 +93,14 @@ test('test empty getProperties() returns empty object', function (t) {
 })
 
 test('test getProperties() batches values keyed by name', function (t) {
-  const names = ['rocksdb.num-files-at-level0', 'rocksdb.num-files-at-level1', 'foo']
+  const names = ['rocksdb.num-files-at-level0', 'rocksdb.num-files-at-level1', 'foo', '__proto__']
   const props = db.getProperties(names)
   // Matches getProperty() one-by-one, so the batch form is a drop-in.
   for (const name of names) {
     t.equal(props[name], db.getProperty(name), name + ' matches getProperty()')
   }
   t.equal(props.foo, '', 'unknown property maps to empty string')
+  t.ok(Object.hasOwn(props, '__proto__'), '__proto__ is an own result property')
   t.end()
 })
 

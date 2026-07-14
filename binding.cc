@@ -3212,6 +3212,13 @@ NAPI_METHOD(db_get_properties) {
     napi_value name;
     NAPI_STATUS_THROWS(napi_get_element(env, argv[1], n, &name));
 
+    napi_valuetype type;
+    NAPI_STATUS_THROWS(napi_typeof(env, name, &type));
+    if (type != napi_string) {
+      napi_throw_type_error(env, NULL, "The 'properties' array must contain only strings");
+      return NULL;
+    }
+
     rocksdb::PinnableSlice property;
     NAPI_STATUS_THROWS(GetValue(env, name, property));
 
@@ -3222,7 +3229,11 @@ NAPI_METHOD(db_get_properties) {
 
     napi_value element;
     NAPI_STATUS_THROWS(napi_create_string_utf8(env, value.data(), value.size(), &element));
-    NAPI_STATUS_THROWS(napi_set_property(env, result, name, element));
+    // Define an own data property so a property named "__proto__" does not
+    // invoke Object.prototype's setter and disappear from the result.
+    napi_property_descriptor descriptor = {
+        nullptr, name, nullptr, nullptr, nullptr, element, napi_default_jsproperty, nullptr};
+    NAPI_STATUS_THROWS(napi_define_properties(env, result, 1, &descriptor));
   }
 
   return result;
