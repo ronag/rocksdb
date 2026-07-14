@@ -267,8 +267,8 @@ class Iterator extends AbstractIterator {
         this[kInitError] = err
       } else {
         this[kInitState] = kReady
-        this[kInitialTarget] = null
       }
+      this[kInitialTarget] = null
 
       this[kBusy] = false
       const callbacks = this[kInitCallbacks]
@@ -783,6 +783,8 @@ class Iterator extends AbstractIterator {
     }
 
     this[kInitState] = kClosed
+    this[kInitCallbacks] = []
+    this[kInitError] = null
     this[kInitialTarget] = null
   }
 
