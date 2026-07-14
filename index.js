@@ -29,7 +29,7 @@ const kEmpty = Object.freeze({})
 function isPackedGetMany (options) {
   const packed = getPackedMode(options)
 
-  if (packed !== false) {
+  if (packed === true) {
     const valueEncoding = options?.valueEncoding
     if (valueEncoding !== undefined && valueEncoding !== 'buffer') {
       throw new TypeError('Packed getMany only supports buffer value encoding')

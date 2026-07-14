@@ -62,23 +62,39 @@ test('packed raw getMany rejects decoded value encodings', async function (t) {
   const db = testCommon.factory({ keyEncoding: 'buffer', valueEncoding: 'buffer' })
   await db.open()
 
-  for (const packed of [true, 'auto']) {
-    let syncError
-    try {
-      db._getManySync([Buffer.from('a')], { packed, valueEncoding: 'utf8' })
-    } catch (err) {
-      syncError = err
-    }
+  let syncError
+  try {
+    db._getManySync([Buffer.from('a')], { packed: true, valueEncoding: 'utf8' })
+  } catch (err) {
+    syncError = err
+  }
 
-    const asyncError = await db._getManyAsync(
-      [Buffer.from('a')],
-      { packed, valueEncoding: 'utf8' }
-    ).then(() => null, (err) => err)
+  const asyncError = await db._getManyAsync(
+    [Buffer.from('a')],
+    { packed: true, valueEncoding: 'utf8' }
+  ).then(() => null, (err) => err)
 
-    t.ok(syncError instanceof TypeError, `sync rejects the incompatible encoding for ${packed}`)
-    t.equal(syncError.message, 'Packed getMany only supports buffer value encoding')
-    t.ok(asyncError instanceof TypeError, `async rejects the incompatible encoding for ${packed}`)
-    t.equal(asyncError.message, 'Packed getMany only supports buffer value encoding')
+  t.ok(syncError instanceof TypeError, 'sync rejects the incompatible encoding')
+  t.equal(syncError.message, 'Packed getMany only supports buffer value encoding')
+  t.ok(asyncError instanceof TypeError, 'async rejects the incompatible encoding')
+  t.equal(asyncError.message, 'Packed getMany only supports buffer value encoding')
+
+  await db.close()
+  t.end()
+})
+
+test('auto getMany falls back to decoded values for non-buffer encodings', async function (t) {
+  const db = testCommon.factory({ keyEncoding: 'buffer', valueEncoding: 'buffer' })
+  await db.open()
+  await db.put('key', Buffer.from('value'))
+
+  for (const [name, read] of [
+    ['sync', () => db._getManySync(['key'], { packed: 'auto', valueEncoding: 'utf8' })],
+    ['async', () => db._getManyAsync(['key'], { packed: 'auto', valueEncoding: 'utf8' })]
+  ]) {
+    const result = await read()
+    t.equal(result.packed, false, `${name} reports the unpacked mode`)
+    t.same(result, ['value'], `${name} preserves the requested decoding`)
   }
 
   await db.close()
@@ -134,7 +150,7 @@ test('auto getMany packs values up to the 8 KiB average threshold', async functi
   t.end()
 })
 
-test('auto getMany observes valueEncoding once and preserves raw buffers', async function (t) {
+test('auto getMany observes valueEncoding once', async function (t) {
   const db = testCommon.factory({ keyEncoding: 'buffer', valueEncoding: 'buffer' })
   await db.open()
   await db.put('large', Buffer.alloc(8 * 1024 + 1, 0x61))
@@ -155,7 +171,7 @@ test('auto getMany observes valueEncoding once and preserves raw buffers', async
     const result = await read(options)
     t.equal(reads, 1, `${name} snapshots valueEncoding once`)
     t.equal(result.packed, false, `${name} selects unpacked mode for the large value`)
-    t.ok(Buffer.isBuffer(result[0]), `${name} preserves the validated buffer encoding`)
+    t.ok(Buffer.isBuffer(result[0]), `${name} preserves the observed buffer encoding`)
   }
 
   await db.close()

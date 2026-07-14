@@ -179,22 +179,25 @@ test('packed nextv rejects prefetched rows instead of changing their encoding', 
 test('packed nextv rejects decoded iterator encodings', async function (t) {
   const expected = 'Packed iterator only supports buffer key and value encodings'
 
-  for (const packed of [true, 'auto']) {
-    const sync = db._iterator({ keyEncoding: 'utf8', valueEncoding: 'utf8' })
+  for (const [name, options] of [
+    ['key', { keyEncoding: 'utf8', valueEncoding: 'buffer' }],
+    ['value', { keyEncoding: 'buffer', valueEncoding: 'utf8' }]
+  ]) {
+    const sync = db._iterator(options)
     t.throws(
-      () => sync._nextvSync(1, { packed }),
+      () => sync._nextvSync(1, { packed: true }),
       (err) => err instanceof TypeError && err.message === expected,
-      `sync rejects decoded encodings for ${packed}`
+      `sync rejects the decoded ${name} encoding`
     )
     await sync.close()
 
-    const async = db._iterator({ keyEncoding: 'utf8', valueEncoding: 'utf8' })
-    const err = await async._nextvAsync(1, { packed }).then(
+    const async = db._iterator(options)
+    const err = await async._nextvAsync(1, { packed: true }).then(
       () => null,
       (err) => err
     )
     t.ok(err instanceof TypeError && err.message === expected,
-      `async rejects decoded encodings for ${packed}`)
+      `async rejects the decoded ${name} encoding`)
     await async.close()
   }
 
@@ -207,6 +210,29 @@ test('packed nextv rejects decoded iterator encodings', async function (t) {
   t.equal(keys._nextvSync(1, { packed: true }).packed, true,
     'a disabled value field does not constrain its encoding')
   await keys.close()
+
+  t.end()
+})
+
+test('auto nextv falls back for enabled decoded iterator encodings', async function (t) {
+  for (const [name, options, check] of [
+    ['key', { keyEncoding: 'utf8', valueEncoding: 'buffer' },
+      (rows) => typeof rows[0] === 'string' && Buffer.isBuffer(rows[1])],
+    ['value', { keyEncoding: 'buffer', valueEncoding: 'utf8' },
+      (rows) => Buffer.isBuffer(rows[0]) && typeof rows[1] === 'string']
+  ]) {
+    const sync = db._iterator(options)
+    const syncResult = sync._nextvSync(1, { packed: 'auto' })
+    t.equal(syncResult.packed, false, `sync falls back for the ${name} encoding`)
+    t.ok(check(syncResult.rows), `sync preserves the ${name} decoding`)
+    await sync.close()
+
+    const async = db._iterator(options)
+    const asyncResult = await async._nextvAsync(1, { packed: 'auto' })
+    t.equal(asyncResult.packed, false, `async falls back for the ${name} encoding`)
+    t.ok(check(asyncResult.rows), `async preserves the ${name} decoding`)
+    await async.close()
+  }
 
   t.end()
 })

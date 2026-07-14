@@ -10,9 +10,11 @@ reads return one byte arena and typed-array metadata instead of allocating a
 JavaScript buffer for every key or value.
 
 With `packed: 'auto'`, reads use the packed representation for values up to 8
-KiB and the unpacked representation for larger values. `getMany` selects based
-on the average size of the values it found. Iterators select based on the first
-row in the batch, avoiding a second pass or a whole-batch copy.
+KiB and the unpacked representation for larger values. Automatic reads also
+use the unpacked representation whenever an enabled key or value encoding is
+not `buffer`. `getMany` selects based on the average size of the values it
+found. Iterators select based on the first row in the batch, avoiding a second
+pass or a whole-batch copy.
 
 Every raw result exposes a `packed: boolean` discriminator. Async callbacks
 also receive the selected mode as their third argument:
@@ -35,6 +37,7 @@ Packed `getMany` results contain:
 Packed reads always return raw bytes. Packed `getMany` reads therefore require
 `valueEncoding: 'buffer'` (or no encoding), while packed iterator reads require
 `keyEncoding` and `valueEncoding` to be `buffer` for each enabled field.
+Explicit `packed: true` reads throw when these requirements are not met.
 
 ## Packed `getMany` benchmark
 

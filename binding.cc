@@ -1258,10 +1258,15 @@ class Iterator final : public BaseIterator, public std::enable_shared_from_this<
     return true;
   }
 
-  bool ValidatePackedEncodings(napi_env env, const PackedMode mode) const {
+  bool ResolvePackedMode(napi_env env, PackedMode& mode) const {
     if (mode == PackedMode::Unpacked ||
         ((!keys_ || keyEncoding_ == Encoding::Buffer) &&
          (!values_ || valueEncoding_ == Encoding::Buffer))) {
+      return true;
+    }
+
+    if (mode == PackedMode::Auto) {
+      mode = PackedMode::Unpacked;
       return true;
     }
 
@@ -1428,8 +1433,8 @@ class Iterator final : public BaseIterator, public std::enable_shared_from_this<
                    uint32_t count,
                    uint32_t timeout,
                    napi_value callback,
-                   const PackedMode mode = PackedMode::Unpacked) {
-    if (!ValidatePackedEncodings(env, mode)) return nullptr;
+                   PackedMode mode = PackedMode::Unpacked) {
+    if (!ResolvePackedMode(env, mode)) return nullptr;
 
     struct State {
       std::vector<rocksdb::PinnableSlice> keys;
@@ -1665,8 +1670,8 @@ class Iterator final : public BaseIterator, public std::enable_shared_from_this<
   napi_value nextv(napi_env env,
                    uint32_t count,
                    const uint32_t timeout = 0,
-                   const PackedMode mode = PackedMode::Unpacked) {
-    if (!ValidatePackedEncodings(env, mode)) return nullptr;
+                   PackedMode mode = PackedMode::Unpacked) {
+    if (!ResolvePackedMode(env, mode)) return nullptr;
 
     std::shared_ptr<DatabaseOperation> databaseOperation;
     NAPI_STATUS_THROWS(BeginDatabaseOperation(env, database_, reference_, databaseOperation));
@@ -2743,7 +2748,7 @@ static napi_value db_get_many_sync_impl(napi_env env, napi_callback_info info, c
   NAPI_STATUS_THROWS(GetColumnProperty(env, argv[2], database, column));
 
   Encoding valueEncoding = Encoding::Buffer;
-  if (mode == PackedMode::Unpacked) {
+  if (mode != PackedMode::Packed) {
     NAPI_STATUS_THROWS(GetProperty(env, argv[2], "valueEncoding", valueEncoding));
   }
 
@@ -2791,7 +2796,8 @@ static napi_value db_get_many_sync_impl(napi_env env, napi_callback_info info, c
   database->db->MultiGet(readOptions, column, count, keys.data(), values.data(), statuses.data());
 
   const auto packed = mode == PackedMode::Packed ||
-                      (mode == PackedMode::Auto && ShouldAutoPackGetMany(statuses, values));
+                      (mode == PackedMode::Auto && valueEncoding == Encoding::Buffer &&
+                       ShouldAutoPackGetMany(statuses, values));
   if (packed) {
     PackedGetManyResult packedResult;
     ROCKS_STATUS_THROWS_NAPI(PackGetManyResult(statuses, values, packedResult));
@@ -2852,7 +2858,7 @@ static napi_value db_get_many_impl(napi_env env, napi_callback_info info, const 
   NAPI_STATUS_THROWS(GetColumnProperty(env, argv[2], database, column));
 
   Encoding valueEncoding = Encoding::Buffer;
-  if (mode == PackedMode::Unpacked) {
+  if (mode != PackedMode::Packed) {
     NAPI_STATUS_THROWS(GetProperty(env, argv[2], "valueEncoding", valueEncoding));
   }
 
@@ -2927,7 +2933,8 @@ static napi_value db_get_many_impl(napi_env env, napi_callback_info info, const 
         database->db->MultiGet(readOptions, column, count, keys.data(), state.values.data(), state.statuses.data());
 
         state.packed = mode == PackedMode::Packed ||
-                       (mode == PackedMode::Auto && ShouldAutoPackGetMany(state.statuses, state.values));
+                       (mode == PackedMode::Auto && valueEncoding == Encoding::Buffer &&
+                        ShouldAutoPackGetMany(state.statuses, state.values));
         return state.packed ? PackGetManyResult(state.statuses, state.values, state.packedResult)
                             : rocksdb::Status::OK();
       },
