@@ -44,6 +44,7 @@ const getTypedArrayByteLength = Object.getOwnPropertyDescriptor(
   Object.getPrototypeOf(Object.getPrototypeOf(Buffer.prototype)),
   'byteLength'
 ).get
+const copyBytesFrom = Buffer.copyBytesFrom
 
 function normalizeSeekTarget (target) {
   if (typeof target === 'string') {
@@ -82,12 +83,9 @@ function normalizeSeekTarget (target) {
 function snapshotSeekTarget (target) {
   target = normalizeSeekTarget(target)
   if (typeof target === 'string') return target
-  if (Buffer.isBuffer(target)) return Buffer.from(target)
+  if (Buffer.isBuffer(target)) return copyBytesFrom(target)
 
-  return Buffer.from(target.buffer.subarray(
-    target.byteOffset,
-    target.byteOffset + target.byteLength
-  ))
+  return copyBytesFrom(target.buffer, target.byteOffset, target.byteLength)
 }
 
 function iteratorBusyError (operation) {
@@ -256,7 +254,14 @@ class Iterator extends AbstractIterator {
     this[kBusy] = true
 
     let referenced = false
+    let initializationScheduled = false
     const complete = (err) => {
+      // A scheduled native initializer closes failed state in its worker. Only
+      // a synchronous scheduling failure still needs fallback cleanup here.
+      if (err && !initializationScheduled) {
+        err = this._cleanupFailedInitialization(err)
+      }
+
       if (referenced) {
         referenced = false
         this[kDB][kUnref]()
@@ -289,6 +294,7 @@ class Iterator extends AbstractIterator {
         this[kInitialTarget],
         complete
       )
+      initializationScheduled = true
     } catch (err) {
       process.nextTick(complete, err)
     }
@@ -305,13 +311,30 @@ class Iterator extends AbstractIterator {
       binding.iterator_init_sync(this[kContext], initialTarget)
 
       this[kInitState] = kReady
-      this[kInitialTarget] = null
     } catch (err) {
+      const initializationError = this._cleanupFailedInitialization(err)
       this[kInitState] = kFailed
-      this[kInitError] = err
-      throw err
+      this[kInitError] = initializationError
+      throw initializationError
     } finally {
+      this[kInitialTarget] = null
       this[kDB][kUnref]()
+    }
+  }
+
+  _cleanupFailedInitialization (initializationError) {
+    if (!this[kContext]) return initializationError
+
+    try {
+      binding.iterator_close_sync(this[kContext])
+      this[kContext] = null
+      return initializationError
+    } catch (cleanupError) {
+      return new AggregateError(
+        [initializationError, cleanupError],
+        'Iterator initialization failed and its native resources could not be released',
+        { cause: initializationError }
+      )
     }
   }
 
@@ -351,7 +374,10 @@ class Iterator extends AbstractIterator {
   _seek (target) {
     if (this[kCloseRequested]) return
     if (this[kInitState] === kUninitialized) {
-      this[kInitialTarget] = snapshotSeekTarget(target)
+      const initialTarget = snapshotSeekTarget(target)
+      if (this[kCloseRequested]) return
+
+      this[kInitialTarget] = initialTarget
       this[kFirst] = true
       this[kCache] = kEmpty
       this[kFinished] = false
@@ -514,7 +540,7 @@ class Iterator extends AbstractIterator {
   // nxt API
 
   _refreshSync () {
-    assert(!this[kBusy])
+    if (this[kBusy]) throw iteratorBusyError('refresh')
     this._initializeSync()
     assert(this[kContext])
 
@@ -549,7 +575,9 @@ class Iterator extends AbstractIterator {
     this[kPosition] = 0
 
     if (this[kInitState] === kUninitialized) {
-      this._initializeSync(snapshotSeekTarget(target))
+      const initialTarget = snapshotSeekTarget(target)
+      if (this[kCloseRequested]) return
+      this._initializeSync(initialTarget)
     } else {
       this._initializeSync()
       binding.iterator_seek_sync(this[kContext], target, discardedCount)
@@ -576,7 +604,13 @@ class Iterator extends AbstractIterator {
 
       const discardedCount = (this[kCache].length - this[kPosition]) / 2
       if (this[kInitState] === kUninitialized) {
-        this[kInitialTarget] = snapshotSeekTarget(target)
+        const initialTarget = snapshotSeekTarget(target)
+        if (this[kCloseRequested]) {
+          this._deferSeekResult(callback)
+          return callback[kPromise]
+        }
+
+        this[kInitialTarget] = initialTarget
         this[kFirst] = true
         this[kCache] = kEmpty
         this[kFinished] = false
@@ -773,7 +807,7 @@ class Iterator extends AbstractIterator {
   }
 
   _closeSync () {
-    assert(!this[kBusy])
+    if (this[kBusy]) throw iteratorBusyError('close')
 
     this[kCache] = kEmpty
 

@@ -37,6 +37,7 @@
 #include <string>
 #include <thread>
 #include <unordered_map>
+#include <utility>
 #include <vector>
 
 #ifdef __linux__
@@ -1068,14 +1069,14 @@ struct BaseIterator : public Closable {
       readOptions_.snapshot = snapshot_;
     }
 
-    const auto status = database_->Attach(reference_, this);
-    if (!status.ok()) {
-      if (snapshot_) {
-        readOptions_.snapshot = nullptr;
-        database_->db->ReleaseSnapshot(snapshot_);
-        snapshot_ = nullptr;
+    try {
+      const auto status = database_->Attach(reference_, this);
+      if (!status.ok()) {
+        throw std::runtime_error(status.ToString());
       }
-      throw std::runtime_error(status.ToString());
+    } catch (...) {
+      ReleaseSnapshot();
+      throw;
     }
   }
 
@@ -1087,6 +1088,9 @@ struct BaseIterator : public Closable {
 
   virtual void Seek(const rocksdb::Slice& target) {
     assert(iterator_);
+    // Positioning is the supported recovery path after a terminal iterator
+    // error. Record any new error below when the caller checks Status().
+    terminalStatus_ = rocksdb::Status::OK();
 
     if (!InRange(target)) {
       Invalidate();
@@ -1105,13 +1109,11 @@ struct BaseIterator : public Closable {
     // ReadOptions stores raw pointers to the bound slices, so the iterator must
     // be destroyed before their backing storage.
     iterator_.reset();
+    readOptions_.iterate_lower_bound = nullptr;
+    readOptions_.iterate_upper_bound = nullptr;
     lower_bound_.reset();
     upper_bound_.reset();
-    if (snapshot_) {
-      readOptions_.snapshot = nullptr;
-      database_->db->ReleaseSnapshot(snapshot_);
-      snapshot_ = nullptr;
-    }
+    ReleaseSnapshot();
     return rocksdb::Status::OK();
   }
 
@@ -1119,15 +1121,24 @@ struct BaseIterator : public Closable {
     if (closed.load()) {
       return rocksdb::Status::InvalidArgument("Iterator is not open");
     }
-    if (iterator_) return rocksdb::Status::OK();
+    if (iterator_) return PreflightStatus();
 
-    iterator_.reset(database_->db->NewIterator(readOptions_, column_));
+    try {
+      iterator_.reset(database_->db->NewIterator(readOptions_, column_));
+    } catch (...) {
+      ReleaseSnapshot();
+      throw;
+    }
+    // RocksDB copies ReadOptions into the iterator and retains its snapshot
+    // pointer for optional auto-refresh. Keep the snapshot alive until the
+    // iterator is destroyed or Refresh(nullptr) clears that internal pointer.
+    terminalStatus_ = rocksdb::Status::OK();
     if (initialTarget) {
       Seek(*initialTarget);
     } else {
       ResetPosition();
     }
-    return iterator_->status();
+    return Status();
   }
 
   rocksdb::Status InitializeSafe(const std::optional<std::string>& initialTarget = std::nullopt) {
@@ -1138,9 +1149,38 @@ struct BaseIterator : public Closable {
     return Initialize(initialTarget);
   }
 
+  rocksdb::Status InitializeAndCloseOnErrorSafe(
+      const std::optional<std::string>& initialTarget = std::nullopt) {
+    rocksdb::Status status;
+    try {
+      status = InitializeSafe(initialTarget);
+    } catch (...) {
+      const auto cleanupStatus = Close();
+      if (!cleanupStatus.ok()) {
+        throw std::runtime_error("Iterator initialization threw and cleanup failed: " +
+                                 cleanupStatus.ToString());
+      }
+      throw;
+    }
+
+    if (status.ok()) return status;
+
+    // Initialization runs on a worker thread, so destroy and detach failed
+    // native state here as well. In particular, releasing a snapshot or a
+    // partially-created RocksDB iterator must not fall back to the JS thread.
+    const auto cleanupStatus = Close();
+    if (!cleanupStatus.ok()) {
+      return rocksdb::Status::CopyAppendMessage(
+          status, "; iterator cleanup failed: ", cleanupStatus.ToString());
+    }
+    return status;
+  }
+
   rocksdb::Status RefreshSafe() {
     std::lock_guard operationLock(operationMutex_);
-    ROCKS_STATUS_RETURN(Initialize());
+    // Refresh is a recovery operation: an existing iterator must be allowed
+    // to clear a cached terminal status rather than replaying it here.
+    if (!iterator_) ROCKS_STATUS_RETURN(Initialize());
     return Refresh();
   }
 
@@ -1190,9 +1230,20 @@ struct BaseIterator : public Closable {
     return iterator_->value();
   }
 
-  rocksdb::Status Status() const {
+  rocksdb::Status Status() {
     assert(iterator_);
-    return iterator_->status();
+    const auto status = iterator_->status();
+    if (!status.ok()) terminalStatus_ = status;
+    return status;
+  }
+
+  bool IsInitialized() const { return iterator_ != nullptr; }
+
+  rocksdb::Status PreflightStatus() const {
+    // Every movement checks Status(), so replay a terminal failure before a
+    // retry can call Next()/Prev() on RocksDB's invalid iterator. Keeping the
+    // status locally avoids a virtual RocksDB call on every healthy batch.
+    return terminalStatus_;
   }
 
   virtual rocksdb::Status Refresh() {
@@ -1202,16 +1253,13 @@ struct BaseIterator : public Closable {
     // after a refresh even though every other piece of state was reset.
     count_ = 0;
     // Passing nullptr explicitly retargets the live iterator to the latest DB
-    // state and clears its internal snapshot before we release our ownership.
-    ROCKS_STATUS_RETURN(iterator_->Refresh(nullptr));
-    if (snapshot_) {
-      readOptions_.snapshot = nullptr;
-      database_->db->ReleaseSnapshot(snapshot_);
-      snapshot_ = nullptr;
-    }
+    // state and clears its internal snapshot.
+    terminalStatus_ = iterator_->Refresh(nullptr);
+    ROCKS_STATUS_RETURN(terminalStatus_);
+    ReleaseSnapshot();
     // Refresh invalidates the iterator, so restore its comparator-aware start.
     ResetPosition();
-    return iterator_->status();
+    return Status();
   }
 
   Database* database_;
@@ -1221,6 +1269,14 @@ struct BaseIterator : public Closable {
   std::mutex operationMutex_;
 
  private:
+  void ReleaseSnapshot() {
+    const auto* snapshot = std::exchange(snapshot_, nullptr);
+    readOptions_.snapshot = nullptr;
+    if (snapshot) {
+      database_->db->ReleaseSnapshot(snapshot);
+    }
+  }
+
   bool InRange(const rocksdb::Slice& key) const {
     const auto* comparator = column_->GetComparator();
     if (lower_bound_) {
@@ -1246,6 +1302,7 @@ struct BaseIterator : public Closable {
   }
 
   void ResetPosition() {
+    terminalStatus_ = rocksdb::Status::OK();
     if (reverse_) {
       if (upper_bound_) {
         iterator_->SeekForPrev(*upper_bound_);
@@ -1271,6 +1328,7 @@ struct BaseIterator : public Closable {
   std::optional<rocksdb::PinnableSlice> lower_bound_;
   std::optional<rocksdb::PinnableSlice> upper_bound_;
   const rocksdb::Snapshot* snapshot_ = nullptr;
+  rocksdb::Status terminalStatus_;
   bool lower_inclusive_ = true;
   bool upper_inclusive_ = false;
   std::unique_ptr<rocksdb::Iterator> iterator_;
@@ -1500,7 +1558,11 @@ class Iterator final : public BaseIterator, public std::enable_shared_from_this<
           if (closed.load()) {
             return rocksdb::Status::InvalidArgument("Iterator is not open");
           }
-          ROCKS_STATUS_RETURN(Initialize());
+          if (!IsInitialized()) {
+            ROCKS_STATUS_RETURN(Initialize());
+          } else {
+            ROCKS_STATUS_RETURN(PreflightStatus());
+          }
 
           // Query uses UINT32_MAX as its "all rows" sentinel. Reserving that
           // value would attempt a huge allocation before reading anything.
@@ -1717,7 +1779,11 @@ class Iterator final : public BaseIterator, public std::enable_shared_from_this<
       napi_throw_error(env, "LEVEL_ITERATOR_NOT_OPEN", "Iterator is not open");
       return nullptr;
     }
-    ROCKS_STATUS_THROWS_NAPI(Initialize());
+    if (!IsInitialized()) {
+      ROCKS_STATUS_THROWS_NAPI(Initialize());
+    } else {
+      ROCKS_STATUS_THROWS_NAPI(PreflightStatus());
+    }
 
     napi_value finished;
     NAPI_STATUS_THROWS(napi_get_boolean(env, false, &finished));
@@ -3463,7 +3529,7 @@ NAPI_METHOD(iterator_init) {
         resourceName, env, argv[2], argv[0],
         [iterator, databaseOperation, initialTarget = std::move(initialTarget)](auto& state) {
           const DatabaseOperationScope operationScope(databaseOperation);
-          return iterator->InitializeSafe(initialTarget);
+          return iterator->InitializeAndCloseOnErrorSafe(initialTarget);
         }));
   } catch (const std::exception& e) {
     napi_throw_error(env, nullptr, e.what());
