@@ -49,6 +49,7 @@ test('refreshSync restarts iteration from the configured position', async functi
   const it = db.iterator({ keyEncoding: 'utf8', valueEncoding: 'utf8' })
   t.same(await it.next(), ['a', '1'], 'consumed first entry')
 
+  await db.put('d', '4')
   it._refreshSync()
 
   const entries = []
@@ -57,14 +58,14 @@ test('refreshSync restarts iteration from the configured position', async functi
     if (entry === undefined) break
     entries.push(entry[0])
   }
-  t.same(entries, ['a', 'b', 'c'], 'iteration restarted from the first key after refresh')
+  t.same(entries, ['a', 'b', 'c', 'd'], 'refresh reads the latest state from the first key')
 
   await it.close()
 
   const rev = db.iterator({ reverse: true, keyEncoding: 'utf8', valueEncoding: 'utf8' })
-  t.same(await rev.next(), ['c', '3'], 'reverse iterator starts at last key')
+  t.same(await rev.next(), ['d', '4'], 'reverse iterator starts at last key')
   rev._refreshSync()
-  t.same(await rev.next(), ['c', '3'], 'reverse iteration restarted from the last key after refresh')
+  t.same(await rev.next(), ['d', '4'], 'reverse iteration restarted from the last key after refresh')
   await rev.close()
 
   await db.close()
@@ -712,6 +713,7 @@ test('public seek serializes key encoding hooks', async function (t) {
     'raw async cancellation callback settles before its queued close')
 
   const throwingIterator = db.iterator()
+  await throwingIterator._seekAsync(Buffer.from('a'))
   const callbackError = new Error('seek callback failed')
   let nativeCompletion
   binding.iterator_seek = function (...args) {
@@ -731,6 +733,7 @@ test('public seek serializes key encoding hooks', async function (t) {
   t.pass('a thrown native seek callback still flushes its queued close')
 
   const throwingNextvIterator = db.iterator()
+  await throwingNextvIterator._seekAsync(Buffer.from('a'))
   const nextvCallbackError = new Error('nextv callback failed')
   let nativeNextvCompletion
   const originalNextvAsync = binding.iterator_nextv

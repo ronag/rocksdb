@@ -37,6 +37,7 @@
 #include <string>
 #include <thread>
 #include <unordered_map>
+#include <utility>
 #include <vector>
 
 #ifdef __linux__
@@ -63,6 +64,7 @@ enum ResourceName {
   ResourceLeveldownClose,
   ResourceLeveldownGetMany,
   ResourceLeveldownFlushWal,
+  ResourceLeveldownIteratorInit,
   ResourceLeveldownIteratorSeek,
   ResourceLeveldownBatchWrite,
   ResourceLeveldownUpdatesSince,
@@ -572,9 +574,9 @@ static constexpr napi_type_tag kUpdatesReferenceTag = {0xe254e64dfaa9406bULL, 0x
 static napi_status GetResourceName(napi_env env, ResourceName name, napi_value& result) {
   static constexpr const char* names[] = {
       "iterator.nextv",        "leveldown.open",         "leveldown.close",
-      "leveldown.get_many",    "leveldown.flush_wal",    "leveldown.iterator_seek",
-      "leveldown.batch_write", "leveldown.updates_since", "leveldown.compact_range",
-      "leveldown.clear"};
+      "leveldown.get_many",    "leveldown.flush_wal",    "leveldown.iterator_init",
+      "leveldown.iterator_seek", "leveldown.batch_write", "leveldown.updates_since",
+      "leveldown.compact_range", "leveldown.clear"};
   static_assert(std::size(names) == ResourceNameCount);
   return napi_create_string_utf8(env, names[name], NAPI_AUTO_LENGTH, &result);
 }
@@ -1023,7 +1025,12 @@ struct BaseIterator : public Closable {
                const std::optional<std::string>& gte,
                const int limit,
                rocksdb::ReadOptions readOptions = {})
-      : database_(database), reference_(std::move(reference)), column_(column), reverse_(reverse), limit_(limit) {
+      : database_(database),
+        reference_(std::move(reference)),
+        column_(column),
+        readOptions_(std::move(readOptions)),
+        reverse_(reverse),
+        limit_(limit) {
     if (lte) {
       upper_bound_ = rocksdb::PinnableSlice();
       *upper_bound_->GetSelf() = *lte;
@@ -1050,19 +1057,26 @@ struct BaseIterator : public Closable {
     // checks because there is no generally valid byte successor for a custom
     // comparator.
     if (upper_bound_ && !upper_inclusive_) {
-      readOptions.iterate_upper_bound = &*upper_bound_;
+      readOptions_.iterate_upper_bound = &*upper_bound_;
     }
 
     if (lower_bound_) {
-      readOptions.iterate_lower_bound = &*lower_bound_;
+      readOptions_.iterate_lower_bound = &*lower_bound_;
     }
 
-    iterator_.reset(database_->db->NewIterator(readOptions, column_));
-    ResetPosition();
+    if (!readOptions_.tailing) {
+      snapshot_ = database_->db->GetSnapshot();
+      readOptions_.snapshot = snapshot_;
+    }
 
-    const auto status = database_->Attach(reference_, this);
-    if (!status.ok()) {
-      throw std::runtime_error(status.ToString());
+    try {
+      const auto status = database_->Attach(reference_, this);
+      if (!status.ok()) {
+        throw std::runtime_error(status.ToString());
+      }
+    } catch (...) {
+      ReleaseSnapshot();
+      throw;
     }
   }
 
@@ -1074,6 +1088,9 @@ struct BaseIterator : public Closable {
 
   virtual void Seek(const rocksdb::Slice& target) {
     assert(iterator_);
+    // Positioning is the supported recovery path after a terminal iterator
+    // error. Record any new error below when the caller checks Status().
+    terminalStatus_ = rocksdb::Status::OK();
 
     if (!InRange(target)) {
       Invalidate();
@@ -1092,24 +1109,84 @@ struct BaseIterator : public Closable {
     // ReadOptions stores raw pointers to the bound slices, so the iterator must
     // be destroyed before their backing storage.
     iterator_.reset();
+    readOptions_.iterate_lower_bound = nullptr;
+    readOptions_.iterate_upper_bound = nullptr;
     lower_bound_.reset();
     upper_bound_.reset();
+    ReleaseSnapshot();
     return rocksdb::Status::OK();
+  }
+
+  virtual rocksdb::Status Initialize(const std::optional<std::string>& initialTarget = std::nullopt) {
+    if (closed.load()) {
+      return rocksdb::Status::InvalidArgument("Iterator is not open");
+    }
+    if (iterator_) return PreflightStatus();
+
+    try {
+      iterator_.reset(database_->db->NewIterator(readOptions_, column_));
+    } catch (...) {
+      ReleaseSnapshot();
+      throw;
+    }
+    // RocksDB copies ReadOptions into the iterator and retains its snapshot
+    // pointer for optional auto-refresh. Keep the snapshot alive until the
+    // iterator is destroyed or Refresh(nullptr) clears that internal pointer.
+    terminalStatus_ = rocksdb::Status::OK();
+    if (initialTarget) {
+      Seek(*initialTarget);
+    } else {
+      ResetPosition();
+    }
+    return Status();
+  }
+
+  rocksdb::Status InitializeSafe(const std::optional<std::string>& initialTarget = std::nullopt) {
+    std::lock_guard operationLock(operationMutex_);
+    if (closed.load()) {
+      return rocksdb::Status::InvalidArgument("Iterator is not open");
+    }
+    return Initialize(initialTarget);
+  }
+
+  rocksdb::Status InitializeAndCloseOnErrorSafe(
+      const std::optional<std::string>& initialTarget = std::nullopt) {
+    rocksdb::Status status;
+    try {
+      status = InitializeSafe(initialTarget);
+    } catch (...) {
+      const auto cleanupStatus = Close();
+      if (!cleanupStatus.ok()) {
+        throw std::runtime_error("Iterator initialization threw and cleanup failed: " +
+                                 cleanupStatus.ToString());
+      }
+      throw;
+    }
+
+    if (status.ok()) return status;
+
+    // Initialization runs on a worker thread, so destroy and detach failed
+    // native state here as well. In particular, releasing a snapshot or a
+    // partially-created RocksDB iterator must not fall back to the JS thread.
+    const auto cleanupStatus = Close();
+    if (!cleanupStatus.ok()) {
+      return rocksdb::Status::CopyAppendMessage(
+          status, "; iterator cleanup failed: ", cleanupStatus.ToString());
+    }
+    return status;
   }
 
   rocksdb::Status RefreshSafe() {
     std::lock_guard operationLock(operationMutex_);
-    if (!iterator_) {
-      return rocksdb::Status::InvalidArgument("Iterator is not open");
-    }
+    // Refresh is a recovery operation: an existing iterator must be allowed
+    // to clear a cached terminal status rather than replaying it here.
+    if (!iterator_) ROCKS_STATUS_RETURN(Initialize());
     return Refresh();
   }
 
   rocksdb::Status SeekSafe(const rocksdb::Slice& target, const uint32_t discardedCount) {
     std::lock_guard operationLock(operationMutex_);
-    if (!iterator_) {
-      return rocksdb::Status::InvalidArgument("Iterator is not open");
-    }
+    if (!iterator_) return Initialize(target.ToString());
     // Native limit accounting includes rows prefetched into the JS cache. Give
     // back only the undelivered rows that seek is about to discard, preserving
     // all public, raw and decode-failed reads that were already consumed.
@@ -1153,9 +1230,20 @@ struct BaseIterator : public Closable {
     return iterator_->value();
   }
 
-  rocksdb::Status Status() const {
+  rocksdb::Status Status() {
     assert(iterator_);
-    return iterator_->status();
+    const auto status = iterator_->status();
+    if (!status.ok()) terminalStatus_ = status;
+    return status;
+  }
+
+  bool IsInitialized() const { return iterator_ != nullptr; }
+
+  rocksdb::Status PreflightStatus() const {
+    // Every movement checks Status(), so replay a terminal failure before a
+    // retry can call Next()/Prev() on RocksDB's invalid iterator. Keeping the
+    // status locally avoids a virtual RocksDB call on every healthy batch.
+    return terminalStatus_;
   }
 
   virtual rocksdb::Status Refresh() {
@@ -1164,18 +1252,31 @@ struct BaseIterator : public Closable {
     // otherwise an iterator that already yielded `limit` rows returns nothing
     // after a refresh even though every other piece of state was reset.
     count_ = 0;
-    ROCKS_STATUS_RETURN(iterator_->Refresh());
+    // Passing nullptr explicitly retargets the live iterator to the latest DB
+    // state and clears its internal snapshot.
+    terminalStatus_ = iterator_->Refresh(nullptr);
+    ROCKS_STATUS_RETURN(terminalStatus_);
+    ReleaseSnapshot();
     // Refresh invalidates the iterator, so restore its comparator-aware start.
     ResetPosition();
-    return iterator_->status();
+    return Status();
   }
 
   Database* database_;
   std::shared_ptr<DatabaseReference> reference_;
   rocksdb::ColumnFamilyHandle* column_;
+  rocksdb::ReadOptions readOptions_;
   std::mutex operationMutex_;
 
  private:
+  void ReleaseSnapshot() {
+    const auto* snapshot = std::exchange(snapshot_, nullptr);
+    readOptions_.snapshot = nullptr;
+    if (snapshot) {
+      database_->db->ReleaseSnapshot(snapshot);
+    }
+  }
+
   bool InRange(const rocksdb::Slice& key) const {
     const auto* comparator = column_->GetComparator();
     if (lower_bound_) {
@@ -1201,6 +1302,7 @@ struct BaseIterator : public Closable {
   }
 
   void ResetPosition() {
+    terminalStatus_ = rocksdb::Status::OK();
     if (reverse_) {
       if (upper_bound_) {
         iterator_->SeekForPrev(*upper_bound_);
@@ -1225,6 +1327,8 @@ struct BaseIterator : public Closable {
   int count_ = 0;
   std::optional<rocksdb::PinnableSlice> lower_bound_;
   std::optional<rocksdb::PinnableSlice> upper_bound_;
+  const rocksdb::Snapshot* snapshot_ = nullptr;
+  rocksdb::Status terminalStatus_;
   bool lower_inclusive_ = true;
   bool upper_inclusive_ = false;
   std::unique_ptr<rocksdb::Iterator> iterator_;
@@ -1244,6 +1348,78 @@ static bool SupportsPackedReads(const Encoding encoding) {
 
 static constexpr size_t kAutoPackedValueBytes = 8 * 1024;
 
+struct IteratorOptions {
+  bool unsafe = false;
+  bool reverse = false;
+  bool keys = true;
+  bool values = true;
+  int32_t limit = -1;
+  int64_t highWaterMarkBytes = std::numeric_limits<int32_t>::max();
+  std::optional<std::string> lt;
+  std::optional<std::string> lte;
+  std::optional<std::string> gt;
+  std::optional<std::string> gte;
+  std::optional<std::string> keyFilter;
+  std::optional<std::string> valueFilter;
+  rocksdb::ColumnFamilyHandle* column = nullptr;
+  Encoding keyEncoding = Encoding::Buffer;
+  Encoding valueEncoding = Encoding::Buffer;
+  rocksdb::ReadOptions readOptions;
+};
+
+static napi_status GetIteratorOptions(napi_env env,
+                                      napi_value options,
+                                      Database* database,
+                                      IteratorOptions& result) {
+  NAPI_STATUS_RETURN(GetProperty(env, options, "unsafe", result.unsafe));
+  NAPI_STATUS_RETURN(GetProperty(env, options, "reverse", result.reverse));
+  NAPI_STATUS_RETURN(GetProperty(env, options, "keys", result.keys));
+  NAPI_STATUS_RETURN(GetProperty(env, options, "values", result.values));
+  NAPI_STATUS_RETURN(GetProperty(env, options, "limit", result.limit));
+  NAPI_STATUS_RETURN(GetProperty(env, options, "highWaterMarkBytes", result.highWaterMarkBytes));
+  if (result.highWaterMarkBytes < 0) {
+    NAPI_STATUS_RETURN(napi_throw_range_error(env, nullptr, "highWaterMarkBytes must be non-negative"));
+    return napi_pending_exception;
+  }
+
+  NAPI_STATUS_RETURN(GetProperty(env, options, "lt", result.lt));
+  NAPI_STATUS_RETURN(GetProperty(env, options, "lte", result.lte));
+  NAPI_STATUS_RETURN(GetProperty(env, options, "gt", result.gt));
+  NAPI_STATUS_RETURN(GetProperty(env, options, "gte", result.gte));
+  NAPI_STATUS_RETURN(GetProperty(env, options, "keyFilter", result.keyFilter));
+  NAPI_STATUS_RETURN(GetProperty(env, options, "valueFilter", result.valueFilter));
+
+  result.column = database->db->DefaultColumnFamily();
+  NAPI_STATUS_RETURN(GetColumnProperty(env, options, database, result.column));
+  NAPI_STATUS_RETURN(GetProperty(env, options, "keyEncoding", result.keyEncoding));
+  NAPI_STATUS_RETURN(GetProperty(env, options, "valueEncoding", result.valueEncoding));
+
+  result.readOptions.background_purge_on_iterator_cleanup = true;
+  NAPI_STATUS_RETURN(GetProperty(env, options, "backgroundPurgeOnIteratorCleanup",
+                                 result.readOptions.background_purge_on_iterator_cleanup));
+  result.readOptions.tailing = false;
+  NAPI_STATUS_RETURN(GetProperty(env, options, "tailing", result.readOptions.tailing));
+  result.readOptions.fill_cache = false;
+  NAPI_STATUS_RETURN(GetProperty(env, options, "fillCache", result.readOptions.fill_cache));
+
+  // Local NVMe/SSD gains nothing from RocksDB async I/O (io_uring): it only adds
+  // CPU + ring overhead (async-io wins need high-latency/remote storage). Default
+  // OFF; callers opt in per-request via `asyncIO`.
+  result.readOptions.async_io = false;
+  NAPI_STATUS_RETURN(GetProperty(env, options, "asyncIO", result.readOptions.async_io));
+  result.readOptions.adaptive_readahead = true;
+  NAPI_STATUS_RETURN(GetProperty(env, options, "adaptiveReadahead", result.readOptions.adaptive_readahead));
+  result.readOptions.readahead_size = 0;
+  NAPI_STATUS_RETURN(GetProperty(env, options, "readaheadSize", result.readOptions.readahead_size));
+  result.readOptions.auto_readahead_size = true;
+  NAPI_STATUS_RETURN(GetProperty(env, options, "autoReadaheadSize", result.readOptions.auto_readahead_size));
+  result.readOptions.ignore_range_deletions = false;
+  NAPI_STATUS_RETURN(GetProperty(env, options, "ignoreRangeDeletions",
+                                 result.readOptions.ignore_range_deletions));
+
+  return napi_ok;
+}
+
 class Iterator final : public BaseIterator, public std::enable_shared_from_this<Iterator> {
   Reference databaseContext_;
   const bool keys_;
@@ -1252,6 +1428,8 @@ class Iterator final : public BaseIterator, public std::enable_shared_from_this<
   bool first_ = true;
   const Encoding keyEncoding_;
   const Encoding valueEncoding_;
+  std::optional<std::string> keyFilterPattern_;
+  std::optional<std::string> valueFilterPattern_;
   std::optional<re2::RE2> keyFilter_;
   std::optional<re2::RE2> valueFilter_;
   const bool unsafe_;
@@ -1276,44 +1454,36 @@ class Iterator final : public BaseIterator, public std::enable_shared_from_this<
  public:
   Iterator(Database* database,
            std::shared_ptr<DatabaseReference> reference,
-           Reference databaseContext,
-           rocksdb::ColumnFamilyHandle* column,
-           const bool reverse,
-           const bool keys,
-           const bool values,
-           const int limit,
-           const std::optional<std::string>& lt,
-           const std::optional<std::string>& lte,
-           const std::optional<std::string>& gt,
-           const std::optional<std::string>& gte,
-           const size_t highWaterMarkBytes,
-           std::optional<std::string> keyFilter = std::nullopt,
-           std::optional<std::string> valueFilter = std::nullopt,
-           Encoding keyEncoding = Encoding::Invalid,
-           Encoding valueEncoding = Encoding::Invalid,
-           const bool unsafe = false,
-           rocksdb::ReadOptions readOptions = {})
-      : BaseIterator(database, std::move(reference), column, reverse, lt, lte, gt, gte, limit, readOptions),
-        databaseContext_(std::move(databaseContext)),
-        keys_(keys),
-        values_(values),
-        highWaterMarkBytes_(highWaterMarkBytes),
-        keyEncoding_(keyEncoding),
-        valueEncoding_(valueEncoding),
-        unsafe_(unsafe) {
-    if (keyFilter) {
-      keyFilter_.emplace(*keyFilter);
+           IteratorOptions options)
+      : BaseIterator(database, std::move(reference), options.column, options.reverse, options.lt, options.lte,
+                     options.gt, options.gte, options.limit, options.readOptions),
+        keys_(options.keys),
+        values_(options.values),
+        highWaterMarkBytes_(static_cast<size_t>(options.highWaterMarkBytes)),
+        keyEncoding_(options.keyEncoding),
+        valueEncoding_(options.valueEncoding),
+        keyFilterPattern_(std::move(options.keyFilter)),
+        valueFilterPattern_(std::move(options.valueFilter)),
+        unsafe_(options.unsafe) {}
+
+  rocksdb::Status Initialize(const std::optional<std::string>& initialTarget = std::nullopt) override {
+    if (keyFilterPattern_) {
+      keyFilter_.emplace(*keyFilterPattern_);
       if (!keyFilter_->ok()) {
-        throw std::invalid_argument("Invalid key filter regex");
+        return rocksdb::Status::InvalidArgument("Invalid key filter regex");
       }
+      keyFilterPattern_.reset();
     }
 
-    if (valueFilter) {
-      valueFilter_.emplace(*valueFilter);
+    if (valueFilterPattern_) {
+      valueFilter_.emplace(*valueFilterPattern_);
       if (!valueFilter_->ok()) {
-        throw std::invalid_argument("Invalid value filter regex");
+        return rocksdb::Status::InvalidArgument("Invalid value filter regex");
       }
+      valueFilterPattern_.reset();
     }
+
+    return BaseIterator::Initialize(initialTarget);
   }
 
   void Seek(const rocksdb::Slice& target) override {
@@ -1326,6 +1496,16 @@ class Iterator final : public BaseIterator, public std::enable_shared_from_this<
     return BaseIterator::Refresh();
   }
 
+  void SetDatabaseContext(Reference databaseContext) {
+    databaseContext_ = std::move(databaseContext);
+  }
+
+  static std::shared_ptr<Iterator> create(Database* database,
+                                          std::shared_ptr<DatabaseReference> reference,
+                                          IteratorOptions options) {
+    return std::make_shared<Iterator>(database, std::move(reference), std::move(options));
+  }
+
   static std::shared_ptr<Iterator> create(napi_env env, napi_value db, napi_value options) {
     Database* database;
     std::shared_ptr<DatabaseReference> reference;
@@ -1335,97 +1515,12 @@ class Iterator final : public BaseIterator, public std::enable_shared_from_this<
     Reference databaseContext;
     NAPI_STATUS_THROWS(Reference::Create(env, db, databaseContext));
 
-    bool unsafe = false;
-    NAPI_STATUS_THROWS(GetProperty(env, options, "unsafe", unsafe));
+    IteratorOptions iteratorOptions;
+    NAPI_STATUS_THROWS(GetIteratorOptions(env, options, database, iteratorOptions));
 
-    bool reverse = false;
-    NAPI_STATUS_THROWS(GetProperty(env, options, "reverse", reverse));
-
-    bool keys = true;
-    NAPI_STATUS_THROWS(GetProperty(env, options, "keys", keys));
-
-    bool values = true;
-    NAPI_STATUS_THROWS(GetProperty(env, options, "values", values));
-
-    int32_t limit = -1;
-    NAPI_STATUS_THROWS(GetProperty(env, options, "limit", limit));
-
-    // 64-bit: the value flows into a size_t cap, so parsing as int32 would wrap
-    // any value > 2 GiB to a garbage cap. Default stays ~2 GiB (effectively no cap).
-    int64_t highWaterMarkBytes = std::numeric_limits<int32_t>::max();
-    NAPI_STATUS_THROWS(GetProperty(env, options, "highWaterMarkBytes", highWaterMarkBytes));
-    if (highWaterMarkBytes < 0) {
-      napi_throw_range_error(env, nullptr, "highWaterMarkBytes must be non-negative");
-      return nullptr;
-    }
-
-    std::optional<std::string> lt;
-    NAPI_STATUS_THROWS(GetProperty(env, options, "lt", lt));
-
-    std::optional<std::string> lte;
-    NAPI_STATUS_THROWS(GetProperty(env, options, "lte", lte));
-
-    std::optional<std::string> gt;
-    NAPI_STATUS_THROWS(GetProperty(env, options, "gt", gt));
-
-    std::optional<std::string> gte;
-    NAPI_STATUS_THROWS(GetProperty(env, options, "gte", gte));
-
-    std::optional<std::string> keyFilter;
-    NAPI_STATUS_THROWS(GetProperty(env, options, "keyFilter", keyFilter));
-
-    std::optional<std::string> valueFilter;
-    NAPI_STATUS_THROWS(GetProperty(env, options, "valueFilter", valueFilter));
-
-    rocksdb::ColumnFamilyHandle* column = database->db->DefaultColumnFamily();
-    NAPI_STATUS_THROWS(GetColumnProperty(env, options, database, column));
-
-    Encoding keyEncoding = Encoding::Buffer;
-    NAPI_STATUS_THROWS(GetProperty(env, options, "keyEncoding", keyEncoding));
-
-    Encoding valueEncoding = Encoding::Buffer;
-    NAPI_STATUS_THROWS(GetProperty(env, options, "valueEncoding", valueEncoding));
-
-    rocksdb::ReadOptions readOptions;
-
-    readOptions.background_purge_on_iterator_cleanup = true;
-    NAPI_STATUS_THROWS(GetProperty(env, options, "backgroundPurgeOnIteratorCleanup",
-                                   readOptions.background_purge_on_iterator_cleanup));
-
-    readOptions.tailing = false;
-    NAPI_STATUS_THROWS(GetProperty(env, options, "tailing", readOptions.tailing));
-
-    readOptions.fill_cache = false;
-    NAPI_STATUS_THROWS(GetProperty(env, options, "fillCache", readOptions.fill_cache));
-
-    // Local NVMe/SSD gains nothing from RocksDB async I/O (io_uring): it only adds
-    // CPU + ring overhead (async-io wins need high-latency/remote storage). Default
-    // OFF; callers opt in per-request via `asyncIO`.
-    readOptions.async_io = false;
-    NAPI_STATUS_THROWS(GetProperty(env, options, "asyncIO", readOptions.async_io));
-
-    readOptions.adaptive_readahead = true;
-    NAPI_STATUS_THROWS(GetProperty(env, options, "adaptiveReadahead", readOptions.adaptive_readahead));
-
-    readOptions.readahead_size = 0;
-    NAPI_STATUS_THROWS(GetProperty(env, options, "readaheadSize", readOptions.readahead_size));
-
-    readOptions.auto_readahead_size = true;
-    NAPI_STATUS_THROWS(GetProperty(env, options, "autoReadaheadSize", readOptions.auto_readahead_size));
-
-    readOptions.ignore_range_deletions = false;
-    NAPI_STATUS_THROWS(GetProperty(env, options, "ignoreRangeDeletions", readOptions.ignore_range_deletions));
-
-    // uint32_t timeout = 0;
-    // NAPI_STATUS_THROWS(GetProperty(env, options, "timeout", timeout));
-
-    // readOptions.deadline = timeout
-    //   ? std::chrono::microseconds(database->db->GetEnv()->NowMicros() + timeout * 1000)
-    //   : std::chrono::microseconds::zero();
-
-    return std::make_shared<Iterator>(database, reference, std::move(databaseContext), column, reverse, keys,
-                                      values, limit, lt, lte, gt, gte, highWaterMarkBytes, keyFilter, valueFilter,
-                                      keyEncoding, valueEncoding, unsafe, readOptions);
+    auto iterator = create(database, std::move(reference), std::move(iteratorOptions));
+    iterator->SetDatabaseContext(std::move(databaseContext));
+    return iterator;
   }
 
   napi_value nextv(napi_env env,
@@ -1462,6 +1557,11 @@ class Iterator final : public BaseIterator, public std::enable_shared_from_this<
           std::lock_guard operationLock(operationMutex_);
           if (closed.load()) {
             return rocksdb::Status::InvalidArgument("Iterator is not open");
+          }
+          if (!IsInitialized()) {
+            ROCKS_STATUS_RETURN(Initialize());
+          } else {
+            ROCKS_STATUS_RETURN(PreflightStatus());
           }
 
           // Query uses UINT32_MAX as its "all rows" sentinel. Reserving that
@@ -1678,6 +1778,11 @@ class Iterator final : public BaseIterator, public std::enable_shared_from_this<
     if (closed.load()) {
       napi_throw_error(env, "LEVEL_ITERATOR_NOT_OPEN", "Iterator is not open");
       return nullptr;
+    }
+    if (!IsInitialized()) {
+      ROCKS_STATUS_THROWS_NAPI(Initialize());
+    } else {
+      ROCKS_STATUS_THROWS_NAPI(PreflightStatus());
     }
 
     napi_value finished;
@@ -3400,7 +3505,67 @@ NAPI_METHOD(db_flush_wal) {
   return 0;
 }
 
+NAPI_METHOD(iterator_init) {
+  NAPI_ARGV(3);
+
+  try {
+    std::shared_ptr<Iterator> iterator;
+    NAPI_STATUS_THROWS(GetResourceExternal(env, argv[0], kIteratorReferenceTag, iterator));
+
+    std::optional<std::string> initialTarget;
+    napi_valuetype targetType;
+    NAPI_STATUS_THROWS(napi_typeof(env, argv[1], &targetType));
+    if (targetType != napi_undefined && targetType != napi_null) {
+      NAPI_STATUS_THROWS(GetValue(env, argv[1], initialTarget));
+    }
+
+    napi_value resourceName;
+    NAPI_STATUS_THROWS(GetResourceName(env, ResourceLeveldownIteratorInit, resourceName));
+    std::shared_ptr<DatabaseOperation> databaseOperation;
+    NAPI_STATUS_THROWS(
+        BeginDatabaseOperation(env, iterator->database_, iterator->reference_, databaseOperation));
+
+    NAPI_STATUS_THROWS(runAsyncKeepAlive(
+        resourceName, env, argv[2], argv[0],
+        [iterator, databaseOperation, initialTarget = std::move(initialTarget)](auto& state) {
+          const DatabaseOperationScope operationScope(databaseOperation);
+          return iterator->InitializeAndCloseOnErrorSafe(initialTarget);
+        }));
+  } catch (const std::exception& e) {
+    napi_throw_error(env, nullptr, e.what());
+    return nullptr;
+  }
+
+  return nullptr;
+}
+
 NAPI_METHOD(iterator_init_sync) {
+  NAPI_ARGV(2);
+
+  try {
+    std::shared_ptr<Iterator> iterator;
+    NAPI_STATUS_THROWS(GetResourceExternal(env, argv[0], kIteratorReferenceTag, iterator));
+
+    std::optional<std::string> initialTarget;
+    napi_valuetype targetType;
+    NAPI_STATUS_THROWS(napi_typeof(env, argv[1], &targetType));
+    if (targetType != napi_undefined && targetType != napi_null) {
+      NAPI_STATUS_THROWS(GetValue(env, argv[1], initialTarget));
+    }
+
+    std::shared_ptr<DatabaseOperation> databaseOperation;
+    NAPI_STATUS_THROWS(
+        BeginDatabaseOperation(env, iterator->database_, iterator->reference_, databaseOperation));
+    ROCKS_STATUS_THROWS_NAPI(iterator->InitializeSafe(initialTarget));
+  } catch (const std::exception& e) {
+    napi_throw_error(env, nullptr, e.what());
+    return nullptr;
+  }
+
+  return nullptr;
+}
+
+NAPI_METHOD(iterator_create) {
   NAPI_ARGV(2);
 
   napi_value result;
@@ -4488,6 +4653,8 @@ NAPI_INIT() {
   NAPI_EXPORT_FUNCTION(statistics_set_stats_level);
   NAPI_EXPORT_FUNCTION(statistics_get_statistics);
 
+  NAPI_EXPORT_FUNCTION(iterator_init);
+  NAPI_EXPORT_FUNCTION(iterator_create);
   NAPI_EXPORT_FUNCTION(iterator_init_sync);
   NAPI_EXPORT_FUNCTION(iterator_refresh_sync);
   NAPI_EXPORT_FUNCTION(iterator_seek);

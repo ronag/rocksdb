@@ -188,7 +188,7 @@ test('stale column handles and closed native iterators fail safely', async funct
 
   const context = binding.db_init(tempy.directory())
   await nativeOpen(context)
-  const iterator = binding.iterator_init_sync(context, {})
+  const iterator = binding.iterator_create(context, {})
   binding.iterator_close_sync(iterator)
   t.throws(
     () => binding.iterator_nextv_sync(iterator, 1, {}),
@@ -207,7 +207,7 @@ test('native iterator seek clamps discarded-row credit without bypassing its lim
   }
   binding.batch_write_sync(context, batch, {})
 
-  const iterator = binding.iterator_init_sync(context, {
+  const iterator = binding.iterator_create(context, {
     limit: 3,
     keyEncoding: 'buffer',
     valueEncoding: 'buffer'
