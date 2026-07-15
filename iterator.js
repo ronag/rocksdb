@@ -24,6 +24,10 @@ const kPosition = Symbol('position')
 const kBusy = Symbol('busy')
 const kPendingClose = Symbol('pendingClose')
 const kCloseRequested = Symbol('closeRequested')
+const kCleanupDebt = Symbol('cleanupDebt')
+const kCleanupDebtClose = Symbol('cleanupDebtClose')
+const kCloseCleanupDebt = Symbol('closeCleanupDebt')
+const kCloseLanded = Symbol('closeLanded')
 const kPublicSeek = Symbol('publicSeek')
 const kUnsafeBusy = Symbol('unsafeBusy')
 const kNoFieldsNext = Symbol('noFieldsNext')
@@ -249,6 +253,9 @@ class Iterator extends AbstractIterator {
       this[kBusy] = false
       this[kPendingClose] = null
       this[kCloseRequested] = false
+      this[kCleanupDebt] = null
+      this[kCleanupDebtClose] = null
+      this[kCloseLanded] = false
       this[kPublicSeek] = false
       if (DEBUG) this[kUnsafeBusy] = false
     } catch (err) {
@@ -401,9 +408,61 @@ class Iterator extends AbstractIterator {
 
   close (callback) {
     if (DEBUG) assert(!this[kUnsafeBusy], 'public close() must not overlap an unsafe operation')
-    const result = super.close(rethrowingCallback(callback))
+
+    if (!this[kCleanupDebt] && this[kCloseLanded]) {
+      return super.close(rethrowingCallback(callback))
+    }
+
+    callback = fromCallback(callback, kPromise)
+    const promise = callback[kPromise]
+    callback = rethrowingCallback(callback)
+
+    if (this[kCleanupDebt]) {
+      // AbstractIterator is already closed and detached at this point, so
+      // retry the retained native context without reentering its state machine.
+      this[kCloseCleanupDebt](callback)
+      return promise
+    }
+
+    const previousDebt = this[kCleanupDebt]
+    // AbstractIterator intentionally discards _close() errors. Let it finish
+    // its public lifecycle, then replay newly-created cleanup debt here.
+    super.close((err) => {
+      this[kCloseLanded] = true
+      const debt = this[kCleanupDebt]
+      callback(err || (debt !== previousDebt ? debt?.error : null))
+    })
     this[kCloseRequested] = true
-    return result
+    return promise
+  }
+
+  [kCloseCleanupDebt] (callback) {
+    const debt = this[kCleanupDebt]
+    const active = this[kCleanupDebtClose]
+    if (active && active.debt === debt) {
+      active.callbacks.push(callback)
+      return
+    }
+
+    const group = { debt, callbacks: [callback] }
+    this[kCleanupDebtClose] = group
+
+    process.nextTick(() => {
+      let err = null
+      try {
+        this._closeSync()
+      } catch (cleanupError) {
+        err = cleanupError
+      }
+
+      if (this[kCleanupDebt] === debt) {
+        this[kCleanupDebt] = err ? { error: err } : null
+      }
+      if (this[kCleanupDebtClose] === group) this[kCleanupDebtClose] = null
+
+      const callbacks = group.callbacks.splice(0)
+      for (const complete of callbacks) complete(err)
+    })
   }
 
   _seek (target) {
@@ -426,11 +485,20 @@ class Iterator extends AbstractIterator {
   _close (callback) {
     // AbstractIterator serializes its async public operations. kBusy is only
     // needed for synchronous public seek accessors that reenter close(). Raw
-    // methods deliberately do not acquire close ownership.
+    // methods deliberately do not acquire cleanup debt or close ownership.
+    const complete = (err) => {
+      if (err && this[kCloseRequested]) {
+        this[kCleanupDebt] = { error: err }
+        callback()
+      } else {
+        callback(err)
+      }
+    }
+
     if (this[kBusy]) {
-      this[kPendingClose] = callback
+      this[kPendingClose] = complete
     } else {
-      this._closeAsync(callback)
+      this._closeAsync(complete)
     }
   }
 
