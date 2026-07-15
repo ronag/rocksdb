@@ -234,7 +234,7 @@ function prepareRawGetManyOptions (options, packed) {
 
   if (packed !== false) {
     const encoding = readValueEncoding()
-    if (encoding !== 'buffer' && !isJavaScriptEncoding(encoding)) {
+    if (DEBUG && encoding !== 'buffer' && !isJavaScriptEncoding(encoding)) {
       throw new TypeError('Packed getMany only supports buffer, slice or utf8 value encoding')
     }
   }
@@ -862,7 +862,11 @@ class RocksLevel extends AbstractLevel {
 
     const group = closeContext.getStore() ?? null
 
-    if (this[kRefs]) {
+    if (DEBUG && group === null) {
+      assert.strictEqual(this[kRefs], 0, 'unsafe _close() must not overlap a public operation')
+    }
+
+    if (group !== null && this[kRefs]) {
       this[kPendingClose] = { callback, group }
     } else {
       this[kNativeClose](callback, group)
@@ -903,10 +907,6 @@ class RocksLevel extends AbstractLevel {
   }
 
   _getMany (keys, options, callback, allowPartial) {
-    if (keys.some(key => typeof key === 'string')) {
-      keys = keys.map(key => typeof key === 'string' ? Buffer.from(key) : key)
-    }
-
     callback = fromCallback(callback, kPromise)
 
     this[kGetManyAsync](keys, options, (err, values) => {
@@ -925,10 +925,6 @@ class RocksLevel extends AbstractLevel {
   _getManyAsync (keys, options, callback, allowPartial, packed, exposePacked = true) {
     if (DEBUG) {
       assert.strictEqual(this.status, 'open', 'unsafe _getManyAsync() requires an open database')
-    }
-
-    if (keys.some(key => typeof key === 'string')) {
-      keys = keys.map(key => typeof key === 'string' ? Buffer.from(key) : key)
     }
 
     callback = fromCallback(callback, kPromise)
@@ -1189,7 +1185,6 @@ class RocksLevel extends AbstractLevel {
   }
 
   _iterator (options) {
-    options = snapshotIteratorOptions(options)
     return new Iterator(this, this[kContext], options ?? kEmpty)
   }
 

@@ -137,8 +137,21 @@ try {
     return duration / iteratorCount
   }
 
+  const constructRaw = async (iteratorOptions) => {
+    const iterators = []
+    const start = process.hrtime.bigint()
+    for (let index = 0; index < iteratorCount; index++) {
+      iterators.push(db._iterator(iteratorOptions))
+    }
+    const duration = elapsedNs(start)
+    await closeAll(iterators)
+    return duration / iteratorCount
+  }
+
   await measure('construct', 'construct default', 'ns/op', () => construct(options))
   await measure('construct', 'construct bounded + filter', 'ns/op', () => construct(filteredOptions))
+  await measure('construct', 'construct raw default', 'ns/op', () => constructRaw(options))
+  await measure('construct', 'construct raw bounded + filter', 'ns/op', () => constructRaw(filteredOptions))
 
   await measure('first-use', 'first next sequential p50', 'us/op', async () => {
     const latencies = []
@@ -241,6 +254,32 @@ try {
       const iterator = db.iterator(options)
       const start = process.hrtime.bigint()
       assert.equal(iterator._nextvSync(1, { packed: true }).count, 1)
+      latencies.push(elapsedNs(start) / 1000)
+      await iterator.close()
+    }
+    return median(latencies)
+  })
+
+  await measure('first-use', 'first _seekSync p50', 'us/op', async () => {
+    const latencies = []
+    const target = keys[Math.floor(rowCount / 2)]
+    for (let index = 0; index < firstUseCount; index++) {
+      const iterator = db._iterator(options)
+      const start = process.hrtime.bigint()
+      iterator._seekSync(target)
+      latencies.push(elapsedNs(start) / 1000)
+      await iterator.close()
+    }
+    return median(latencies)
+  })
+
+  await measure('first-use', 'first _seekAsync p50', 'us/op', async () => {
+    const latencies = []
+    const target = keys[Math.floor(rowCount / 2)]
+    for (let index = 0; index < firstUseCount; index++) {
+      const iterator = db._iterator(options)
+      const start = process.hrtime.bigint()
+      await iterator._seekAsync(target)
       latencies.push(elapsedNs(start) / 1000)
       await iterator.close()
     }

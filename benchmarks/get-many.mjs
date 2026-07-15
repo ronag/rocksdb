@@ -1,10 +1,28 @@
 import { bench, run, group } from 'mitata'
-import { RocksLevel } from '../index.js'
+import { execFileSync } from 'node:child_process'
 import { mkdtemp, rm } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
-import { join } from 'node:path'
+import { dirname, join, resolve } from 'node:path'
+import { fileURLToPath, pathToFileURL } from 'node:url'
 import assert from 'node:assert/strict'
 import { cleanupAfterBenchmark } from './cleanup.mjs'
+
+const localRoot = dirname(dirname(fileURLToPath(import.meta.url)))
+const root = resolve(process.env.ROCKS_LEVEL_ROOT ?? localRoot)
+const { RocksLevel } = await import(pathToFileURL(join(root, 'index.js')).href)
+
+function revision () {
+  try {
+    return execFileSync('git', ['-C', root, 'rev-parse', 'HEAD'], {
+      encoding: 'utf8',
+      stdio: ['ignore', 'pipe', 'ignore']
+    }).trim()
+  } catch {
+    return 'unknown'
+  }
+}
+
+console.log(`implementation: ${process.env.BENCH_LABEL ?? 'local'} (${revision()})`)
 
 const location = await mkdtemp(join(tmpdir(), 'rocks-get-many-'))
 let db
@@ -80,6 +98,13 @@ try {
       bench('_getManyAsync packed=false ' + label, async () => {
         consumeResult(await db._getManyAsync(keys, getOpts))
       })
+
+      if (size === 64) {
+        const stringKeys = Array.from({ length: keys.length }, (_, n) => `${n}-${size}`)
+        bench('_getManyAsync string keys packed=false ' + label, async () => {
+          consumeResult(await db._getManyAsync(stringKeys, getOpts))
+        })
+      }
 
       bench('_getManySync packed=true ' + label, () => {
         consumeResult(db._getManySync(keys, packedGetOpts))
