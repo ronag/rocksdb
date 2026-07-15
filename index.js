@@ -9,7 +9,7 @@ const { ChainedBatch } = require('./chained-batch')
 const { RocksCache } = require('./cache')
 const { RocksWriteBufferManager } = require('./write-buffer-manager')
 const { RocksStatistics, getStatisticsContext } = require('./statistics')
-const { Iterator, kNoFieldsNext } = require('./iterator')
+const { Iterator, noFieldsNextOptions } = require('./iterator')
 const {
   completePublicEvent,
   completePublicEvents,
@@ -45,7 +45,6 @@ const openContinuations = new WeakSet()
 const closeContinuations = new WeakMap()
 const partialResults = new WeakMap()
 const noFieldsIterators = new WeakSet()
-const noFieldsNextOptions = Object.freeze({ [kNoFieldsNext]: true })
 const deferredPartialResults = new WeakSet()
 
 const { getPackedMode, kRef, kUnref, setPackedResult } = require('./util')
