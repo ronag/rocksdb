@@ -82,6 +82,100 @@ test('release prebuild validation rejects native test fault hooks', function (t)
   t.end()
 })
 
+test('release prebuild validation rejects symlinks and non-files', function (t) {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), 'rocks-level-prebuild-files-'))
+
+  try {
+    for (const file of EXPECTED_PREBUILDS) {
+      const absolute = path.join(root, file)
+      fs.mkdirSync(path.dirname(absolute), { recursive: true })
+      fs.writeFileSync(absolute, 'production addon')
+    }
+
+    const linux = path.join(root, EXPECTED_PREBUILDS[1])
+    fs.rmSync(linux)
+    fs.symlinkSync(path.join(root, EXPECTED_PREBUILDS[0]), linux)
+    t.throws(
+      () => validateNoNativeTestFaultHooks(root),
+      /linux-x64.*not a regular file/,
+      'a symlinked addon is not followed'
+    )
+
+    fs.rmSync(linux)
+    fs.mkdirSync(linux)
+    t.throws(
+      () => validateNoNativeTestFaultHooks(root),
+      /linux-x64.*not a regular file/,
+      'a non-file addon is rejected before reading'
+    )
+  } finally {
+    fs.rmSync(root, { recursive: true, force: true })
+  }
+
+  t.end()
+})
+
+test('release prebuild validation scans the file opened before a path swap', function (t) {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), 'rocks-level-prebuild-swap-'))
+  const originalOpen = fs.openSync
+  const originalFstat = fs.fstatSync
+  const originalClose = fs.closeSync
+  const openFlags = []
+  let fstatCalls = 0
+  let closeCalls = 0
+
+  try {
+    for (const file of EXPECTED_PREBUILDS) {
+      const absolute = path.join(root, file)
+      fs.mkdirSync(path.dirname(absolute), { recursive: true })
+      fs.writeFileSync(absolute, 'production addon')
+    }
+
+    const darwin = path.join(root, EXPECTED_PREBUILDS[0])
+    const linux = path.join(root, EXPECTED_PREBUILDS[1])
+    fs.appendFileSync(linux, `\0${NATIVE_TEST_FAULT_HOOKS[2]}\0`)
+
+    fs.openSync = function (...args) {
+      openFlags.push(args[1])
+      return originalOpen(...args)
+    }
+    fs.fstatSync = function (...args) {
+      const stat = originalFstat(...args)
+      fstatCalls++
+
+      if (fstatCalls === 2) {
+        fs.renameSync(linux, `${linux}.opened`)
+        fs.symlinkSync(darwin, linux)
+      }
+
+      return stat
+    }
+    fs.closeSync = function (...args) {
+      closeCalls++
+      return originalClose(...args)
+    }
+
+    t.throws(
+      () => validateNoNativeTestFaultHooks(root),
+      /linux-x64.*test_complete_exception/,
+      'the scan remains bound to the validated descriptor'
+    )
+    t.equal(fstatCalls, 2, 'both expected addons were validated by descriptor')
+    t.equal(closeCalls, 2, 'both descriptors close, including the rejected addon')
+    t.ok(openFlags.every((flags) => (flags & fs.constants.O_NOFOLLOW) !== 0),
+      'descriptor opens never follow symlinks')
+    t.ok(openFlags.every((flags) => (flags & fs.constants.O_NONBLOCK) !== 0),
+      'descriptor opens cannot block on special files')
+  } finally {
+    fs.openSync = originalOpen
+    fs.fstatSync = originalFstat
+    fs.closeSync = originalClose
+    fs.rmSync(root, { recursive: true, force: true })
+  }
+
+  t.end()
+})
+
 test('release prebuild validation covers every native test export', function (t) {
   const binding = fs.readFileSync(path.join(__dirname, '..', 'binding.cc'), 'utf8')
   const guardedBlocks = [...binding.matchAll(
