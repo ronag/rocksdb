@@ -1,6 +1,7 @@
 'use strict'
 
 const { spawnSync } = require('node:child_process')
+const path = require('node:path')
 const test = require('tape')
 const binding = require('../binding')
 const { RocksLevel } = require('..')
@@ -324,9 +325,9 @@ test('cleanup callback exceptions do not abort public fanout', function (t) {
   `
 
   const result = spawnSync(process.execPath, ['-e', script], {
-    cwd: process.cwd(),
+    cwd: path.join(__dirname, '..'),
     encoding: 'utf8',
-    timeout: 30000
+    timeout: 30_000
   })
 
   t.equal(result.status, 0, childMessage(result, 'callback exception child passed'))
@@ -386,9 +387,9 @@ test('cleanup debt does not prevent resource finalization fallback', function (t
   `
 
   const result = spawnSync(process.execPath, ['--expose-gc', '-e', script], {
-    cwd: process.cwd(),
+    cwd: path.join(__dirname, '..'),
     encoding: 'utf8',
-    timeout: 30000
+    timeout: 30_000
   })
 
   t.equal(result.status, 0, childMessage(result, 'finalization fallback child passed'))
