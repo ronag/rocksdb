@@ -33,6 +33,16 @@ const kBatchAsync = Symbol('batchAsync')
 const kPublicEventToken = Symbol('publicEventToken')
 const kPublicOpenToken = Symbol('publicOpenToken')
 const kPublicCloseToken = Symbol('publicCloseToken')
+const kOpenEpoch = Symbol('openEpoch')
+const kCloseGroups = Symbol('closeGroups')
+const kPhysicalCloseGroup = Symbol('physicalCloseGroup')
+const kLandingClose = Symbol('landingClose')
+const kNativeClose = Symbol('nativeClose')
+const kCleanupDebt = Symbol('cleanupDebt')
+const kCleanupDebtClose = Symbol('cleanupDebtClose')
+const kCloseCleanupDebt = Symbol('closeCleanupDebt')
+const openContinuations = new WeakSet()
+const closeContinuations = new WeakMap()
 const partialResults = new WeakMap()
 const noFieldsIterators = new WeakSet()
 const noFieldsNextOptions = Object.freeze({ [kNoFieldsNext]: true })
@@ -42,6 +52,93 @@ const { getPackedMode, kRef, kUnref, setPackedResult } = require('./util')
 
 const kEmpty = Object.freeze({})
 const DEBUG = process.env.NODE_ENV !== 'production'
+const cleanupAttempts = 3
+
+function aggregateErrors (errors, message) {
+  return errors.length === 1
+    ? errors[0]
+    : new AggregateError(errors, message, { cause: errors[0] })
+}
+
+function cleanupDatabaseReference (context, shouldRetry, finish) {
+  const errors = []
+  let attempts = 0
+
+  const complete = (closed) => finish({ closed, errors })
+
+  const afterClose = (err) => {
+    if (err) errors.push(err)
+
+    let closed = false
+    try {
+      closed = binding.db_is_closed(context)
+    } catch (err) {
+      errors.push(err)
+    }
+
+    if (closed || attempts >= cleanupAttempts || !shouldRetry()) {
+      complete(closed)
+      return
+    }
+
+    // Leave a turn between retries. A public open admitted in the meantime
+    // cancels the stale cleanup before it can close the newly-opened lease.
+    process.nextTick(() => {
+      if (shouldRetry()) attempt()
+      else complete(false)
+    })
+  }
+
+  const attempt = () => {
+    attempts++
+    let synchronous = true
+    let completed = false
+    const settle = (err) => {
+      if (completed) return
+      completed = true
+      if (synchronous) process.nextTick(afterClose, err)
+      else afterClose(err)
+    }
+    try {
+      binding.db_close(context, settle)
+      synchronous = false
+    } catch (err) {
+      settle(err)
+    }
+  }
+
+  attempt()
+}
+
+function failedOpenError (openError, cleanupErrors) {
+  if (cleanupErrors.length === 0) return openError
+  return new AggregateError(
+    [openError, ...cleanupErrors],
+    'Database open failed and its native reference could not be released cleanly',
+    { cause: openError }
+  )
+}
+
+function cleanupDebtError (errors) {
+  if (errors.length === 0) return null
+  return new ModuleError('Database is not closed', {
+    code: 'LEVEL_DATABASE_NOT_CLOSED',
+    cause: aggregateErrors(errors, 'Database reference cleanup failed')
+  })
+}
+
+function closeUpdates (handle) {
+  const errors = []
+  for (let attempt = 0; attempt < cleanupAttempts; attempt++) {
+    try {
+      binding.updates_close(handle)
+      break
+    } catch (err) {
+      errors.push(err)
+    }
+  }
+  return errors
+}
 
 function ownPublicCallback (db, callback) {
   // Own the complete public call, including AbstractLevel validation and any
@@ -337,6 +434,12 @@ class RocksLevel extends AbstractLevel {
 
     this[kRefs] = 0
     this[kPendingClose] = null
+    this[kOpenEpoch] = 0
+    this[kCloseGroups] = new Map()
+    this[kPhysicalCloseGroup] = null
+    this[kLandingClose] = false
+    this[kCleanupDebt] = null
+    this[kCleanupDebtClose] = null
   }
 
   [Symbol.asyncDispose] () {
@@ -352,15 +455,35 @@ class RocksLevel extends AbstractLevel {
       callback = options
       options = undefined
     }
-    callback = fromCallback(callback, kPromise)
-    const safeCallback = rethrowingCallback(callback)
+
+    // AbstractLevel re-enters this method after a pending transition lands.
+    // Keep that continuation in the original ordering epoch, while still
+    // installing a fresh listener guard for the physical open it may start.
+    const reentry = typeof callback === 'function' && openContinuations.has(callback)
+    let promise
+    if (!reentry) {
+      callback = fromCallback(callback, kPromise)
+      promise = callback[kPromise]
+      callback = rethrowingCallback(callback)
+
+      // A public open separates close request groups even when the request is
+      // queued behind a transition or the database is already open.
+      this[kOpenEpoch]++
+    }
+
     const previous = this[kPublicOpenToken]
     const token = { claimed: false, errors: [] }
     this[kPublicOpenToken] = token
 
     try {
       guardPublicEvents(this, ['opening'], () => {
-        super.open(options, safeCallback)
+        super.open(options, callback)
+        // Option accessors run inside AbstractLevel and can synchronously
+        // start a transition. Mark only calls that actually need its later
+        // this.open(options, callback) continuation.
+        if (!reentry && (this.status === 'opening' || this.status === 'closing')) {
+          openContinuations.add(callback)
+        }
       }, token.errors)
     } catch (err) {
       rethrowErrors(token.errors)
@@ -369,7 +492,177 @@ class RocksLevel extends AbstractLevel {
       this[kPublicOpenToken] = previous
     }
 
-    return callback[kPromise]
+    return promise
+  }
+
+  close (callback) {
+    const continuation = typeof callback === 'function'
+      ? closeContinuations.get(callback)
+      : undefined
+
+    if (!continuation && this.status === 'closed' && this[kCleanupDebt]) {
+      return this[kCloseCleanupDebt](callback)
+    }
+
+    const callClose = (complete) => {
+      const token = this.status === 'open' && !this[kPublicCloseToken]
+        ? { errors: [] }
+        : null
+      if (token) this[kPublicCloseToken] = token
+
+      try {
+        if (token) {
+          guardPublicEvents(this, ['closing'], () => {
+            super.close(complete)
+          }, token.errors)
+        } else {
+          super.close(complete)
+        }
+      } catch (err) {
+        if (this[kPublicCloseToken] === token) this[kPublicCloseToken] = null
+        if (token) rethrowErrors(token.errors)
+        throw err
+      }
+    }
+
+    // AbstractLevel re-enters this.close() from its private landed event. Do
+    // not let that continuation start another public group. Re-entry from a
+    // native close landing is deferred because AbstractLevel's error path calls
+    // maybeClosed(err) synchronously after emitting the landed event; changing
+    // state during that emit otherwise recurses in abstract-level@1.x.
+    if (continuation && continuation.db === this) {
+      if (this[kLandingClose] && this.status === 'open') {
+        process.nextTick(() => this.close(callback))
+        return
+      }
+
+      if (this.status === 'open') {
+        this[kPhysicalCloseGroup] = continuation.group
+      }
+      return callClose(callback)
+    }
+
+    // Preserve AbstractLevel's fast idempotent path when there is no native
+    // close attempt to coordinate.
+    if (this.status === 'closed') {
+      callback = fromCallback(callback, kPromise)
+      const promise = callback[kPromise]
+      callClose(rethrowingCallback(callback))
+      return promise
+    }
+
+    callback = fromCallback(callback, kPromise)
+    const promise = callback[kPromise]
+    callback = rethrowingCallback(callback)
+    const epoch = this[kOpenEpoch]
+
+    const activeGroup = this[kCloseGroups].get(epoch)
+    if (activeGroup && activeGroup.accepting) {
+      activeGroup.callbacks.push(callback)
+      return promise
+    }
+
+    const group = {
+      callbacks: [callback],
+      terminalError: null,
+      accepting: true,
+      finished: false
+    }
+    this[kCloseGroups].set(epoch, group)
+
+    const complete = (err) => {
+      if (group.finished) return
+      group.finished = true
+      group.accepting = false
+      if (this[kCloseGroups].get(epoch) === group) {
+        this[kCloseGroups].delete(epoch)
+      }
+
+      // A queued open can change AbstractLevel's eventual error while a
+      // terminal native close is landing. Preserve the native teardown error
+      // captured for this close attempt rather than the later state error.
+      const closeError = group.terminalError || err
+      const thrown = []
+      const callbacks = group.callbacks.splice(0)
+      for (const pending of callbacks) {
+        try {
+          pending(closeError)
+        } catch (err) {
+          thrown.push(err)
+        }
+      }
+
+      // One throwing callback must not prevent Promise and callback peers from
+      // settling. Rethrow only after the complete fanout, preserving normal
+      // uncaught callback-error behavior.
+      for (const err of thrown) {
+        process.nextTick(() => { throw err })
+      }
+    }
+    closeContinuations.set(complete, { db: this, group })
+
+    try {
+      if (this.status === 'open') {
+        this[kPhysicalCloseGroup] = group
+      }
+      callClose(complete)
+    } catch (err) {
+      group.accepting = false
+      group.finished = true
+      if (this[kCloseGroups].get(epoch) === group) {
+        this[kCloseGroups].delete(epoch)
+      }
+      if (this[kPhysicalCloseGroup] === group) {
+        this[kPhysicalCloseGroup] = null
+      }
+      throw err
+    }
+
+    return promise
+  }
+
+  [kCloseCleanupDebt] (callback) {
+    callback = fromCallback(callback, kPromise)
+    const promise = callback[kPromise]
+    callback = rethrowingCallback(callback)
+
+    const debt = this[kCleanupDebt]
+    const active = this[kCleanupDebtClose]
+    if (active && active.debt === debt) {
+      active.callbacks.push(callback)
+      return promise
+    }
+
+    const group = { debt, callbacks: [callback], openWaiters: [] }
+    this[kCleanupDebtClose] = group
+
+    cleanupDatabaseReference(
+      this[kContext],
+      () => this[kCleanupDebt] === debt,
+      ({ closed, errors }) => {
+        if (closed && this[kCleanupDebt] === debt) this[kCleanupDebt] = null
+        if (this[kCleanupDebtClose] === group) this[kCleanupDebtClose] = null
+
+        let err = cleanupDebtError(errors)
+        if (!closed && this[kCleanupDebt] === debt && !err) {
+          err = new ModuleError('Database is not closed', {
+            code: 'LEVEL_DATABASE_NOT_CLOSED',
+            cause: new Error('Native database reference remains open after cleanup')
+          })
+        }
+
+        const callbacks = group.callbacks.splice(0)
+        for (const complete of callbacks) complete(err)
+
+        // A later public open cancels only retries that have not been admitted.
+        // Resume it after the active native close has settled, so worker-pool
+        // scheduling cannot let that close tear down the newly-opened lease.
+        const openWaiters = group.openWaiters.splice(0)
+        for (const resume of openWaiters) process.nextTick(resume)
+      }
+    )
+
+    return promise
   }
 
   static async open (...args) {
@@ -420,11 +713,11 @@ class RocksLevel extends AbstractLevel {
       // db_init reserves imported handles immediately. Release that reservation
       // on every open failure, including synchronous option-validation errors
       // that occur before native Database::Open runs.
-      try {
-        binding.db_close(this[kContext], () => complete(err))
-      } catch {
-        process.nextTick(complete, err)
-      }
+      const debt = {}
+      cleanupDatabaseReference(this[kContext], () => true, ({ closed, errors }) => {
+        if (!closed) this[kCleanupDebt] = debt
+        complete(failedOpenError(err, errors))
+      })
     }
 
     const doOpen = () => {
@@ -433,14 +726,46 @@ class RocksLevel extends AbstractLevel {
           options = { ...options, statistics: getStatisticsContext(options.statistics) }
         }
 
-        binding.db_open(this[kContext], inheritColumnOptions(options), (err, columns) => {
+        const bindingOptions = inheritColumnOptions(options)
+        let publicNativeSettled = false
+
+        const settleNativeOpen = (err, columns) => {
+          if (publicOpen) {
+            if (publicNativeSettled) return
+            publicNativeSettled = true
+          }
+
           if (err) {
             failOpen(err)
           } else {
             this[kColumns] = columns
             complete(null)
           }
-        })
+        }
+
+        const admitOpen = () => {
+          const cleanupClose = this[kCleanupDebtClose]
+          if (publicOpen && cleanupClose) {
+            // Cancel queued retries by debt identity, but let the
+            // already-admitted attempt callback exactly once before
+            // dispatching native Open.
+            this[kCleanupDebt] = null
+            cleanupClose.openWaiters.push(admitOpen)
+            return
+          }
+
+          // Cancel stale failed-open cleanup only once native Open is actually
+          // admitted. An option getter that throws before this point leaves the
+          // existing debt available to a later public close retry.
+          this[kCleanupDebt] = null
+          try {
+            binding.db_open(this[kContext], bindingOptions, settleNativeOpen)
+          } catch (err) {
+            settleNativeOpen(err)
+          }
+        }
+
+        admitOpen()
       } catch (err) {
         failOpen(err)
       }
@@ -471,9 +796,82 @@ class RocksLevel extends AbstractLevel {
       // so we must call binding.db_close here (not just the callback) or the
       // native DB and its directory lock would leak. nextTick avoids reentering
       // the native layer from within the completing op's own callback.
-      const callback = this[kPendingClose]
+      const { callback, group } = this[kPendingClose]
       this[kPendingClose] = null
-      process.nextTick(() => binding.db_close(this[kContext], callback))
+      process.nextTick(() => this[kNativeClose](callback, group))
+    }
+  }
+
+  [kNativeClose] (callback, group) {
+    const land = (err) => {
+      this[kLandingClose] = true
+      try {
+        callback(err)
+      } finally {
+        this[kLandingClose] = false
+      }
+    }
+
+    const complete = (err) => {
+      // A close admitted after the physical result is known is a new
+      // idempotent/retry group, even if no open request changed the epoch.
+      if (group) group.accepting = false
+
+      let closed = false
+      if (err) {
+        try {
+          closed = binding.db_is_closed(this[kContext])
+        } catch (stateErr) {
+          land(new AggregateError([err, stateErr], 'Failed to determine database close state'))
+          return
+        }
+      }
+
+      if (closed) {
+        // AbstractLevel assumes that a failing _close() leaves the database
+        // open. RocksDB can instead report I/O errors after teardown is
+        // irreversible. Let AbstractLevel publish the actual closed state,
+        // while close() still rejects with its established error shape.
+        const closeError = new ModuleError('Database is not closed', {
+          code: 'LEVEL_DATABASE_NOT_CLOSED',
+          cause: err
+        })
+        if (group) {
+          group.terminalError = closeError
+          land()
+        } else {
+          land(closeError)
+        }
+      } else {
+        land(err)
+      }
+    }
+
+    // Public close groups own their completion and must settle exactly once,
+    // including the deferred kUnref path where dispatch happens on nextTick.
+    // Leave direct underscore calls caller-owned (group is null).
+    if (group) {
+      let synchronous = true
+      let completed = false
+      const settle = (err) => {
+        if (completed) return
+        completed = true
+        if (synchronous) process.nextTick(complete, err)
+        else complete(err)
+      }
+
+      try {
+        binding.db_close(this[kContext], settle)
+        synchronous = false
+      } catch (err) {
+        settle(err)
+      }
+    } else {
+      try {
+        binding.db_close(this[kContext], complete)
+      } catch (err) {
+        process.nextTick(complete, err)
+      }
     }
   }
 
@@ -485,37 +883,14 @@ class RocksLevel extends AbstractLevel {
           this, ['closed'], callback, err, value, token.errors
         )
       : callback
+    const group = this[kPhysicalCloseGroup]
+    this[kPhysicalCloseGroup] = null
 
     if (this[kRefs]) {
-      this[kPendingClose] = complete
+      this[kPendingClose] = { callback: complete, group }
     } else {
-      binding.db_close(this[kContext], complete)
+      this[kNativeClose](complete, group)
     }
-  }
-
-  close (callback) {
-    callback = fromCallback(callback, kPromise)
-    const safeCallback = rethrowingCallback(callback)
-    const token = this.status === 'open' && !this[kPublicCloseToken]
-      ? { errors: [] }
-      : null
-    if (token) this[kPublicCloseToken] = token
-
-    try {
-      if (token) {
-        guardPublicEvents(this, ['closing'], () => {
-          super.close(safeCallback)
-        }, token.errors)
-      } else {
-        super.close(safeCallback)
-      }
-    } catch (err) {
-      if (this[kPublicCloseToken] === token) this[kPublicCloseToken] = null
-      if (token) rethrowErrors(token.errors)
-      throw err
-    }
-
-    return callback[kPromise]
   }
 
   _put (key, value, options, callback) {
@@ -1063,6 +1438,7 @@ class RocksLevel extends AbstractLevel {
     }
 
     const handle = binding.updates_init(this[kContext], options)
+    let iterationError
     try {
       // Stop if the db is closed between yields, so we never call updates_next
       // on a freed db.
@@ -1084,8 +1460,28 @@ class RocksLevel extends AbstractLevel {
         }
         yield value
       }
+    } catch (err) {
+      iterationError = err
+      throw err
     } finally {
-      binding.updates_close(handle)
+      // CloseResources is retry-safe. Bound retries so a transient cleanup
+      // exception does not strand the native log iterator, while keeping every
+      // observed error visible and preserving the iteration error as cause.
+      const cleanupErrors = closeUpdates(handle)
+      if (cleanupErrors.length > 0) {
+        if (iterationError) {
+          // Intentional: cleanup must augment an abrupt generator completion.
+          // eslint-disable-next-line no-unsafe-finally
+          throw new AggregateError(
+            [iterationError, ...cleanupErrors],
+            'Updates iteration failed and its native resources could not be released cleanly',
+            { cause: iterationError }
+          )
+        }
+        // Intentional: return() must report cleanup failure instead of hiding it.
+        // eslint-disable-next-line no-unsafe-finally
+        throw aggregateErrors(cleanupErrors, 'Updates resources could not be released cleanly')
+      }
     }
   }
 

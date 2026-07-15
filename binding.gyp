@@ -2,8 +2,8 @@
     "variables": {
         "openssl_fips": "0",
         "rocks_level_march%": "<!(node -p \"process.env.ROCKS_LEVEL_MARCH || ''\")",
-        # Compile narrow native fault hooks only for the explicit exception
-        # safety test build. Published binaries have no hook or hot-path check.
+        # Native fault hooks are compiled only for explicit fault-test builds.
+        # Published binaries have neither exports nor hot-path branches.
         "rocks_level_test_faults%": "<!(node -p \"process.env.ROCKS_LEVEL_TEST_FAULTS === '1' ? '1' : '0'\")",
     },
     "targets": [
