@@ -413,7 +413,7 @@ class Iterator extends AbstractIterator {
       return promise
     }
 
-    process.nextTick(callback, iteratorBusyError('all'))
+    process.nextTick(callback, iteratorBusyError('all'), undefined)
     return promise
   }
 

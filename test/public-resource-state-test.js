@@ -147,6 +147,26 @@ test('public iterator busy admission stays outside raw hooks', async function (t
     await iterator.close()
   }
 
+  const callbackAll = db.iterator()
+  let callbackAllArgs
+  callbackAll.seek('a', {
+    keyEncoding: {
+      name: 'nested-all-callback-shape',
+      format: 'buffer',
+      encode (value) {
+        callbackAllArgs = new Promise(resolve => callbackAll.all((...args) => resolve(args)))
+        return Buffer.from(value)
+      },
+      decode: value => value.toString()
+    }
+  })
+  const busyAllArgs = await callbackAllArgs
+  t.equal(busyAllArgs.length, 2, 'busy all callback receives exactly (err, rows)')
+  t.equal(busyAllArgs[0] && busyAllArgs[0].code, 'LEVEL_ITERATOR_BUSY',
+    'busy all callback reports public busy state')
+  t.equal(busyAllArgs[1], undefined, 'busy all callback has no rows')
+  await callbackAll.close()
+
   const invalid = db.iterator()
   let invalidSize
   invalid.seek('a', {
