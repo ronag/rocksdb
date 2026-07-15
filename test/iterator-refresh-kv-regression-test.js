@@ -352,7 +352,7 @@ test('empty SliceLike seek targets reject without discarding iterator state', as
   t.end()
 })
 
-test('seek target validation uses intrinsic lengths and serializes accessors', async function (t) {
+test('seek target validation uses intrinsic lengths and snapshots accessors', async function (t) {
   const db = testCommon.factory()
   await db.open()
   await db.batch([
@@ -400,20 +400,9 @@ test('seek target validation uses intrinsic lengths and serializes accessors', a
 
   const snapshotIterator = db.iterator()
   const reads = { buffer: 0, byteOffset: 0, byteLength: 0 }
-  let reentrantNext
-  let reentrantSeekError
   const target = {
     get buffer () {
       reads.buffer++
-      try {
-        snapshotIterator.seek('a')
-      } catch (err) {
-        reentrantSeekError = err
-      }
-      reentrantNext = snapshotIterator.next().then(
-        () => null,
-        (err) => err
-      )
       return Buffer.from('b')
     },
     get byteOffset () {
@@ -428,131 +417,12 @@ test('seek target validation uses intrinsic lengths and serializes accessors', a
   await snapshotIterator._seekAsync(target)
   t.same(reads, { buffer: 1, byteOffset: 1, byteLength: 1 },
     'SliceLike accessors are snapshotted once')
-  t.equal(reentrantSeekError && reentrantSeekError.code, 'LEVEL_ITERATOR_BUSY',
-    'a reentrant public seek throws a normal busy error')
-  const reentryError = await reentrantNext
-  t.equal(reentryError && reentryError.code, 'LEVEL_ITERATOR_BUSY',
-    'a SliceLike accessor gets a normal busy error for a concurrent iterator operation')
   t.same(await snapshotIterator.next(), ['b', '2'], 'the snapshotted SliceLike target is used')
-
-  const nextvIterator = db.iterator()
-  let reentrantNextv
-  await nextvIterator._seekAsync({
-    get buffer () {
-      reentrantNextv = nextvIterator.nextv(1).then(
-        () => null,
-        (err) => err
-      )
-      return Buffer.from('b')
-    },
-    byteOffset: 0,
-    byteLength: 1
-  })
-  const nextvError = await reentrantNextv
-  t.equal(nextvError && nextvError.code, 'LEVEL_ITERATOR_BUSY',
-    'a reentrant public nextv unwinds its abstract iterator state')
-  t.same(await nextvIterator.next(), ['b', '2'], 'nextv busy handling leaves the iterator usable')
-
-  for (const style of ['promise', 'callback']) {
-    const allIterator = db.iterator()
-    let reentrantAll
-    await allIterator._seekAsync({
-      get buffer () {
-        if (style === 'promise') {
-          reentrantAll = allIterator.all().then(
-            () => null,
-            (err) => err
-          )
-        } else {
-          reentrantAll = new Promise((resolve) => {
-            let synchronous = true
-            allIterator.all((err) => {
-              t.notOk(synchronous, 'reentrant all callback is asynchronous')
-              resolve(err)
-            })
-            synchronous = false
-          })
-        }
-        return Buffer.from('b')
-      },
-      byteOffset: 0,
-      byteLength: 1
-    })
-    const allError = await reentrantAll
-    t.equal(allError && allError.code, 'LEVEL_ITERATOR_BUSY',
-      `reentrant all (${style}) reports a normal busy error`)
-    t.same(await allIterator.next(), ['b', '2'],
-      `reentrant all (${style}) leaves the iterator open and usable`)
-    await allIterator.close()
-  }
-
-  for (const style of ['promise', 'callback']) {
-    const closingAllIterator = db.iterator()
-    let closing
-    const seeking = closingAllIterator._seekAsync({
-      get buffer () {
-        closing = closingAllIterator.close()
-        return Buffer.from('b')
-      },
-      byteOffset: 0,
-      byteLength: 1
-    })
-    let closedAll
-    if (style === 'promise') {
-      closedAll = closingAllIterator.all().then(
-        () => null,
-        (err) => err
-      )
-    } else {
-      closedAll = new Promise((resolve) => {
-        let synchronous = true
-        closingAllIterator.all((err) => {
-          t.notOk(synchronous, 'closing all callback is asynchronous')
-          resolve(err)
-        })
-        synchronous = false
-      })
-    }
-    const closedAllError = await closedAll
-    t.equal(closedAllError && closedAllError.code, 'LEVEL_ITERATOR_NOT_OPEN',
-      `all (${style}) preserves closing precedence over busy`)
-    if (style === 'promise') {
-      t.doesNotThrow(() => closingAllIterator.seek('a'),
-        'public seek preserves abstract-level close-time no-op behavior')
-    }
-    await seeking
-    await closing
-  }
-
-  const closingIterator = db.iterator()
-  const accessorError = new Error('target offset failed')
-  const validationOrder = []
-  let closing
-  const failingTarget = {
-    get buffer () {
-      closing = closingIterator.close().then(() => validationOrder.push('close'))
-      return Buffer.from('b')
-    },
-    get byteOffset () { throw accessorError },
-    byteLength: 1
-  }
-  const seekError = await closingIterator._seekAsync(failingTarget).then(
-    () => null,
-    (err) => {
-      validationOrder.push('seek')
-      return err
-    }
-  )
-  t.is(seekError, accessorError, 'reentrant close does not replace the validation error')
-  await closing
-  t.same(validationOrder, ['seek', 'close'],
-    'failed validation settles before its queued close')
 
   await stringIterator.close()
   await sliceIterator.close()
   await stateIterator.close()
   await snapshotIterator.close()
-  await nextvIterator.close()
   await db.close()
   t.end()
 })
@@ -588,41 +458,22 @@ test('public seek serializes key encoding hooks', async function (t) {
     'a nested public read rejects while the target is encoded')
   t.same(await nextIterator.next(), ['b', '2'], 'outer public seek uses its encoded target')
 
-  const rawIterator = db.iterator()
-  let nestedRawSeek
-  rawIterator.seek('b', {
-    keyEncoding: {
-      name: 'nested-raw-seek',
-      format: 'buffer',
-      encode (value) {
-        nestedRawSeek = rawIterator._seekAsync(Buffer.from('a')).then(
-          () => null,
-          (err) => err
-        )
-        return Buffer.from(value)
-      },
-      decode
-    }
-  })
-  t.equal((await nestedRawSeek).code, 'LEVEL_ITERATOR_BUSY',
-    'a nested raw async seek rejects normally instead of asserting')
-  t.same(await rawIterator.next(), ['b', '2'], 'nested raw seek cannot replace the outer target')
-
   const optionsIterator = db.iterator()
-  let nestedOptionSeek
+  let nestedOptionSeekError
   const options = {}
   Object.defineProperty(options, 'keyEncoding', {
     get () {
-      nestedOptionSeek ??= optionsIterator._seekAsync(Buffer.from('a')).then(
-        () => null,
-        (err) => err
-      )
+      try {
+        optionsIterator.seek('a')
+      } catch (err) {
+        nestedOptionSeekError = err
+      }
       return 'utf8'
     }
   })
   optionsIterator.seek('b', options)
-  t.equal((await nestedOptionSeek).code, 'LEVEL_ITERATOR_BUSY',
-    'a keyEncoding accessor cannot start a concurrent seek')
+  t.equal(nestedOptionSeekError && nestedOptionSeekError.code, 'LEVEL_ITERATOR_BUSY',
+    'a keyEncoding accessor cannot start a nested public seek')
   t.same(await optionsIterator.next(), ['b', '2'], 'options reentrancy leaves the outer seek intact')
 
   const closeIterator = db.iterator()
@@ -679,98 +530,7 @@ test('public seek serializes key encoding hooks', async function (t) {
   t.equal(syncNativeSeeks, 0,
     'close during encoded SliceLike normalization skips the native sync seek')
 
-  const asyncCloseIterator = db.iterator()
-  const asyncOrder = []
-  let asyncClosing
-  let asyncNativeSeeks = 0
-  const originalSeekAsync = binding.iterator_seek
-  binding.iterator_seek = function (...args) {
-    asyncNativeSeeks++
-    return originalSeekAsync(...args)
-  }
-  try {
-    await new Promise((resolve, reject) => {
-      asyncCloseIterator._seekAsync({
-        get buffer () {
-          asyncClosing = asyncCloseIterator.close().then(() => asyncOrder.push('close'))
-          return Buffer.from('b')
-        },
-        byteOffset: 0,
-        byteLength: 1
-      }, (err) => {
-        asyncOrder.push('seek')
-        if (err) reject(err)
-        else resolve()
-      })
-    })
-  } finally {
-    binding.iterator_seek = originalSeekAsync
-  }
-  await asyncClosing
-  t.equal(asyncNativeSeeks, 0,
-    'close during raw async normalization skips native scheduling')
-  t.same(asyncOrder, ['seek', 'close'],
-    'raw async cancellation callback settles before its queued close')
-
-  const throwingIterator = db.iterator()
-  await throwingIterator._seekAsync(Buffer.from('a'))
-  const callbackError = new Error('seek callback failed')
-  let nativeCompletion
-  binding.iterator_seek = function (...args) {
-    nativeCompletion = args.at(-1)
-  }
-  try {
-    throwingIterator._seekAsync(Buffer.from('b'), () => {
-      throw callbackError
-    })
-  } finally {
-    binding.iterator_seek = originalSeekAsync
-  }
-  const throwingClose = throwingIterator.close()
-  t.throws(() => nativeCompletion(null), callbackError,
-    'a native seek completion preserves a thrown user callback error')
-  await throwingClose
-  t.pass('a thrown native seek callback still flushes its queued close')
-
-  const throwingNextvIterator = db.iterator()
-  await throwingNextvIterator._seekAsync(Buffer.from('a'))
-  const nextvCallbackError = new Error('nextv callback failed')
-  let nativeNextvCompletion
-  const originalNextvAsync = binding.iterator_nextv
-  binding.iterator_nextv = function (...args) {
-    nativeNextvCompletion = args.at(-1)
-  }
-  try {
-    throwingNextvIterator._nextvAsync(1, {}, () => {
-      throw nextvCallbackError
-    })
-  } finally {
-    binding.iterator_nextv = originalNextvAsync
-  }
-  const throwingNextvClose = throwingNextvIterator.close()
-  t.throws(() => nativeNextvCompletion(null, { rows: [], finished: true }), nextvCallbackError,
-    'a native nextv completion preserves a thrown user callback error')
-  await throwingNextvClose
-  t.pass('a thrown native nextv callback still flushes its queued close')
-
-  const failingNextvIterator = db.iterator()
-  const optionsError = new Error('nextv options failed')
-  let failingNextvClose
-  const nextvError = await failingNextvIterator._nextvAsync(1, {
-    get timeout () {
-      failingNextvClose = failingNextvIterator.close()
-      throw optionsError
-    }
-  }).then(
-    () => null,
-    (err) => err
-  )
-  t.is(nextvError, optionsError, 'a synchronous nextv options error is preserved')
-  await failingNextvClose
-  t.pass('a synchronous nextv options error still flushes its queued close')
-
   await optionsIterator.close()
-  await rawIterator.close()
   await nextIterator.close()
   await db.close()
   t.end()

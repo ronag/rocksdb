@@ -6,6 +6,10 @@ const ModuleError = require('module-error')
 const assert = require('node:assert')
 
 const binding = require('./binding')
+const {
+  completePublicEvent,
+  rethrowingCallback
+} = require('./public-lifecycle')
 
 const kPromise = Symbol('promise')
 const kBatchContext = Symbol('batchContext')
@@ -13,18 +17,47 @@ const kDbContext = Symbol('dbContext')
 const kBusy = Symbol('busy')
 const kLength = Symbol('length')
 const kPendingClose = Symbol('pendingClose')
+const kScheduleWrite = Symbol('scheduleWrite')
+const kUnsafeBusy = Symbol('unsafeBusy')
+const kPublicWriting = Symbol('publicWriting')
+const kPublicWriteToken = Symbol('publicWriteToken')
 
 const EMPTY = {}
+const DEBUG = process.env.NODE_ENV !== 'production'
+
+function batchBusyError () {
+  return new ModuleError(
+    'Batch is busy: cannot call toArray() while write() or another toArray() is in progress',
+    { code: 'LEVEL_BATCH_BUSY' }
+  )
+}
+
+function assertBatchIdle (batch) {
+  if (DEBUG) {
+    assert(batch[kBatchContext], 'unsafe batch method requires an open batch')
+    assert(!batch[kBusy], 'unsafe batch methods must not overlap')
+    assert(!batch[kPublicWriting], 'unsafe batch methods must not overlap a public write')
+    assert(!batch[kUnsafeBusy], 'unsafe batch methods must not overlap')
+  }
+}
 
 class ChainedBatch extends AbstractChainedBatch {
   constructor (db, context) {
     super(db)
 
     this[kDbContext] = context
-    this[kBatchContext] = binding.batch_init(context)
+    try {
+      this[kBatchContext] = binding.batch_init(context)
+    } catch (err) {
+      db.detachResource(this)
+      throw err
+    }
     this[kBusy] = false
     this[kLength] = 0
     this[kPendingClose] = null
+    this[kPublicWriting] = false
+    this[kPublicWriteToken] = null
+    if (DEBUG) this[kUnsafeBusy] = false
   }
 
   [Symbol.asyncDispose] () {
@@ -32,62 +65,55 @@ class ChainedBatch extends AbstractChainedBatch {
   }
 
   get length () {
-    if (this[kBatchContext]) {
-      this[kLength] = binding.batch_count(this[kBatchContext])
-    }
     return this[kLength]
   }
 
-  _put (key, value, options) {
-    assert(this[kBatchContext])
-    assert(!this[kBusy])
-
-    if (key === null || key === undefined) {
-      throw new ModuleError('Key cannot be null or undefined', {
-        code: 'LEVEL_INVALID_KEY'
-      })
+  write (options, callback) {
+    if (typeof options === 'function') {
+      callback = options
+      options = undefined
     }
+    const previous = this[kPublicWriteToken]
+    this[kPublicWriteToken] = true
+    try {
+      return super.write(options, rethrowingCallback(callback))
+    } finally {
+      this[kPublicWriteToken] = previous
+    }
+  }
 
-    if (value === null || value === undefined) {
-      throw new ModuleError('value cannot be null or undefined', {
-        code: 'LEVEL_INVALID_VALUE'
-      })
+  close (callback) {
+    return super.close(rethrowingCallback(callback))
+  }
+
+  _put (key, value, options) {
+    assertBatchIdle(this)
+    if (DEBUG) {
+      assert(key !== null && key !== undefined, 'unsafe _put() requires a key')
+      assert(value !== null && value !== undefined, 'unsafe _put() requires a value')
     }
 
     key = typeof key === 'string' ? Buffer.from(key) : key
     value = typeof value === 'string' ? Buffer.from(value) : value
 
     binding.batch_put(this[kBatchContext], key, value, options ?? EMPTY)
+    this[kLength]++
   }
 
   _putParts (key, value, options) {
-    assert(this[kBatchContext])
-    assert(!this[kBusy])
-
-    if (key === null || key === undefined) {
-      throw new ModuleError('Key cannot be null or undefined', {
-        code: 'LEVEL_INVALID_KEY'
-      })
-    }
-
-    if (value === null || value === undefined) {
-      throw new ModuleError('value cannot be null or undefined', {
-        code: 'LEVEL_INVALID_VALUE'
-      })
+    assertBatchIdle(this)
+    if (DEBUG) {
+      assert(key !== null && key !== undefined, 'unsafe _putParts() requires a key')
+      assert(value !== null && value !== undefined, 'unsafe _putParts() requires a value')
     }
 
     binding.batch_put_parts(this[kBatchContext], key, value, options ?? EMPTY)
+    this[kLength]++
   }
 
   _putLogData (blob) {
-    assert(this[kBatchContext])
-    assert(!this[kBusy])
-
-    if (blob === null || blob === undefined) {
-      throw new ModuleError('Blob cannot be null or undefined', {
-        code: 'LEVEL_INVALID_VALUE'
-      })
-    }
+    assertBatchIdle(this)
+    if (DEBUG) assert(blob !== null && blob !== undefined, 'unsafe _putLogData() requires data')
 
     blob = typeof blob === 'string' ? Buffer.from(blob) : blob
 
@@ -95,75 +121,83 @@ class ChainedBatch extends AbstractChainedBatch {
   }
 
   _del (key, options) {
-    assert(this[kBatchContext])
-    assert(!this[kBusy])
-
-    if (key === null || key === undefined) {
-      throw new ModuleError('Key cannot be null or undefined', {
-        code: 'LEVEL_INVALID_KEY'
-      })
-    }
+    assertBatchIdle(this)
+    if (DEBUG) assert(key !== null && key !== undefined, 'unsafe _del() requires a key')
 
     key = typeof key === 'string' ? Buffer.from(key) : key
 
     binding.batch_del(this[kBatchContext], key, options ?? EMPTY)
+    this[kLength]++
   }
 
   _clear () {
-    assert(this[kBatchContext])
-    assert(!this[kBusy])
+    assertBatchIdle(this)
 
     binding.batch_clear(this[kBatchContext])
+    this[kLength] = 0
   }
 
   _write (options, callback) {
-    assert(this[kBatchContext])
-    assert(!this[kBusy])
-
-    return this._writeAsync(options, callback)
+    assertBatchIdle(this)
+    const owned = this[kPublicWriteToken] === true
+    if (owned) this[kPublicWriteToken] = false
+    if (owned) this[kPublicWriting] = true
+    else if (DEBUG) this[kUnsafeBusy] = true
+    this[kScheduleWrite](options, (err) => {
+      if (owned) this[kPublicWriting] = false
+      else if (DEBUG) this[kUnsafeBusy] = false
+      if (owned) completePublicEvent(this.db, 'batch', callback, err)
+      else callback(err)
+    })
   }
 
   _writeSync (options) {
-    assert(this[kBatchContext])
-    assert(!this[kBusy])
+    assertBatchIdle(this)
+    if (!DEBUG) {
+      binding.batch_write_sync(this[kDbContext], this[kBatchContext], options ?? EMPTY)
+      return
+    }
 
-    binding.batch_write_sync(this[kDbContext], this[kBatchContext], options ?? EMPTY)
+    this[kUnsafeBusy] = true
+    try {
+      binding.batch_write_sync(this[kDbContext], this[kBatchContext], options ?? EMPTY)
+    } finally {
+      this[kUnsafeBusy] = false
+    }
   }
 
   _writeAsync (options, callback) {
-    assert(this[kBatchContext])
-    assert(!this[kBusy])
-
+    assertBatchIdle(this)
     callback = fromCallback(callback, kPromise)
-
-    this[kBusy] = true
-    const done = (err) => {
-      this[kBusy] = false
-      try {
+    if (DEBUG) {
+      this[kUnsafeBusy] = true
+      this[kScheduleWrite](options, (err) => {
+        this[kUnsafeBusy] = false
         callback(err)
-      } finally {
-        // Raw _writeAsync() calls bypass AbstractChainedBatch's `writing`
-        // state. A concurrent batch.close() or db.close() therefore reaches
-        // _close() while the native write is still in flight. Settle the write
-        // first, then release the native batch and its attached DB resource.
-        this._flushPendingClose()
-      }
-    }
-
-    try {
-      binding.batch_write(this[kDbContext], this[kBatchContext], options ?? EMPTY, done)
-    } catch (err) {
-      process.nextTick(done, err)
+      })
+    } else {
+      this[kScheduleWrite](options, callback)
     }
 
     return callback[kPromise]
   }
 
+  [kScheduleWrite] (options, callback) {
+    try {
+      binding.batch_write(this[kDbContext], this[kBatchContext], options ?? EMPTY, callback)
+    } catch (err) {
+      process.nextTick(callback, err)
+    }
+  }
+
   _close (callback) {
-    assert(this[kBatchContext])
+    if (DEBUG) {
+      assert(this[kBatchContext], 'unsafe _close() requires an open batch')
+      assert(!this[kUnsafeBusy], 'unsafe _close() must not overlap an unsafe operation')
+    }
 
     if (this[kBusy]) {
-      assert(!this[kPendingClose])
+      if (DEBUG) assert(!this[kPendingClose])
       this[kPendingClose] = callback
       return
     }
@@ -185,53 +219,35 @@ class ChainedBatch extends AbstractChainedBatch {
   }
 
   _closeSync () {
-    assert(this[kBatchContext])
-    assert(!this[kBusy])
+    assertBatchIdle(this)
 
-    this[kLength] = binding.batch_count(this[kBatchContext])
     binding.batch_clear(this[kBatchContext])
     this[kBatchContext] = null
   }
 
   _merge (key, value, options) {
-    assert(this[kBatchContext])
-    assert(!this[kBusy])
-
-    if (key === null || key === undefined) {
-      throw new ModuleError('Key cannot be null or undefined', {
-        code: 'LEVEL_INVALID_KEY'
-      })
-    }
-
-    if (value === null || value === undefined) {
-      throw new ModuleError('value cannot be null or undefined', {
-        code: 'LEVEL_INVALID_VALUE'
-      })
+    assertBatchIdle(this)
+    if (DEBUG) {
+      assert(key !== null && key !== undefined, 'unsafe _merge() requires a key')
+      assert(value !== null && value !== undefined, 'unsafe _merge() requires a value')
     }
 
     key = typeof key === 'string' ? Buffer.from(key) : key
     value = typeof value === 'string' ? Buffer.from(value) : value
 
     binding.batch_merge(this[kBatchContext], key, value, options ?? EMPTY)
+    this[kLength]++
   }
 
   _mergeParts (key, value, options) {
-    assert(this[kBatchContext])
-    assert(!this[kBusy])
-
-    if (key === null || key === undefined) {
-      throw new ModuleError('Key cannot be null or undefined', {
-        code: 'LEVEL_INVALID_KEY'
-      })
-    }
-
-    if (value === null || value === undefined) {
-      throw new ModuleError('value cannot be null or undefined', {
-        code: 'LEVEL_INVALID_VALUE'
-      })
+    assertBatchIdle(this)
+    if (DEBUG) {
+      assert(key !== null && key !== undefined, 'unsafe _mergeParts() requires a key')
+      assert(value !== null && value !== undefined, 'unsafe _mergeParts() requires a value')
     }
 
     binding.batch_merge_parts(this[kBatchContext], key, value, options ?? EMPTY)
+    this[kLength]++
   }
 
   * [Symbol.iterator] () {
@@ -246,16 +262,25 @@ class ChainedBatch extends AbstractChainedBatch {
   }
 
   toArray (options) {
+    if (DEBUG) assert(!this[kUnsafeBusy], 'public toArray() must not overlap an unsafe operation')
+    if (this[kBusy] || this[kPublicWriting]) throw batchBusyError()
+
     if (!this[kBatchContext]) {
       return []
     }
 
-    return binding.batch_iterate(this[kDbContext], this[kBatchContext], {
-      keys: true,
-      values: true,
-      data: true,
-      ...options
-    })
+    this[kBusy] = true
+    try {
+      return binding.batch_iterate(this[kDbContext], this[kBatchContext], {
+        keys: true,
+        values: true,
+        data: true,
+        ...options
+      })
+    } finally {
+      this[kBusy] = false
+      this._flushPendingClose()
+    }
   }
 }
 

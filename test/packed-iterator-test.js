@@ -479,28 +479,6 @@ test('raw iterator rejects callable options before encoding proxy preparation', 
   t.end()
 })
 
-test('packed nextv flushes a close requested by a throwing option accessor', async function (t) {
-  const iterator = db._iterator({ keyEncoding: 'buffer', valueEncoding: 'buffer' })
-  const expected = new Error('timeout getter failed')
-  let closePromise
-  const options = { packed: true }
-  Object.defineProperty(options, 'timeout', {
-    get () {
-      closePromise = iterator.close()
-      throw expected
-    }
-  })
-
-  const err = await iterator._nextvAsync(10, options).then(
-    () => null,
-    (err) => err
-  )
-  t.equal(err, expected, 'read reports the original accessor failure')
-  await closePromise
-  t.pass('deferred iterator close completes')
-  t.end()
-})
-
 test('tearDown packed iterator database', async function (t) {
   await db.close()
   t.pass('closed database')

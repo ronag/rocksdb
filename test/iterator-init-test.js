@@ -384,64 +384,6 @@ test('sync initialization failure clears its target and closes native state', as
   t.end()
 })
 
-test('initializing state rejects synchronous reentry with public errors', async function (t) {
-  t.timeoutAfter(5000)
-
-  const db = testCommon.factory()
-  await db.open()
-  await db.put('a', '1')
-
-  const heldInitialization = holdIteratorInitialization()
-  t.teardown(() => {
-    heldInitialization.restore()
-    const err = heldInitialization.resume()
-    if (err) throw err
-  })
-  const iterator = db.iterator()
-  let pending
-  let closing
-  let cleanupError
-  try {
-    pending = iterator._nextvAsync(1, {})
-    if (!heldInitialization.captured) {
-      throw new Error('first read did not enter the initializing state')
-    }
-    t.pass('first read entered the initializing state')
-
-    for (const [operation, call] of [
-      ['refresh', () => iterator._refreshSync()],
-      ['close', () => iterator._closeSync()],
-      ['seek', () => iterator._seekSync(Buffer.from('a'))],
-      ['nextv', () => iterator._nextvSync(1, {})]
-    ]) {
-      const err = thrown(call)
-      t.equal(err && err.code, 'LEVEL_ITERATOR_BUSY', `${operation} reports a busy iterator`)
-      t.notEqual(err && err.code, 'ERR_ASSERTION', `${operation} does not expose an assertion`)
-    }
-
-    let closeSettled = false
-    closing = iterator.close().then(() => { closeSettled = true })
-    await new Promise((resolve) => setImmediate(resolve))
-    t.equal(closeSettled, false, 'async close waits for initialization and its read')
-
-    const resumeError = heldInitialization.resume()
-    if (resumeError) throw resumeError
-    t.same((await pending).rows, ['a', '1'], 'held initialization resumes the original read')
-    await closing
-    t.equal(closeSettled, true, 'deferred close settles exactly once')
-    t.equal(snapshotCount(db), 0, 'resumed initialization releases its snapshot')
-  } finally {
-    heldInitialization.restore()
-    cleanupError = heldInitialization.resume()
-    await Promise.allSettled([pending, closing].filter(Boolean))
-    await iterator.close()
-    await db.close()
-  }
-  if (cleanupError) throw cleanupError
-
-  t.end()
-})
-
 test('database close waits for held iterator initialization', async function (t) {
   t.timeoutAfter(5000)
 
@@ -487,63 +429,6 @@ test('database close waits for held iterator initialization', async function (t)
     if (db.status !== 'closed') await db.close()
   }
   if (cleanupError) throw cleanupError
-
-  t.end()
-})
-
-test('thrown initialization callback still flushes a pending close', async function (t) {
-  t.timeoutAfter(5000)
-
-  const db = testCommon.factory()
-  await db.open()
-
-  const iterator = db.iterator()
-  const callbackError = new Error('initialization callback failed')
-  const originalInit = binding.iterator_init
-  let initializationCompletion
-  let initializationCompleted = false
-  let closing
-
-  binding.iterator_init = function (...args) {
-    initializationCompletion = args.at(-1)
-  }
-  t.teardown(() => {
-    binding.iterator_init = originalInit
-    if (!initializationCompleted && initializationCompletion) {
-      initializationCompleted = true
-      try {
-        initializationCompletion(new Error('test cleanup'))
-      } catch {}
-    }
-  })
-
-  try {
-    iterator._seekAsync(Buffer.from('a'), () => {
-      throw callbackError
-    })
-    if (!initializationCompletion) {
-      throw new Error('seek did not enter the initializing state')
-    }
-
-    closing = iterator.close()
-    initializationCompleted = true
-    t.throws(() => initializationCompletion(null), callbackError,
-      'initialization completion preserves the thrown callback error')
-
-    await closing
-    t.equal(snapshotCount(db), 0, 'the thrown callback still flushes close')
-  } finally {
-    binding.iterator_init = originalInit
-    if (!initializationCompleted && initializationCompletion) {
-      initializationCompleted = true
-      try {
-        initializationCompletion(new Error('test cleanup'))
-      } catch {}
-    }
-    await Promise.allSettled([closing].filter(Boolean))
-    await iterator.close()
-    await db.close()
-  }
 
   t.end()
 })

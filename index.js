@@ -10,6 +10,16 @@ const { RocksCache } = require('./cache')
 const { RocksWriteBufferManager } = require('./write-buffer-manager')
 const { RocksStatistics, getStatisticsContext } = require('./statistics')
 const { Iterator, kNoFieldsNext } = require('./iterator')
+const {
+  completePublicEvent,
+  completePublicEvents,
+  emitPublicEvent,
+  guardPublicEvents,
+  protectPublicChainedBatch,
+  protectPublicClose,
+  rethrowErrors,
+  rethrowingCallback
+} = require('./public-lifecycle')
 const fs = require('node:fs')
 const assert = require('node:assert')
 
@@ -18,6 +28,11 @@ const kColumns = Symbol('columns')
 const kPromise = Symbol('promise')
 const kRefs = Symbol('refs')
 const kPendingClose = Symbol('pendingClose')
+const kGetManyAsync = Symbol('getManyAsync')
+const kBatchAsync = Symbol('batchAsync')
+const kPublicEventToken = Symbol('publicEventToken')
+const kPublicOpenToken = Symbol('publicOpenToken')
+const kPublicCloseToken = Symbol('publicCloseToken')
 const partialResults = new WeakMap()
 const noFieldsIterators = new WeakSet()
 const noFieldsNextOptions = Object.freeze({ [kNoFieldsNext]: true })
@@ -26,6 +41,179 @@ const deferredPartialResults = new WeakSet()
 const { getPackedMode, kRef, kUnref, setPackedResult } = require('./util')
 
 const kEmpty = Object.freeze({})
+const DEBUG = process.env.NODE_ENV !== 'production'
+
+function ownPublicCallback (db, callback) {
+  // Own the complete public call, including AbstractLevel validation and any
+  // deferred auto-open re-entry. Raw hooks never inspect or inherit this state.
+  let owned = true
+  db[kRef]()
+
+  const release = () => {
+    if (!owned) return
+    owned = false
+    db[kUnref]()
+  }
+
+  return {
+    callback (err, value) {
+      release()
+      callback(err, value)
+    },
+    release
+  }
+}
+
+function callPublicMutation (db, event, call) {
+  const previous = db[kPublicEventToken]
+  db[kPublicEventToken] = event
+
+  try {
+    return call()
+  } finally {
+    db[kPublicEventToken] = previous
+  }
+}
+
+function claimPublicMutation (db, event) {
+  if (db[kPublicEventToken] !== event) return false
+  db[kPublicEventToken] = null
+  return true
+}
+
+function wrapSublevelMutation (db, method, event, callbackIndex) {
+  const publicMethod = db[method]
+  Object.defineProperty(db, method, {
+    configurable: true,
+    writable: true,
+    value: function (...args) {
+      const result = callPublicMutation(this, event, () => publicMethod.apply(this, args))
+      return method === 'batch' && args.length === 0 && !(result instanceof ChainedBatch)
+        ? protectPublicChainedBatch(result)
+        : result
+    }
+  })
+
+  const rawMethod = db[`_${method}`]
+  Object.defineProperty(db, `_${method}`, {
+    configurable: true,
+    writable: true,
+    value: function (...args) {
+      if (claimPublicMutation(this, event)) {
+        const callback = args[callbackIndex]
+        args[callbackIndex] = (err, value) => {
+          completePublicEvent(this, event, callback, err, value)
+        }
+      }
+      return rawMethod.apply(this, args)
+    }
+  })
+}
+
+function wrapSublevelLifecycle (db) {
+  const open = db.open
+  const rawOpen = db._open
+  Object.defineProperty(db, 'open', {
+    configurable: true,
+    writable: true,
+    value: function (options, callback) {
+      if (typeof options === 'function') {
+        callback = options
+        options = undefined
+      }
+      callback = fromCallback(callback, kPromise)
+      const safeCallback = rethrowingCallback(callback)
+      const previous = this[kPublicOpenToken]
+      const token = { claimed: false, errors: [] }
+      this[kPublicOpenToken] = token
+
+      try {
+        guardPublicEvents(this, ['opening'], () => {
+          open.call(this, options, safeCallback)
+        }, token.errors)
+      } catch (err) {
+        rethrowErrors(token.errors)
+        throw err
+      } finally {
+        this[kPublicOpenToken] = previous
+      }
+
+      return callback[kPromise]
+    }
+  })
+  Object.defineProperty(db, '_open', {
+    configurable: true,
+    writable: true,
+    value: function (options, callback) {
+      const token = this[kPublicOpenToken]
+      const publicOpen = token && !token.claimed
+      if (publicOpen) token.claimed = true
+      return rawOpen.call(this, options, publicOpen
+        ? (err, value) => completePublicEvents(
+            this, ['open', 'ready'], callback, err, value, token.errors
+          )
+        : callback)
+    }
+  })
+
+  const close = db.close
+  const rawClose = db._close
+  Object.defineProperty(db, 'close', {
+    configurable: true,
+    writable: true,
+    value: function (callback) {
+      callback = fromCallback(callback, kPromise)
+      const safeCallback = rethrowingCallback(callback)
+      const token = this.status === 'open' && !this[kPublicCloseToken]
+        ? { errors: [] }
+        : null
+      if (token) this[kPublicCloseToken] = token
+
+      try {
+        if (token) {
+          guardPublicEvents(this, ['closing'], () => {
+            close.call(this, safeCallback)
+          }, token.errors)
+        } else {
+          close.call(this, safeCallback)
+        }
+      } catch (err) {
+        if (this[kPublicCloseToken] === token) this[kPublicCloseToken] = null
+        if (token) rethrowErrors(token.errors)
+        throw err
+      }
+
+      return callback[kPromise]
+    }
+  })
+  Object.defineProperty(db, '_close', {
+    configurable: true,
+    writable: true,
+    value: function (callback) {
+      const token = this[kPublicCloseToken]
+      if (token) this[kPublicCloseToken] = null
+      return rawClose.call(this, token
+        ? (err, value) => completePublicEvents(
+            this, ['closed'], callback, err, value, token.errors
+          )
+        : callback)
+    }
+  })
+}
+
+function clearNativeBatch (batch, operationError) {
+  try {
+    binding.batch_clear(batch)
+    return operationError
+  } catch (cleanupError) {
+    if (!operationError) return cleanupError
+    return new AggregateError(
+      [operationError, cleanupError],
+      'Batch operation failed and its native resources could not be released',
+      { cause: operationError }
+    )
+  }
+}
 
 function isUtf8Encoding (encoding) {
   return encoding === 'utf8' || encoding === 'utf-8'
@@ -155,6 +343,35 @@ class RocksLevel extends AbstractLevel {
     return this.close()
   }
 
+  emit (event, ...args) {
+    return emitPublicEvent(this, event, () => super.emit(event, ...args))
+  }
+
+  open (options, callback) {
+    if (typeof options === 'function') {
+      callback = options
+      options = undefined
+    }
+    callback = fromCallback(callback, kPromise)
+    const safeCallback = rethrowingCallback(callback)
+    const previous = this[kPublicOpenToken]
+    const token = { claimed: false, errors: [] }
+    this[kPublicOpenToken] = token
+
+    try {
+      guardPublicEvents(this, ['opening'], () => {
+        super.open(options, safeCallback)
+      }, token.errors)
+    } catch (err) {
+      rethrowErrors(token.errors)
+      throw err
+    } finally {
+      this[kPublicOpenToken] = previous
+    }
+
+    return callback[kPromise]
+  }
+
   static async open (...args) {
     const db = new this(...args)
     await db.open()
@@ -190,14 +407,23 @@ class RocksLevel extends AbstractLevel {
   }
 
   _open (options, callback) {
+    const token = this[kPublicOpenToken]
+    const publicOpen = token && !token.claimed
+    if (publicOpen) token.claimed = true
+    const complete = publicOpen
+      ? (err, value) => completePublicEvents(
+          this, ['open', 'ready'], callback, err, value, token.errors
+        )
+      : callback
+
     const failOpen = (err) => {
       // db_init reserves imported handles immediately. Release that reservation
       // on every open failure, including synchronous option-validation errors
       // that occur before native Database::Open runs.
       try {
-        binding.db_close(this[kContext], () => callback(err))
+        binding.db_close(this[kContext], () => complete(err))
       } catch {
-        process.nextTick(callback, err)
+        process.nextTick(complete, err)
       }
     }
 
@@ -212,7 +438,7 @@ class RocksLevel extends AbstractLevel {
             failOpen(err)
           } else {
             this[kColumns] = columns
-            callback(null)
+            complete(null)
           }
         })
       } catch (err) {
@@ -252,21 +478,76 @@ class RocksLevel extends AbstractLevel {
   }
 
   _close (callback) {
+    const token = this[kPublicCloseToken]
+    if (token) this[kPublicCloseToken] = null
+    const complete = token
+      ? (err, value) => completePublicEvents(
+          this, ['closed'], callback, err, value, token.errors
+        )
+      : callback
+
     if (this[kRefs]) {
-      this[kPendingClose] = callback
+      this[kPendingClose] = complete
     } else {
-      binding.db_close(this[kContext], callback)
+      binding.db_close(this[kContext], complete)
     }
+  }
+
+  close (callback) {
+    callback = fromCallback(callback, kPromise)
+    const safeCallback = rethrowingCallback(callback)
+    const token = this.status === 'open' && !this[kPublicCloseToken]
+      ? { errors: [] }
+      : null
+    if (token) this[kPublicCloseToken] = token
+
+    try {
+      if (token) {
+        guardPublicEvents(this, ['closing'], () => {
+          super.close(safeCallback)
+        }, token.errors)
+      } else {
+        super.close(safeCallback)
+      }
+    } catch (err) {
+      if (this[kPublicCloseToken] === token) this[kPublicCloseToken] = null
+      if (token) rethrowErrors(token.errors)
+      throw err
+    }
+
+    return callback[kPromise]
   }
 
   _put (key, value, options, callback) {
     callback = fromCallback(callback, kPromise)
+    const publicEvent = claimPublicMutation(this, 'put')
+
+    return this[kBatchAsync](
+      [{ type: 'put', key, value }],
+      options ?? kEmpty,
+      callback,
+      options,
+      publicEvent && 'put'
+    )
+  }
+
+  put (key, value, options, callback) {
+    if (typeof options === 'function') {
+      callback = options
+      options = undefined
+    }
+    callback = fromCallback(callback, kPromise)
+    const owned = ownPublicCallback(this, callback)
+    const previous = this[kPublicEventToken]
+    this[kPublicEventToken] = 'put'
 
     try {
-      const column = options?.column
-      this._batch([{ type: 'put', key, value, column }], options ?? kEmpty, callback)
+      super.put(key, value, options, owned.callback)
     } catch (err) {
-      process.nextTick(callback, err)
+      owned.release()
+      throw err
+    } finally {
+      this[kPublicEventToken] = previous
     }
 
     return callback[kPromise]
@@ -291,9 +572,13 @@ class RocksLevel extends AbstractLevel {
   }
 
   _getMany (keys, options, callback, allowPartial) {
+    if (keys.some(key => typeof key === 'string')) {
+      keys = keys.map(key => typeof key === 'string' ? Buffer.from(key) : key)
+    }
+
     callback = fromCallback(callback, kPromise)
 
-    this._getManyAsync(keys, options, (err, values) => {
+    this[kGetManyAsync](keys, options, (err, values) => {
       if (err) {
         callback(err)
         return
@@ -307,28 +592,22 @@ class RocksLevel extends AbstractLevel {
   }
 
   _getManyAsync (keys, options, callback, allowPartial, packed, exposePacked = true) {
-    callback = fromCallback(callback, kPromise)
-    if (this.status !== 'open') {
-      process.nextTick(callback, new ModuleError('Database is not open', {
-        code: 'LEVEL_DATABASE_NOT_OPEN'
-      }))
-      return callback[kPromise]
+    if (DEBUG) {
+      assert.strictEqual(this.status, 'open', 'unsafe _getManyAsync() requires an open database')
     }
 
-    let referenced = false
+    if (keys.some(key => typeof key === 'string')) {
+      keys = keys.map(key => typeof key === 'string' ? Buffer.from(key) : key)
+    }
+
+    callback = fromCallback(callback, kPromise)
+    return this[kGetManyAsync](keys, options, callback, allowPartial, packed, exposePacked)
+  }
+
+  [kGetManyAsync] (keys, options, callback, allowPartial, packed, exposePacked) {
     let bindingOptions = options
 
     try {
-      // Claim the database before reading user-controlled array elements or
-      // option accessors. A getter can call db.close(); the accepted read must
-      // keep the native database alive until its callback has completed.
-      this[kRef]()
-      referenced = true
-
-      if (keys.some(key => typeof key === 'string')) {
-        keys = keys.map(key => typeof key === 'string' ? Buffer.from(key) : key)
-      }
-
       if (allowPartial == null) {
         allowPartial = false
         if ((typeof options === 'object' && options !== null) || typeof options === 'function') {
@@ -354,47 +633,57 @@ class RocksLevel extends AbstractLevel {
           ? binding.db_get_many_auto
           : binding.db_get_many
       getMany(this[kContext], keys, bindingOptions, (err, val) => {
-        this[kUnref]()
         if (err) {
           callback(err)
           return
         }
 
-        const indexes = []
-        const packedResult = !Array.isArray(val)
-        if (packedResult) {
-          for (let i = 0; i < val.statuses.length; i++) {
-            if (val.statuses[i] === 2) indexes.push(i)
+        let completionError
+        let completionValue
+        let completionPacked
+        try {
+          const indexes = []
+          const packedResult = !Array.isArray(val)
+          if (packedResult) {
+            for (let i = 0; i < val.statuses.length; i++) {
+              if (val.statuses[i] === 2) indexes.push(i)
+            }
+          } else {
+            for (let i = 0; i < val.length; i++) {
+              if (val[i] === null) indexes.push(i)
+            }
           }
-        } else {
-          for (let i = 0; i < val.length; i++) {
-            if (val[i] === null) indexes.push(i)
+
+          val = convertRawGetManyResult(val, prepared.valueEncoding)
+
+          if (indexes.length === 0) {
+            if (exposePacked) setPackedResult(val, packedResult)
+            completionValue = val
+            completionPacked = packedResult
+          } else if (!allowPartial) {
+            const message = keys.length === 1
+              ? 'Multi-get stopped before the value was read'
+              : 'Multi-get stopped before every value was read'
+            completionError = new ModuleError(message, {
+              code: 'LEVEL_ABORTED'
+            })
+          } else if (packedResult) {
+            if (exposePacked) setPackedResult(val, true)
+            completionValue = val
+            completionPacked = true
+          } else {
+            partialResults.set(val, indexes)
+            if (exposePacked) setPackedResult(val, false)
+            completionValue = val
+            completionPacked = false
           }
+        } catch (err) {
+          completionError = err
         }
 
-        val = convertRawGetManyResult(val, prepared.valueEncoding)
-
-        if (indexes.length === 0) {
-          if (exposePacked) setPackedResult(val, packedResult)
-          callback(null, val, packedResult)
-        } else if (!allowPartial) {
-          const message = keys.length === 1
-            ? 'Multi-get stopped before the value was read'
-            : 'Multi-get stopped before every value was read'
-          callback(new ModuleError(message, {
-            code: 'LEVEL_ABORTED'
-          }))
-        } else if (packedResult) {
-          if (exposePacked) setPackedResult(val, true)
-          callback(null, val, true)
-        } else {
-          partialResults.set(val, indexes)
-          if (exposePacked) setPackedResult(val, false)
-          callback(null, val, false)
-        }
+        callback(completionError, completionValue, completionPacked)
       })
     } catch (err) {
-      if (referenced) this[kUnref]()
       process.nextTick(callback, err)
     }
 
@@ -414,11 +703,36 @@ class RocksLevel extends AbstractLevel {
       if (!err && !deferPartialResults) restorePartialResults(values)
       callback(err, values)
     }
+    const owned = ownPublicCallback(this, done)
 
-    if (options === undefined) {
-      super.getMany(keys, done)
-    } else {
-      super.getMany(keys, options, done)
+    try {
+      if (options === undefined) {
+        super.getMany(keys, owned.callback)
+      } else {
+        super.getMany(keys, options, owned.callback)
+      }
+    } catch (err) {
+      owned.release()
+      if (deferPartialResults) deferredPartialResults.delete(options)
+      throw err
+    }
+
+    return callback[kPromise]
+  }
+
+  get (key, options, callback) {
+    if (typeof options === 'function') {
+      callback = options
+      options = undefined
+    }
+    callback = fromCallback(callback, kPromise)
+    const owned = ownPublicCallback(this, callback)
+
+    try {
+      super.get(key, options, owned.callback)
+    } catch (err) {
+      owned.release()
+      throw err
     }
 
     return callback[kPromise]
@@ -430,41 +744,71 @@ class RocksLevel extends AbstractLevel {
 
   iterator (options) {
     options = snapshotIteratorOptions(options)
+    const noFields = hasNoFields(options)
     const iterator = super.iterator(options)
-    return wrapNoFieldsIterator(iterator, hasNoFields(options))
+    return wrapNoFieldsIterator(iterator, noFields)
+  }
+
+  keys (options) {
+    return protectPublicClose(super.keys(options))
+  }
+
+  values (options) {
+    return protectPublicClose(super.values(options))
   }
 
   _getManySync (keys, options) {
+    if (DEBUG) {
+      assert.strictEqual(this.status, 'open', 'unsafe _getManySync() requires an open database')
+    }
+
     if (keys.some(key => typeof key === 'string')) {
       keys = keys.map(key => typeof key === 'string' ? Buffer.from(key) : key)
     }
 
-    this[kRef]()
-    try {
-      const prepared = prepareRawGetManyOptions(options)
-      const packed = prepared.packed
-      const getMany = packed === true
-        ? binding.db_get_many_packed_sync
-        : packed === 'auto'
-          ? binding.db_get_many_auto_sync
-          : binding.db_get_many_sync
-      const nativeResult = getMany(this[kContext], keys, prepared.bindingOptions)
-      const packedResult = !Array.isArray(nativeResult)
-      const result = convertRawGetManyResult(nativeResult, prepared.valueEncoding)
-      return setPackedResult(result, packedResult)
-    } finally {
-      this[kUnref]()
-    }
+    const prepared = prepareRawGetManyOptions(options)
+    const packed = prepared.packed
+    const getMany = packed === true
+      ? binding.db_get_many_packed_sync
+      : packed === 'auto'
+        ? binding.db_get_many_auto_sync
+        : binding.db_get_many_sync
+    const nativeResult = getMany(this[kContext], keys, prepared.bindingOptions)
+    const packedResult = !Array.isArray(nativeResult)
+    const result = convertRawGetManyResult(nativeResult, prepared.valueEncoding)
+    return setPackedResult(result, packedResult)
   }
 
   _del (key, options, callback) {
     callback = fromCallback(callback, kPromise)
+    const publicEvent = claimPublicMutation(this, 'del')
+
+    return this[kBatchAsync](
+      [{ type: 'del', key }],
+      options ?? kEmpty,
+      callback,
+      options,
+      publicEvent && 'del'
+    )
+  }
+
+  del (key, options, callback) {
+    if (typeof options === 'function') {
+      callback = options
+      options = undefined
+    }
+    callback = fromCallback(callback, kPromise)
+    const owned = ownPublicCallback(this, callback)
+    const previous = this[kPublicEventToken]
+    this[kPublicEventToken] = 'del'
 
     try {
-      const column = options?.column
-      this._batch([{ type: 'del', key, column }], options ?? kEmpty, callback)
+      super.del(key, options, owned.callback)
     } catch (err) {
-      process.nextTick(callback, err)
+      owned.release()
+      throw err
+    } finally {
+      this[kPublicEventToken] = previous
     }
 
     return callback[kPromise]
@@ -472,16 +816,38 @@ class RocksLevel extends AbstractLevel {
 
   _clear (options, callback) {
     callback = fromCallback(callback, kPromise)
+    const publicEvent = claimPublicMutation(this, 'clear')
+
+    const complete = publicEvent
+      ? (err, value) => completePublicEvent(this, 'clear', callback, err, value)
+      : callback
 
     try {
-      this[kRef]()
-      binding.db_clear(this[kContext], options ?? kEmpty, (err) => {
-        this[kUnref]()
-        callback(err)
-      })
+      binding.db_clear(this[kContext], options ?? kEmpty, complete)
     } catch (err) {
-      this[kUnref]()
       process.nextTick(callback, err)
+    }
+
+    return callback[kPromise]
+  }
+
+  clear (options, callback) {
+    if (typeof options === 'function') {
+      callback = options
+      options = undefined
+    }
+    callback = fromCallback(callback, kPromise)
+    const owned = ownPublicCallback(this, callback)
+    const previous = this[kPublicEventToken]
+    this[kPublicEventToken] = 'clear'
+
+    try {
+      super.clear(options, owned.callback)
+    } catch (err) {
+      owned.release()
+      throw err
+    } finally {
+      this[kPublicEventToken] = previous
     }
 
     return callback[kPromise]
@@ -493,13 +859,23 @@ class RocksLevel extends AbstractLevel {
 
   _batch (operations, options, callback) {
     callback = fromCallback(callback, kPromise)
+    const publicEvent = claimPublicMutation(this, 'batch')
+    return this[kBatchAsync](
+      operations,
+      options,
+      callback,
+      undefined,
+      publicEvent && 'batch'
+    )
+  }
 
+  [kBatchAsync] (operations, options, callback, columnOptions, publicEvent) {
     let batch
-    let referenced = false
     try {
       batch = binding.batch_init(this[kContext])
 
       for (let { type, key, value, ...rest } of operations) {
+        if (columnOptions !== undefined) rest.column = columnOptions?.column
         if (type === 'del') {
           key = typeof key === 'string' ? Buffer.from(key) : key
           binding.batch_del(batch, key, rest)
@@ -508,24 +884,49 @@ class RocksLevel extends AbstractLevel {
           value = typeof value === 'string' ? Buffer.from(value) : value
           binding.batch_put(batch, key, value, rest)
         } else {
-          assert(false)
+          if (DEBUG) assert.fail('unsafe _batch() operation type must be put or del')
         }
       }
 
-      // Hold a db ref for the duration of the write so close() defers db_close
-      // until it completes. Array-form batches are not tracked as abstract-level
-      // resources, so they need this explicit lease.
-      this[kRef]()
-      referenced = true
       binding.batch_write(this[kContext], batch, options ?? {}, (err, val) => {
-        this[kUnref]()
-        binding.batch_clear(batch)
-        callback(err, val)
+        err = clearNativeBatch(batch, err)
+        if (publicEvent) completePublicEvent(this, publicEvent, callback, err, val)
+        else callback(err, val)
       })
     } catch (err) {
-      if (referenced) this[kUnref]()
-      if (batch) binding.batch_clear(batch)
-      process.nextTick(callback, err)
+      const completionError = batch ? clearNativeBatch(batch, err) : err
+      process.nextTick(callback, completionError)
+    }
+
+    return callback[kPromise]
+  }
+
+  batch (operations, options, callback) {
+    if (arguments.length === 0) {
+      const batch = super.batch()
+      return batch instanceof ChainedBatch ? batch : protectPublicChainedBatch(batch)
+    }
+
+    if (typeof operations === 'function') {
+      callback = operations
+      options = undefined
+    } else if (typeof options === 'function') {
+      callback = options
+      options = undefined
+    }
+    callback = fromCallback(callback, kPromise)
+    const owned = ownPublicCallback(this, callback)
+    const previous = this[kPublicEventToken]
+    this[kPublicEventToken] = 'batch'
+
+    try {
+      if (typeof operations === 'function') super.batch(owned.callback)
+      else super.batch(operations, options, owned.callback)
+    } catch (err) {
+      owned.release()
+      throw err
+    } finally {
+      this[kPublicEventToken] = previous
     }
 
     return callback[kPromise]
@@ -730,7 +1131,7 @@ class RocksLevel extends AbstractLevel {
       return callback[kPromise]
     }
 
-    let referenced = false
+    this[kRef]()
     try {
       let sync
       if (typeof options === 'boolean') {
@@ -746,14 +1147,12 @@ class RocksLevel extends AbstractLevel {
         }
       }
 
-      this[kRef]()
-      referenced = true
       binding.db_flush_wal(this[kContext], sync, (err, val) => {
         this[kUnref]()
         callback(err, val)
       })
     } catch (err) {
-      if (referenced) this[kUnref]()
+      this[kUnref]()
       process.nextTick(callback, err)
     }
 
@@ -835,6 +1234,21 @@ function wrapNoFieldsIterator (iterator, noFields) {
 }
 
 function wrapSublevel (db) {
+  const emit = db.emit
+  Object.defineProperty(db, 'emit', {
+    configurable: true,
+    writable: true,
+    value: function (event, ...args) {
+      return emitPublicEvent(this, event, () => emit.call(this, event, ...args))
+    }
+  })
+
+  wrapSublevelLifecycle(db)
+  wrapSublevelMutation(db, 'put', 'put', 3)
+  wrapSublevelMutation(db, 'del', 'del', 2)
+  wrapSublevelMutation(db, 'clear', 'clear', 1)
+  wrapSublevelMutation(db, 'batch', 'batch', 2)
+
   const getMany = db.getMany
   Object.defineProperty(db, 'getMany', {
     configurable: true,
@@ -880,10 +1294,22 @@ function wrapSublevel (db) {
     writable: true,
     value: function (options) {
       options = snapshotIteratorOptions(options)
+      const noFields = hasNoFields(options)
       const result = iterator.call(this, options)
-      return wrapNoFieldsIterator(result, hasNoFields(options))
+      return protectPublicClose(wrapNoFieldsIterator(result, noFields))
     }
   })
+
+  for (const method of ['keys', 'values']) {
+    const createIterator = db[method]
+    Object.defineProperty(db, method, {
+      configurable: true,
+      writable: true,
+      value: function (options) {
+        return protectPublicClose(createIterator.call(this, options))
+      }
+    })
+  }
 
   const sublevel = db._sublevel
   Object.defineProperty(db, '_sublevel', {
