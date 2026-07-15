@@ -21,6 +21,11 @@ const kScheduleWrite = Symbol('scheduleWrite')
 const kUnsafeBusy = Symbol('unsafeBusy')
 const kPublicWriting = Symbol('publicWriting')
 const kPublicWriteToken = Symbol('publicWriteToken')
+const kPublicCleanup = Symbol('publicCleanup')
+const kCleanupDebt = Symbol('cleanupDebt')
+const kCleanupDebtClose = Symbol('cleanupDebtClose')
+const kCloseCleanupDebt = Symbol('closeCleanupDebt')
+const kCloseLanded = Symbol('closeLanded')
 
 const EMPTY = {}
 const DEBUG = process.env.NODE_ENV !== 'production'
@@ -41,6 +46,44 @@ function assertBatchIdle (batch) {
   }
 }
 
+function combineCleanupError (operationError, cleanupError) {
+  if (!cleanupError) return operationError
+  if (!operationError || operationError === cleanupError) return cleanupError
+
+  return new AggregateError(
+    [operationError, cleanupError],
+    'Batch operation failed and its native resources could not be released',
+    { cause: operationError }
+  )
+}
+
+function ownPublicCleanup (batch, callback) {
+  // AbstractChainedBatch intentionally discards _close() errors. Keep that
+  // lifecycle behavior, but let the public write()/close() that owned cleanup
+  // observe a newly-created native cleanup debt.
+  const previousDebt = batch[kCleanupDebt]
+  let owned = true
+  batch[kPublicCleanup]++
+
+  const release = () => {
+    if (!owned) return
+    owned = false
+    batch[kPublicCleanup]--
+  }
+
+  return {
+    callback (err, value) {
+      const debt = batch[kCleanupDebt]
+      release()
+      callback(combineCleanupError(
+        err,
+        debt !== previousDebt ? debt?.error : null
+      ), value)
+    },
+    release
+  }
+}
+
 class ChainedBatch extends AbstractChainedBatch {
   constructor (db, context) {
     super(db)
@@ -57,6 +100,10 @@ class ChainedBatch extends AbstractChainedBatch {
     this[kPendingClose] = null
     this[kPublicWriting] = false
     this[kPublicWriteToken] = null
+    this[kPublicCleanup] = 0
+    this[kCleanupDebt] = null
+    this[kCleanupDebtClose] = null
+    this[kCloseLanded] = false
     if (DEBUG) this[kUnsafeBusy] = false
   }
 
@@ -73,17 +120,77 @@ class ChainedBatch extends AbstractChainedBatch {
       callback = options
       options = undefined
     }
+    callback = fromCallback(callback, kPromise)
+    const promise = callback[kPromise]
+    const cleanup = ownPublicCleanup(this, rethrowingCallback(callback))
     const previous = this[kPublicWriteToken]
     this[kPublicWriteToken] = true
     try {
-      return super.write(options, rethrowingCallback(callback))
+      super.write(options, cleanup.callback)
+    } catch (err) {
+      cleanup.release()
+      throw err
     } finally {
       this[kPublicWriteToken] = previous
     }
+
+    return promise
   }
 
   close (callback) {
-    return super.close(rethrowingCallback(callback))
+    if (!this[kCleanupDebt] && this[kCloseLanded]) {
+      return super.close(rethrowingCallback(callback))
+    }
+
+    callback = fromCallback(callback, kPromise)
+    const promise = callback[kPromise]
+    callback = rethrowingCallback(callback)
+
+    if (this[kCleanupDebt]) {
+      // AbstractChainedBatch is already closed and detached at this point, so
+      // retry the retained native context without reentering its state machine.
+      this[kCloseCleanupDebt](callback)
+      return promise
+    }
+
+    const cleanup = ownPublicCleanup(this, callback)
+    try {
+      super.close(cleanup.callback)
+    } catch (err) {
+      cleanup.release()
+      throw err
+    }
+
+    return promise
+  }
+
+  [kCloseCleanupDebt] (callback) {
+    const debt = this[kCleanupDebt]
+    const active = this[kCleanupDebtClose]
+    if (active && active.debt === debt) {
+      active.callbacks.push(callback)
+      return
+    }
+
+    const group = { debt, callbacks: [callback] }
+    this[kCleanupDebtClose] = group
+
+    process.nextTick(() => {
+      let err = null
+      try {
+        this._closeSync()
+      } catch (cleanupError) {
+        err = cleanupError
+      }
+
+      if (this[kCleanupDebt] === debt) {
+        this[kCleanupDebt] = err ? { error: err } : null
+      }
+      if (this[kCleanupDebtClose] === group) this[kCleanupDebtClose] = null
+
+      const callbacks = group.callbacks.splice(0)
+      for (const complete of callbacks) complete(err)
+    })
   }
 
   _put (key, value, options) {
@@ -191,6 +298,8 @@ class ChainedBatch extends AbstractChainedBatch {
   }
 
   _close (callback) {
+    // Unsafe hook: callers own serialization and direct error handling. Only a
+    // surrounding public write()/close() may retain cleanup debt for a retry.
     if (DEBUG) {
       assert(this[kBatchContext], 'unsafe _close() requires an open batch')
       assert(!this[kUnsafeBusy], 'unsafe _close() must not overlap an unsafe operation')
@@ -202,11 +311,22 @@ class ChainedBatch extends AbstractChainedBatch {
       return
     }
 
+    const publicCleanup = this[kPublicCleanup] > 0
+    const complete = (err) => {
+      if (publicCleanup) this[kCloseLanded] = true
+      if (err && publicCleanup) {
+        this[kCleanupDebt] = { error: err }
+        callback()
+      } else {
+        callback(err)
+      }
+    }
+
     try {
       this._closeSync()
-      process.nextTick(callback, null)
+      process.nextTick(complete, null)
     } catch (err) {
-      process.nextTick(callback, err)
+      process.nextTick(complete, err)
     }
   }
 
