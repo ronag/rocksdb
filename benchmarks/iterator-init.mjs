@@ -186,11 +186,14 @@ try {
     const latencies = []
     for (let index = 0; index < firstUseCount; index++) {
       const iterator = db.iterator(limitOneOptions)
-      const start = process.hrtime.bigint()
-      const entries = await iterator.all({})
-      assert.equal(entries.length, 1)
-      latencies.push(elapsedNs(start) / 1000)
-      await iterator.close()
+      try {
+        const start = process.hrtime.bigint()
+        const entries = await iterator.all({})
+        assert.equal(entries.length, 1)
+        latencies.push(elapsedNs(start) / 1000)
+      } finally {
+        await iterator.close()
+      }
     }
     return median(latencies)
   })
