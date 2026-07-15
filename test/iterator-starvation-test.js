@@ -19,50 +19,57 @@ test('iterator does not starve event loop', function (t) {
 
   const db = testCommon.factory()
 
-  db.open(function (err) {
-    t.ifError(err, 'no open error')
+  db.open().then(function () {
+    t.pass('no open error')
 
     // Insert test data
-    db.batch(sourceData.slice(), function (err) {
-      t.ifError(err, 'no batch error')
+    return db.batch(sourceData.slice())
+  }).then(function () {
+    t.pass('no batch error')
 
-      // Set a high highWaterMarkBytes to fill up the cache entirely
-      const it = db.iterator({ highWaterMarkBytes: Math.pow(1024, 3) })
+    // Set a high highWaterMarkBytes to fill up the cache entirely
+    const it = db.iterator({ highWaterMarkBytes: Math.pow(1024, 3) })
 
-      let breaths = 0
-      let entries = 0
-      let scheduled = false
+    let breaths = 0
+    let entries = 0
+    let scheduled = false
 
-      // Iterate continuously while also scheduling work with setImmediate(),
-      // which should be given a chance to run because we limit the tick depth.
-      const next = function () {
-        it.next(function (err, key, value) {
-          if (err || (key === undefined && value === undefined)) {
-            t.ifError(err, 'no next error')
-            t.is(entries, sourceData.length, 'got all data')
-            t.is(breaths, sourceData.length / 1000, 'breathed while iterating')
+    // Iterate continuously while also scheduling work with setImmediate(),
+    // which should be given a chance to run because we limit the tick depth.
+    const next = function () {
+      it.next().then(function (entry) {
+        if (entry === undefined) {
+          t.pass('no next error')
+          t.is(entries, sourceData.length, 'got all data')
+          t.is(breaths, sourceData.length / 1000, 'breathed while iterating')
 
-            return db.close(function (err) {
-              t.ifError(err, 'no close error')
-            })
-          }
+          db.close().then(function () {
+            t.pass('no close error')
+          }, function (err) {
+            t.ifError(err, 'no close error')
+          })
+          return
+        }
 
-          entries++
+        entries++
 
-          if (!scheduled) {
-            scheduled = true
-            setImmediate(function () {
-              breaths++
-              scheduled = false
-            })
-          }
+        if (!scheduled) {
+          scheduled = true
+          setImmediate(function () {
+            breaths++
+            scheduled = false
+          })
+        }
 
-          next()
-        })
-      }
+        next()
+      }, function (err) {
+        t.ifError(err, 'no next error')
+      })
+    }
 
-      next()
-    })
+    next()
+  }, function (err) {
+    t.ifError(err, 'no setup error')
   })
 })
 
@@ -71,50 +78,57 @@ test('iterator with seeks does not starve event loop', function (t) {
 
   const db = testCommon.factory()
 
-  db.open(function (err) {
-    t.ifError(err, 'no open error')
+  db.open().then(function () {
+    t.pass('no open error')
 
-    db.batch(sourceData.slice(), function (err) {
-      t.ifError(err, 'no batch error')
+    return db.batch(sourceData.slice())
+  }).then(function () {
+    t.pass('no batch error')
 
-      const it = db.iterator({ highWaterMarkBytes: Math.pow(1024, 3), limit: sourceData.length })
+    const it = db.iterator({ highWaterMarkBytes: Math.pow(1024, 3), limit: sourceData.length })
 
-      let breaths = 0
-      let entries = 0
-      let scheduled = false
+    let breaths = 0
+    let entries = 0
+    let scheduled = false
 
-      const next = function () {
-        it.next(function (err, key, value) {
-          if (err || (key === undefined && value === undefined)) {
-            t.ifError(err, 'no next error')
-            t.is(entries, sourceData.length, 'got all data')
-            t.is(breaths, sourceData.length - 1, 'breathed while iterating')
+    const next = function () {
+      it.next().then(function (entry) {
+        if (entry === undefined) {
+          t.pass('no next error')
+          t.is(entries, sourceData.length, 'got all data')
+          t.is(breaths, sourceData.length - 1, 'breathed while iterating')
 
-            return db.close(function (err) {
-              t.ifError(err, 'no close error')
-            })
-          }
+          db.close().then(function () {
+            t.pass('no close error')
+          }, function (err) {
+            t.ifError(err, 'no close error')
+          })
+          return
+        }
 
-          entries++
+        entries++
 
-          if (!scheduled) {
-            // Seeking clears the cache, which should only have a positive
-            // effect because it means the cache must be refilled, which
-            // again gives us time to breathe. This is a smoke test, really.
-            it.seek(sourceData[0].key)
+        if (!scheduled) {
+          // Seeking clears the cache, which should only have a positive
+          // effect because it means the cache must be refilled, which
+          // again gives us time to breathe. This is a smoke test, really.
+          it.seek(sourceData[0].key)
 
-            scheduled = true
-            setImmediate(function () {
-              breaths++
-              scheduled = false
-            })
-          }
+          scheduled = true
+          setImmediate(function () {
+            breaths++
+            scheduled = false
+          })
+        }
 
-          next()
-        })
-      }
+        next()
+      }, function (err) {
+        t.ifError(err, 'no next error')
+      })
+    }
 
-      next()
-    })
+    next()
+  }, function (err) {
+    t.ifError(err, 'no setup error')
   })
 })

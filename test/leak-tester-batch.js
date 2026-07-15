@@ -37,9 +37,10 @@ const run = CHAINED
       batch.put(key, value)
     }
 
-    batch.write(function (err) {
-      assert(!err)
+    batch.write().then(function () {
       process.nextTick(run)
+    }, function (err) {
+      assert.ifError(err)
     })
 
     writeCount++
@@ -56,9 +57,10 @@ const run = CHAINED
       batch.push({ type: 'put', key, value })
     }
 
-    db.batch(batch, function (err) {
-      assert(!err)
+    db.batch(batch).then(function () {
       process.nextTick(run)
+    }, function (err) {
+      assert.ifError(err)
     })
 
     writeCount++
@@ -67,7 +69,9 @@ const run = CHAINED
 
 const db = testCommon.factory()
 
-db.open(function () {
+db.open().then(function () {
   rssBase = process.memoryUsage().rss
   run()
+}, function (err) {
+  throw err
 })

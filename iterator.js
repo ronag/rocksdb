@@ -7,11 +7,7 @@ const ModuleError = require('module-error')
 const assert = require('node:assert')
 const { Buffer } = require('node:buffer')
 const { getPackedMode, setPackedResult } = require('./util')
-const {
-  combineIteratorCleanupError,
-  iteratePublicIterator,
-  rethrowingCallback
-} = require('./public-lifecycle')
+const { iteratePublicIterator } = require('./public-lifecycle')
 
 const binding = require('./binding')
 
@@ -28,10 +24,6 @@ const kPosition = Symbol('position')
 const kBusy = Symbol('busy')
 const kPendingClose = Symbol('pendingClose')
 const kCloseRequested = Symbol('closeRequested')
-const kCleanupDebt = Symbol('cleanupDebt')
-const kCleanupDebtClose = Symbol('cleanupDebtClose')
-const kCloseCleanupDebt = Symbol('closeCleanupDebt')
-const kCloseLanded = Symbol('closeLanded')
 const kPublicSeek = Symbol('publicSeek')
 const kUnsafeBusy = Symbol('unsafeBusy')
 const kNoFieldsNext = Symbol('noFieldsNext')
@@ -46,6 +38,11 @@ const kInitNextvAsync = Symbol('initNextvAsync')
 const kCompleteNextv = Symbol('completeNextv')
 const kFinishInitialization = Symbol('finishInitialization')
 const kPublicFirstUse = Symbol('publicFirstUse')
+const kPublicCleanup = Symbol('publicCleanup')
+const kCleanupDebt = Symbol('cleanupDebt')
+const kCleanupDebtClose = Symbol('cleanupDebtClose')
+const kPublicClose = Symbol('publicClose')
+const kCloseCleanupDebt = Symbol('closeCleanupDebt')
 
 const kEmpty = Object.freeze([])
 const noFieldsNextOptions = Object.freeze({ [kNoFieldsNext]: true })
@@ -262,11 +259,12 @@ class Iterator extends AbstractIterator {
       this[kBusy] = false
       this[kPendingClose] = null
       this[kCloseRequested] = false
+      this[kPublicSeek] = false
+      this[kPublicCleanup] = 0
       this[kCleanupDebt] = null
       this[kCleanupDebtClose] = null
-      this[kCloseLanded] = false
-      this[kPublicSeek] = false
       this[kPublicFirstUse] = false
+      this[kPublicClose] = null
       if (DEBUG) this[kUnsafeBusy] = false
     } catch (err) {
       // AbstractIterator attaches itself to the database in super(). A failed
@@ -400,78 +398,52 @@ class Iterator extends AbstractIterator {
     return this.close()
   }
 
-  next (callback) {
+  next () {
     if (DEBUG) assert(!this[kUnsafeBusy], 'public next() must not overlap an unsafe operation')
-    if (!this[kBusy] || this[kCloseRequested]) return super.next(callback)
+    if (!this[kBusy] || this[kCloseRequested]) return super.next()
 
-    callback = fromCallback(callback, kPromise)
-    process.nextTick(callback, iteratorBusyError('next'))
-    return callback[kPromise]
+    return Promise.reject(iteratorBusyError('next'))
   }
 
-  nextv (size, options, callback) {
+  nextv (size, options) {
     if (DEBUG) assert(!this[kUnsafeBusy], 'public nextv() must not overlap an unsafe operation')
     if (!this[kBusy] || this[kCloseRequested]) {
       const previous = this[kPublicFirstUse]
       // Explicit read options are inspected only after lazy initialization in
       // the existing path. Keep that exception/access ordering; the common
       // no-options form can safely initialize and read in one worker.
-      this[kPublicFirstUse] = options === undefined ||
-        typeof options === 'function' || options === noFieldsNextOptions
+      const fuse = options === undefined || options === noFieldsNextOptions
+      this[kPublicFirstUse] = fuse
       try {
-        return super.nextv(size, options, callback)
+        return super.nextv(size, options)
       } finally {
         this[kPublicFirstUse] = previous
       }
     }
 
-    callback = fromCallback(typeof options === 'function' ? options : callback, kPromise)
     const err = Number.isInteger(size)
       ? iteratorBusyError('nextv')
       : new TypeError("The first argument 'size' must be an integer")
-    process.nextTick(callback, err)
-    return callback[kPromise]
+    return Promise.reject(err)
   }
 
-  all (options, callback) {
+  all (options) {
     if (DEBUG) assert(!this[kUnsafeBusy], 'public all() must not overlap an unsafe operation')
-
-    if (typeof options === 'function') {
-      callback = options
-      options = undefined
-    }
-
-    callback = fromCallback(callback, kPromise)
-    const promise = callback[kPromise]
-    callback = rethrowingCallback(callback)
-
     if (!this[kBusy] || this[kCloseRequested]) {
-      const previousDebt = this[kCleanupDebt]
-      const complete = (err, entries) => {
-        // AbstractIterator binds (err, entries) through its auto-close and
-        // therefore cannot receive a later close error as another argument.
-        // Recover the cleanup owned by this all() from its retained debt.
-        const debt = this[kCleanupDebt]
-        const cleanupError = debt !== previousDebt ? debt?.error : null
-        callback(combineIteratorCleanupError(err, cleanupError) || null, entries)
-      }
-
       const previous = this[kPublicFirstUse]
-      // AbstractIterator currently substitutes its private empty options in
-      // _all(), so explicit caller options do not reach the native read. Keep
-      // their identity as a guard in case a future version forwards them.
-      this[kPublicFirstUse] = options === undefined ? true : options
+      // Explicit objects can gain own or inherited options while the lazy
+      // initializer is running. Preserve initialization-before-option-access
+      // ordering for every caller-owned object; only omission is immutable.
+      const fuse = options === undefined
+      this[kPublicFirstUse] = fuse
       try {
-        if (options === undefined) super.all(complete)
-        else super.all(options, complete)
+        return super.all(options)
       } finally {
         this[kPublicFirstUse] = previous
       }
-      return promise
     }
 
-    process.nextTick(callback, iteratorBusyError('all'), undefined)
-    return promise
+    return Promise.reject(iteratorBusyError('all'))
   }
 
   seek (target, options) {
@@ -490,71 +462,73 @@ class Iterator extends AbstractIterator {
     }
   }
 
-  close (callback) {
+  close () {
     if (DEBUG) assert(!this[kUnsafeBusy], 'public close() must not overlap an unsafe operation')
+    this[kCloseRequested] = true
 
-    if (!this[kCleanupDebt] && this[kCloseLanded]) {
-      return super.close(rethrowingCallback(callback))
-    }
-
-    callback = fromCallback(callback, kPromise)
-    const promise = callback[kPromise]
-    callback = rethrowingCallback(callback)
-
-    if (this[kCleanupDebt]) {
-      // AbstractIterator is already closed and detached at this point, so
-      // retry the retained native context without reentering its state machine.
-      this[kCloseCleanupDebt](callback)
-      return promise
-    }
+    if (this[kPublicClose] !== null) return this[kPublicClose]
+    if (this[kCleanupDebt] !== null) return this[kCloseCleanupDebt]()
 
     const previousDebt = this[kCleanupDebt]
-    // AbstractIterator intentionally discards _close() errors. Let it finish
-    // its public lifecycle, then replay newly-created cleanup debt here.
-    super.close((err) => {
-      this[kCloseLanded] = true
-      const debt = this[kCleanupDebt]
-      const failure = combineIteratorCleanupError(
-        err,
-        debt !== previousDebt ? debt?.error : null
-      )
-      if (failure) callback(failure)
-      else callback()
-    })
-    this[kCloseRequested] = true
+    this[kPublicCleanup]++
+    const promise = (async () => {
+      try {
+        await super.close()
+        const debt = this[kCleanupDebt]
+        if (debt !== previousDebt) {
+          // AbstractIterator detached us after our promise hook completed. If
+          // database shutdown owned this close, restore the attachment so a
+          // later db.close() retries the native cleanup before closing RocksDB.
+          if (this.db.status === 'closing') this.db.attachResource(this)
+          throw debt.error
+        }
+      } finally {
+        this[kPublicCleanup]--
+      }
+    })()
+    this[kPublicClose] = promise
+
+    const clear = () => {
+      if (this[kPublicClose] === promise) this[kPublicClose] = null
+    }
+    promise.then(clear, clear)
     return promise
   }
 
-  [kCloseCleanupDebt] (callback) {
+  [kCloseCleanupDebt] () {
     const debt = this[kCleanupDebt]
     const active = this[kCleanupDebtClose]
-    if (active && active.debt === debt) {
-      active.callbacks.push(callback)
-      return
-    }
+    if (active !== null && active.debt === debt) return active.promise
 
-    const group = { debt, callbacks: [callback] }
+    const group = { debt, promise: null }
+    group.promise = new Promise((resolve, reject) => {
+      process.nextTick(() => {
+        let err
+        try {
+          this._closeSync()
+        } catch (cause) {
+          err = cause
+        }
+
+        if (this[kCleanupDebt] === debt) {
+          this[kCleanupDebt] = err ? { error: err } : null
+        }
+
+        if (err) {
+          reject(err)
+        } else {
+          this.db.detachResource(this)
+          resolve()
+        }
+      })
+    })
     this[kCleanupDebtClose] = group
 
-    process.nextTick(() => {
-      let err = null
-      try {
-        this._closeSync()
-      } catch (cleanupError) {
-        err = cleanupError
-      }
-
-      if (this[kCleanupDebt] === debt) {
-        this[kCleanupDebt] = err ? { error: err } : null
-      }
+    const clear = () => {
       if (this[kCleanupDebtClose] === group) this[kCleanupDebtClose] = null
-
-      const callbacks = group.callbacks.splice(0)
-      for (const complete of callbacks) {
-        if (err) complete(err)
-        else complete()
-      }
-    })
+    }
+    group.promise.then(clear, clear)
+    return group.promise
   }
 
   [Symbol.asyncIterator] () {
@@ -579,11 +553,18 @@ class Iterator extends AbstractIterator {
   }
 
   _close (callback) {
+    if (callback === undefined) {
+      return new Promise((resolve, reject) => {
+        this._close(err => err ? reject(err) : resolve())
+      })
+    }
+
     // AbstractIterator serializes its async public operations. kBusy is only
     // needed for synchronous public seek accessors that reenter close(). Raw
     // methods deliberately do not acquire cleanup debt or close ownership.
+    const publicCleanup = this[kPublicCleanup] > 0
     const complete = (err) => {
-      if (err && this[kCloseRequested]) {
+      if (err && publicCleanup) {
         this[kCleanupDebt] = { error: err }
         callback()
       } else {
@@ -616,6 +597,16 @@ class Iterator extends AbstractIterator {
   }
 
   _next (callback) {
+    if (callback === undefined) {
+      return new Promise((resolve, reject) => {
+        this._next(function (err, key, value) {
+          if (err) reject(err)
+          else if (arguments.length < 3) resolve(undefined)
+          else resolve([key, value])
+        })
+      })
+    }
+
     if (DEBUG) assert(!this[kUnsafeBusy], 'unsafe _next() must not overlap an unsafe operation')
 
     if (this[kInitState] !== kReady && this[kInitState] !== kUninitialized) {

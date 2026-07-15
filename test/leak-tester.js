@@ -14,20 +14,22 @@ function run () {
 
   if (BUFFERS) key = Buffer.from(key)
 
-  db.get(key, function (err, value) {
+  db.get(key).then(function (value) {
     getCount++
 
-    if (err) {
+    if (value === undefined) {
       let putValue = crypto.randomBytes(1024)
       if (!BUFFERS) putValue = putValue.toString('hex')
 
-      return db.put(key, putValue, function () {
+      return db.put(key, putValue).then(function () {
         putCount++
         process.nextTick(run)
       })
     }
 
     process.nextTick(run)
+  }, function (err) {
+    throw err
   })
 
   if (getCount % 1000 === 0) {
@@ -43,7 +45,9 @@ function run () {
 
 const db = testCommon.factory()
 
-db.open(function () {
+db.open().then(function () {
   rssBase = process.memoryUsage().rss
   run()
+}, function (err) {
+  throw err
 })

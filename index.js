@@ -9,19 +9,12 @@ const { ChainedBatch } = require('./chained-batch')
 const { RocksCache } = require('./cache')
 const { RocksWriteBufferManager } = require('./write-buffer-manager')
 const { RocksStatistics, getStatisticsContext } = require('./statistics')
-const { Iterator, noFieldsNextOptions } = require('./iterator')
-const {
-  completePublicEvent,
-  completePublicEvents,
-  emitPublicEvent,
-  guardPublicEvents,
-  protectPublicChainedBatch,
-  protectPublicIterator,
-  rethrowErrors,
-  rethrowingCallback
-} = require('./public-lifecycle')
+const { Iterator } = require('./iterator')
+const { iteratePublicIterator } = require('./public-lifecycle')
 const fs = require('node:fs')
 const assert = require('node:assert')
+const { AsyncLocalStorage } = require('node:async_hooks')
+const combineErrors = require('maybe-combine-errors')
 
 const kContext = Symbol('context')
 const kColumns = Symbol('columns')
@@ -30,22 +23,24 @@ const kRefs = Symbol('refs')
 const kPendingClose = Symbol('pendingClose')
 const kGetManyAsync = Symbol('getManyAsync')
 const kBatchAsync = Symbol('batchAsync')
-const kPublicEventToken = Symbol('publicEventToken')
-const kPublicOpenToken = Symbol('publicOpenToken')
-const kPublicCloseToken = Symbol('publicCloseToken')
+const kPublicOperation = Symbol('publicOperation')
+const kRunLifecycle = Symbol('runLifecycle')
+const kLifecycleTail = Symbol('lifecycleTail')
 const kOpenEpoch = Symbol('openEpoch')
 const kCloseGroups = Symbol('closeGroups')
-const kPhysicalCloseGroup = Symbol('physicalCloseGroup')
-const kLandingClose = Symbol('landingClose')
 const kNativeClose = Symbol('nativeClose')
 const kCleanupDebt = Symbol('cleanupDebt')
 const kCleanupDebtClose = Symbol('cleanupDebtClose')
 const kCloseCleanupDebt = Symbol('closeCleanupDebt')
-const openContinuations = new WeakSet()
-const closeContinuations = new WeakMap()
+const kInitialReservation = Symbol('initialReservation')
+const kReleaseInitialReservation = Symbol('releaseInitialReservation')
+const kReconcileInitialReservation = Symbol('reconcileInitialReservation')
 const partialResults = new WeakMap()
-const noFieldsIterators = new WeakSet()
 const deferredPartialResults = new WeakSet()
+const cleanupRetryIterators = new WeakSet()
+const closeContext = new AsyncLocalStorage()
+const openContext = new AsyncLocalStorage()
+const openEventContext = new AsyncLocalStorage()
 
 const { getPackedMode, kRef, kUnref, setPackedResult } = require('./util')
 
@@ -126,6 +121,57 @@ function cleanupDebtError (errors) {
   })
 }
 
+function initialReservationOpenError (openError, closed, cleanupErrors) {
+  if (closed && cleanupErrors.length === 0) return openError
+
+  const primary = openError?.cause ?? openError
+  const errors = [primary, ...cleanupErrors]
+  if (!closed && cleanupErrors.length === 0) {
+    errors.push(new Error('Native database reservation remains open after cleanup'))
+  }
+  const cause = new AggregateError(
+    errors,
+    'Database open failed and its native reservation could not be released cleanly',
+    { cause: primary }
+  )
+
+  return openError instanceof Error && typeof openError.code === 'string'
+    ? new ModuleError(openError.message, { code: openError.code, cause })
+    : new AggregateError([openError, ...errors.slice(1)], cause.message, { cause: openError })
+}
+
+function dedupeDatabaseResourceError (err, group) {
+  const cause = err?.cause
+  if (!(cause instanceof Error) || cause.name !== 'CombinedError' ||
+      typeof cause[Symbol.iterator] !== 'function') return err
+
+  const errors = [...cause]
+  const drops = new Map()
+
+  for (const [cleanupError, actual] of group.resourceCleanupErrors) {
+    const total = errors.reduce(
+      (count, error) => count + (error === cleanupError ? 1 : 0),
+      0
+    )
+    const duplicates = Math.min(actual, Math.max(0, total - actual))
+    if (duplicates > 0) drops.set(cleanupError, duplicates)
+  }
+
+  if (drops.size === 0) return err
+
+  const deduped = []
+  for (const error of errors) {
+    const remaining = drops.get(error) ?? 0
+    if (remaining > 0) drops.set(error, remaining - 1)
+    else deduped.push(error)
+  }
+
+  return new ModuleError(err.message, {
+    code: err.code,
+    cause: combineErrors(deduped)
+  })
+}
+
 function closeUpdates (handle) {
   const errors = []
   for (let attempt = 0; attempt < cleanupAttempts; attempt++) {
@@ -137,164 +183,6 @@ function closeUpdates (handle) {
     }
   }
   return errors
-}
-
-function ownPublicCallback (db, callback) {
-  // Own the complete public call, including AbstractLevel validation and any
-  // deferred auto-open re-entry. Raw hooks never inspect or inherit this state.
-  let owned = true
-  db[kRef]()
-
-  const release = () => {
-    if (!owned) return
-    owned = false
-    db[kUnref]()
-  }
-
-  return {
-    callback (err, value) {
-      release()
-      callback(err, value)
-    },
-    release
-  }
-}
-
-function callPublicMutation (db, event, call) {
-  const previous = db[kPublicEventToken]
-  db[kPublicEventToken] = event
-
-  try {
-    return call()
-  } finally {
-    db[kPublicEventToken] = previous
-  }
-}
-
-function claimPublicMutation (db, event) {
-  if (db[kPublicEventToken] !== event) return false
-  db[kPublicEventToken] = null
-  return true
-}
-
-function wrapSublevelMutation (db, method, event, callbackIndex) {
-  const publicMethod = db[method]
-  Object.defineProperty(db, method, {
-    configurable: true,
-    writable: true,
-    value: function (...args) {
-      const result = callPublicMutation(this, event, () => publicMethod.apply(this, args))
-      return method === 'batch' && args.length === 0 && !(result instanceof ChainedBatch)
-        ? protectPublicChainedBatch(result)
-        : result
-    }
-  })
-
-  const rawMethod = db[`_${method}`]
-  Object.defineProperty(db, `_${method}`, {
-    configurable: true,
-    writable: true,
-    value: function (...args) {
-      if (claimPublicMutation(this, event)) {
-        const callback = args[callbackIndex]
-        args[callbackIndex] = (err, value) => {
-          completePublicEvent(this, event, callback, err, value)
-        }
-      }
-      return rawMethod.apply(this, args)
-    }
-  })
-}
-
-function wrapSublevelLifecycle (db) {
-  const open = db.open
-  const rawOpen = db._open
-  Object.defineProperty(db, 'open', {
-    configurable: true,
-    writable: true,
-    value: function (options, callback) {
-      if (typeof options === 'function') {
-        callback = options
-        options = undefined
-      }
-      callback = fromCallback(callback, kPromise)
-      const safeCallback = rethrowingCallback(callback)
-      const previous = this[kPublicOpenToken]
-      const token = { claimed: false, errors: [] }
-      this[kPublicOpenToken] = token
-
-      try {
-        guardPublicEvents(this, ['opening'], () => {
-          open.call(this, options, safeCallback)
-        }, token.errors)
-      } catch (err) {
-        rethrowErrors(token.errors)
-        throw err
-      } finally {
-        this[kPublicOpenToken] = previous
-      }
-
-      return callback[kPromise]
-    }
-  })
-  Object.defineProperty(db, '_open', {
-    configurable: true,
-    writable: true,
-    value: function (options, callback) {
-      const token = this[kPublicOpenToken]
-      const publicOpen = token && !token.claimed
-      if (publicOpen) token.claimed = true
-      return rawOpen.call(this, options, publicOpen
-        ? (err, value) => completePublicEvents(
-            this, ['open', 'ready'], callback, err, value, token.errors
-          )
-        : callback)
-    }
-  })
-
-  const close = db.close
-  const rawClose = db._close
-  Object.defineProperty(db, 'close', {
-    configurable: true,
-    writable: true,
-    value: function (callback) {
-      callback = fromCallback(callback, kPromise)
-      const safeCallback = rethrowingCallback(callback)
-      const token = this.status === 'open' && !this[kPublicCloseToken]
-        ? { errors: [] }
-        : null
-      if (token) this[kPublicCloseToken] = token
-
-      try {
-        if (token) {
-          guardPublicEvents(this, ['closing'], () => {
-            close.call(this, safeCallback)
-          }, token.errors)
-        } else {
-          close.call(this, safeCallback)
-        }
-      } catch (err) {
-        if (this[kPublicCloseToken] === token) this[kPublicCloseToken] = null
-        if (token) rethrowErrors(token.errors)
-        throw err
-      }
-
-      return callback[kPromise]
-    }
-  })
-  Object.defineProperty(db, '_close', {
-    configurable: true,
-    writable: true,
-    value: function (callback) {
-      const token = this[kPublicCloseToken]
-      if (token) this[kPublicCloseToken] = null
-      return rawClose.call(this, token
-        ? (err, value) => completePublicEvents(
-            this, ['closed'], callback, err, value, token.errors
-          )
-        : callback)
-    }
-  })
 }
 
 function clearNativeBatch (batch, operationError) {
@@ -407,6 +295,9 @@ class RocksLevel extends AbstractLevel {
           buffer: true,
           utf8: true
         },
+        createIfMissing: true,
+        errorIfExists: true,
+        implicitSnapshots: false,
         seek: true,
         additionalMethods: {
           getStatistics: true,
@@ -433,12 +324,15 @@ class RocksLevel extends AbstractLevel {
 
     this[kRefs] = 0
     this[kPendingClose] = null
+    this[kLifecycleTail] = null
     this[kOpenEpoch] = 0
     this[kCloseGroups] = new Map()
-    this[kPhysicalCloseGroup] = null
-    this[kLandingClose] = false
     this[kCleanupDebt] = null
     this[kCleanupDebtClose] = null
+    // db_init(handle) reserves a native lease before AbstractLevel schedules
+    // its first open. Own it until the public lifecycle proves that the lease
+    // was admitted or released.
+    this[kInitialReservation] = typeof locationOrHandle === 'bigint'
   }
 
   [Symbol.asyncDispose] () {
@@ -446,222 +340,320 @@ class RocksLevel extends AbstractLevel {
   }
 
   emit (event, ...args) {
-    return emitPublicEvent(this, event, () => super.emit(event, ...args))
+    return event === 'open'
+      ? openEventContext.run(this, () => super.emit(event, ...args))
+      : super.emit(event, ...args)
   }
 
-  open (options, callback) {
-    if (typeof options === 'function') {
-      callback = options
-      options = undefined
-    }
-
-    // AbstractLevel re-enters this method after a pending transition lands.
-    // Keep that continuation in the original ordering epoch, while still
-    // installing a fresh listener guard for the physical open it may start.
-    const reentry = typeof callback === 'function' && openContinuations.has(callback)
-    let promise
-    if (!reentry) {
-      callback = fromCallback(callback, kPromise)
-      promise = callback[kPromise]
-      callback = rethrowingCallback(callback)
-
-      // A public open separates close request groups even when the request is
-      // queued behind a transition or the database is already open.
-      this[kOpenEpoch]++
-    }
-
-    const previous = this[kPublicOpenToken]
-    const token = { claimed: false, errors: [] }
-    this[kPublicOpenToken] = token
-
-    try {
-      guardPublicEvents(this, ['opening'], () => {
-        super.open(options, callback)
-        // Option accessors run inside AbstractLevel and can synchronously
-        // start a transition. Mark only calls that actually need its later
-        // this.open(options, callback) continuation.
-        if (!reentry && (this.status === 'opening' || this.status === 'closing')) {
-          openContinuations.add(callback)
-        }
-      }, token.errors)
-    } catch (err) {
-      rethrowErrors(token.errors)
-      throw err
-    } finally {
-      this[kPublicOpenToken] = previous
-    }
-
-    return promise
-  }
-
-  close (callback) {
-    const continuation = typeof callback === 'function'
-      ? closeContinuations.get(callback)
-      : undefined
-
-    if (!continuation && this.status === 'closed' && this[kCleanupDebt]) {
-      return this[kCloseCleanupDebt](callback)
-    }
-
-    const callClose = (complete) => {
-      const token = this.status === 'open' && !this[kPublicCloseToken]
-        ? { errors: [] }
-        : null
-      if (token) this[kPublicCloseToken] = token
-
+  open (options) {
+    if (typeof options === 'object' && options !== null) {
       try {
-        if (token) {
-          guardPublicEvents(this, ['closing'], () => {
-            super.close(complete)
-          }, token.errors)
-        } else {
-          super.close(complete)
-        }
+        // Materialize once before entering the lifecycle queue. Besides matching
+        // abstract-level's own option normalization, this lets a reentrant close
+        // from an accessor establish its request before this open is enqueued.
+        options = { ...options }
       } catch (err) {
-        if (this[kPublicCloseToken] === token) this[kPublicCloseToken] = null
-        if (token) rethrowErrors(token.errors)
-        throw err
+        return Promise.reject(err)
       }
     }
 
-    // AbstractLevel re-enters this.close() from its private landed event. Do
-    // not let that continuation start another public group. Re-entry from a
-    // native close landing is deferred because AbstractLevel's error path calls
-    // maybeClosed(err) synchronously after emitting the landed event; changing
-    // state during that emit otherwise recurses in abstract-level@1.x.
-    if (continuation && continuation.db === this) {
-      if (this[kLandingClose] && this.status === 'open') {
-        process.nextTick(() => this.close(callback))
-        return
-      }
-
-      if (this.status === 'open') {
-        this[kPhysicalCloseGroup] = continuation.group
-      }
-      return callClose(callback)
+    // Passive opens only observe lifecycle state. They must remain outside the
+    // mutation queue so the initial passive open can wait for automatic open.
+    if (options !== null && typeof options === 'object' && options.passive === true) {
+      return super.open(options)
     }
 
-    // Preserve AbstractLevel's fast idempotent path when there is no native
-    // close attempt to coordinate.
-    if (this.status === 'closed') {
-      callback = fromCallback(callback, kPromise)
-      const promise = callback[kPromise]
-      callClose(rethrowingCallback(callback))
-      return promise
+    // Count every non-passive request before deciding whether it can bypass
+    // the queue. In particular, an open() from the open event must separate a
+    // close-open-close sequence into distinct close groups.
+    this[kOpenEpoch]++
+
+    // Let abstract-level observe its own transient locked state while running
+    // postopen hooks. Queueing a reentrant open here would otherwise wait for
+    // the very open whose hook is waiting on this call.
+    const lifecycle = this[kLifecycleTail]
+    if (this.status === 'open' && lifecycle !== null && !lifecycle.settled &&
+        openEventContext.getStore() !== this) {
+      return super.open(options)
     }
 
-    callback = fromCallback(callback, kPromise)
-    const promise = callback[kPromise]
-    callback = rethrowingCallback(callback)
+    return this[kRunLifecycle](() => {
+      const start = () => {
+        // A closing-listener failure on a never-opened imported wrapper makes
+        // abstract-level revert to "open" although the native reference is
+        // still Reserved. Reconcile that state before treating open() as an
+        // idempotent success.
+        if (this[kInitialReservation] && this.status === 'open') {
+          return this[kReconcileInitialReservation]().then(start)
+        }
+
+        const result = super.open(options)
+
+        // Keep the common location-based path on abstract-level's exact
+        // promise. An extra async wrapper would let event-triggered lifecycle
+        // requests change status before observers of this open() settle.
+        if (!this[kInitialReservation]) return result
+
+        return result.then(
+          value => {
+            this[kInitialReservation] = false
+            return value
+          },
+          async err => {
+            if (!this[kInitialReservation]) throw err
+
+            // If _open() already owned and cleaned the reference, do not
+            // schedule a second worker merely to discover that it is inactive.
+            // Cleanup debt likewise means that path already owns the retry.
+            if (this.status === 'open' || this[kCleanupDebt] !== null) {
+              this[kInitialReservation] = false
+              throw err
+            }
+
+            // A failed postopen hook can leave AbstractLevel closed while the
+            // native open lease is still usable. Only Reserved references
+            // reject this operation, distinguishing pre-_open event failures.
+            let admitted = false
+            try {
+              binding.db_get_handle(this[kContext])
+              admitted = true
+            } catch {}
+            if (admitted) {
+              this[kInitialReservation] = false
+              throw err
+            }
+
+            let nativeClosed = false
+            try {
+              nativeClosed = binding.db_is_closed(this[kContext])
+            } catch {
+              // Let the retrying cleanup path below retain inspection errors.
+            }
+            if (nativeClosed) {
+              this[kInitialReservation] = false
+              throw err
+            }
+
+            const { closed, errors } = await this[kReleaseInitialReservation]()
+            throw initialReservationOpenError(err, closed, errors)
+          }
+        )
+      }
+
+      const cleanup = this[kCleanupDebtClose]
+      if (cleanup !== null) {
+        // Wait for native cleanup before opening a new lease on the same context.
+        // Keep the debt until _open() is admitted so option errors remain retryable.
+        return cleanup.promise.catch(() => {}).then(start)
+      }
+
+      return start()
+    })
+  }
+
+  close () {
     const epoch = this[kOpenEpoch]
+    const active = this[kCloseGroups].get(epoch)
+    if (active !== undefined) return active.promise
 
-    const activeGroup = this[kCloseGroups].get(epoch)
-    if (activeGroup && activeGroup.accepting) {
-      activeGroup.callbacks.push(callback)
-      return promise
-    }
-
-    const group = {
-      callbacks: [callback],
-      terminalError: null,
-      accepting: true,
-      finished: false
-    }
+    const group = { terminalError: null, resourceCleanupErrors: new Map(), promise: null }
+    let resolveGroup
+    let rejectGroup
+    group.promise = new Promise((resolve, reject) => {
+      resolveGroup = resolve
+      rejectGroup = reject
+    })
+    // The shell is only returned to synchronous reentrant peers. Keep it
+    // handled when no such peer exists and the actual close rejects.
+    group.promise.catch(() => {})
+    // Publish the group before super.close() can emit a reentrant closing
+    // event. Every caller in this epoch must share one native teardown and its
+    // exact terminal result.
     this[kCloseGroups].set(epoch, group)
 
-    const complete = (err) => {
-      if (group.finished) return
-      group.finished = true
-      group.accepting = false
-      if (this[kCloseGroups].get(epoch) === group) {
-        this[kCloseGroups].delete(epoch)
-      }
-
-      // A queued open can change AbstractLevel's eventual error while a
-      // terminal native close is landing. Preserve the native teardown error
-      // captured for this close attempt rather than the later state error.
-      const closeError = group.terminalError || err
-      const thrown = []
-      const callbacks = group.callbacks.splice(0)
-      for (const pending of callbacks) {
+    const closeWork = async () => {
+      let closeError
+      if (this.status === 'closed' && this[kCleanupDebt] !== null) {
         try {
-          pending(closeError)
+          await this[kCloseCleanupDebt]()
         } catch (err) {
-          thrown.push(err)
+          closeError = err
+        }
+      } else {
+        try {
+          await super.close()
+        } catch (err) {
+          closeError = dedupeDatabaseResourceError(err, group)
         }
       }
 
-      // One throwing callback must not prevent Promise and callback peers from
-      // settling. Rethrow only after the complete fanout, preserving normal
-      // uncaught callback-error behavior.
-      for (const err of thrown) {
-        process.nextTick(() => { throw err })
-      }
-    }
-    closeContinuations.set(complete, { db: this, group })
+      // A failure before AbstractLevel publishes closed must remain retryable;
+      // it still owns an open or Reserved reference. A closed-event failure,
+      // however, happens after the initial close skipped _close(), so continue
+      // and release that reservation before surfacing the listener error.
+      if (closeError && this.status !== 'closed') throw closeError
 
-    try {
-      if (this.status === 'open') {
-        this[kPhysicalCloseGroup] = group
+      if (this[kInitialReservation]) {
+        const { closed, errors } = await this[kReleaseInitialReservation]()
+        if (!closed && errors.length === 0) {
+          errors.push(new Error('Native database reservation remains open after cleanup'))
+        }
+        const cleanupError = cleanupDebtError(errors)
+        if (cleanupError !== null) {
+          if (closeError) {
+            throw aggregateErrors(
+              [closeError, cleanupError],
+              'Database close and native reservation cleanup failed'
+            )
+          }
+          throw cleanupError
+        }
       }
-      callClose(complete)
-    } catch (err) {
-      group.accepting = false
-      group.finished = true
-      if (this[kCloseGroups].get(epoch) === group) {
-        this[kCloseGroups].delete(epoch)
-      }
-      if (this[kPhysicalCloseGroup] === group) {
-        this[kPhysicalCloseGroup] = null
-      }
-      throw err
+
+      if (closeError) throw closeError
+      if (group.terminalError !== null) throw group.terminalError
     }
+
+    const operation = () => {
+      let result
+      try {
+        result = closeContext.run(group, closeWork)
+      } catch (err) {
+        result = Promise.reject(err)
+      }
+      Promise.resolve(result).then(resolveGroup, rejectGroup)
+      return group.promise
+    }
+
+    // Calls made while abstract-level is running a postopen hook must reach
+    // its status-lock check immediately. The same condition also covers the
+    // subsequent open event, where close() is allowed. Queue that event case so
+    // observers of the opening promise still see "open"; keep closeContext in
+    // both paths so terminal failures reconcile the public closed state.
+    const lifecycle = this[kLifecycleTail]
+    let result
+    try {
+      result = this.status === 'open' && lifecycle !== null && !lifecycle.settled &&
+          openEventContext.getStore() !== this
+        ? operation()
+        : this[kRunLifecycle](operation)
+    } catch (err) {
+      result = Promise.reject(err)
+    }
+
+    // Return the lifecycle promise. operation() resolves the already-published
+    // group first, so synchronous closing-event peers settle before the next
+    // queued transition is admitted.
+    const promise = Promise.resolve(result)
+
+    const clear = () => {
+      if (this[kCloseGroups].get(epoch) === group) this[kCloseGroups].delete(epoch)
+    }
+    promise.then(clear, clear)
 
     return promise
   }
 
-  [kCloseCleanupDebt] (callback) {
-    callback = fromCallback(callback, kPromise)
-    const promise = callback[kPromise]
-    callback = rethrowingCallback(callback)
+  [kRunLifecycle] (operation) {
+    const previous = this[kLifecycleTail]
+    let release
+    const barrier = new Promise(resolve => { release = resolve })
+    const current = { barrier, settled: false }
+    this[kLifecycleTail] = current
 
-    const debt = this[kCleanupDebt]
-    const active = this[kCleanupDebtClose]
-    if (active && active.debt === debt) {
-      active.callbacks.push(callback)
-      return promise
+    let promise
+    if (previous === null || previous.settled) {
+      try {
+        promise = Promise.resolve(operation())
+      } catch (err) {
+        promise = Promise.reject(err)
+      }
+    } else {
+      promise = previous.barrier.then(operation)
     }
 
-    const group = { debt, callbacks: [callback], openWaiters: [] }
+    const settle = () => {
+      current.settled = true
+      release()
+    }
+    promise.then(settle, settle)
+    const clear = () => {
+      if (this[kLifecycleTail] === current) this[kLifecycleTail] = null
+    }
+    barrier.then(clear)
+    return promise
+  }
+
+  [kReleaseInitialReservation] () {
+    const debt = this[kCleanupDebt] ?? {}
+    this[kCleanupDebt] = debt
+
+    return new Promise((resolve) => {
+      cleanupDatabaseReference(
+        this[kContext],
+        () => this[kInitialReservation] && this[kCleanupDebt] === debt,
+        ({ closed, errors }) => {
+          if (closed) {
+            this[kInitialReservation] = false
+            if (this[kCleanupDebt] === debt) this[kCleanupDebt] = null
+          }
+          resolve({ closed, errors })
+        }
+      )
+    })
+  }
+
+  [kReconcileInitialReservation] () {
+    const group = { terminalError: null, resourceCleanupErrors: new Map() }
+
+    return closeContext.run(group, async () => {
+      try {
+        await super.close()
+      } catch (err) {
+        throw dedupeDatabaseResourceError(err, group)
+      }
+
+      if (group.terminalError !== null) throw group.terminalError
+    })
+  }
+
+  [kCloseCleanupDebt] () {
+    const debt = this[kCleanupDebt]
+    const active = this[kCleanupDebtClose]
+    if (active !== null && active.debt === debt) return active.promise
+
+    const group = { debt, promise: null }
+    group.promise = new Promise((resolve, reject) => {
+      cleanupDatabaseReference(
+        this[kContext],
+        () => this[kCleanupDebt] === debt,
+        ({ closed, errors }) => {
+          if (closed) {
+            this[kInitialReservation] = false
+            if (this[kCleanupDebt] === debt) this[kCleanupDebt] = null
+          }
+
+          let err = cleanupDebtError(errors)
+          if (!closed && this[kCleanupDebt] === debt && !err) {
+            err = new ModuleError('Database is not closed', {
+              code: 'LEVEL_DATABASE_NOT_CLOSED',
+              cause: new Error('Native database reference remains open after cleanup')
+            })
+          }
+
+          if (err) reject(err)
+          else resolve()
+        }
+      )
+    })
     this[kCleanupDebtClose] = group
 
-    cleanupDatabaseReference(
-      this[kContext],
-      () => this[kCleanupDebt] === debt,
-      ({ closed, errors }) => {
-        if (closed && this[kCleanupDebt] === debt) this[kCleanupDebt] = null
-        if (this[kCleanupDebtClose] === group) this[kCleanupDebtClose] = null
+    const clear = () => {
+      if (this[kCleanupDebtClose] === group) this[kCleanupDebtClose] = null
+    }
+    group.promise.then(clear, clear)
 
-        let err = cleanupDebtError(errors)
-        if (!closed && this[kCleanupDebt] === debt && !err) {
-          err = new ModuleError('Database is not closed', {
-            code: 'LEVEL_DATABASE_NOT_CLOSED',
-            cause: new Error('Native database reference remains open after cleanup')
-          })
-        }
-
-        const callbacks = group.callbacks.splice(0)
-        for (const complete of callbacks) complete(err)
-
-        // A later public open cancels only retries that have not been admitted.
-        // Resume it after the active native close has settled, so worker-pool
-        // scheduling cannot let that close tear down the newly-opened lease.
-        const openWaiters = group.openWaiters.splice(0)
-        for (const resume of openWaiters) process.nextTick(resume)
-      }
-    )
-
-    return promise
+    return group.promise
   }
 
   static async open (...args) {
@@ -699,14 +691,13 @@ class RocksLevel extends AbstractLevel {
   }
 
   _open (options, callback) {
-    const token = this[kPublicOpenToken]
-    const publicOpen = token && !token.claimed
-    if (publicOpen) token.claimed = true
-    const complete = publicOpen
-      ? (err, value) => completePublicEvents(
-          this, ['open', 'ready'], callback, err, value, token.errors
-        )
-      : callback
+    if (callback === undefined) {
+      return openContext.run(this, () => new Promise((resolve, reject) => {
+        this._open(options, err => err ? reject(err) : resolve())
+      }))
+    }
+
+    const promiseHook = openContext.getStore() === this
 
     const failOpen = (err) => {
       // db_init reserves imported handles immediately. Release that reservation
@@ -715,7 +706,7 @@ class RocksLevel extends AbstractLevel {
       const debt = {}
       cleanupDatabaseReference(this[kContext], () => true, ({ closed, errors }) => {
         if (!closed) this[kCleanupDebt] = debt
-        complete(failedOpenError(err, errors))
+        callback(failedOpenError(err, errors))
       })
     }
 
@@ -726,33 +717,23 @@ class RocksLevel extends AbstractLevel {
         }
 
         const bindingOptions = inheritColumnOptions(options)
-        let publicNativeSettled = false
+        let nativeSettled = false
 
         const settleNativeOpen = (err, columns) => {
-          if (publicOpen) {
-            if (publicNativeSettled) return
-            publicNativeSettled = true
+          if (promiseHook) {
+            if (nativeSettled) return
+            nativeSettled = true
           }
 
           if (err) {
             failOpen(err)
           } else {
             this[kColumns] = columns
-            complete(null)
+            callback(null)
           }
         }
 
         const admitOpen = () => {
-          const cleanupClose = this[kCleanupDebtClose]
-          if (publicOpen && cleanupClose) {
-            // Cancel queued retries by debt identity, but let the
-            // already-admitted attempt callback exactly once before
-            // dispatching native Open.
-            this[kCleanupDebt] = null
-            cleanupClose.openWaiters.push(admitOpen)
-            return
-          }
-
           // Cancel stale failed-open cleanup only once native Open is actually
           // admitted. An option getter that throws before this point leaves the
           // existing debt available to a later public close retry.
@@ -787,6 +768,15 @@ class RocksLevel extends AbstractLevel {
     this[kRefs]++
   }
 
+  async [kPublicOperation] (operation) {
+    this[kRef]()
+    try {
+      return await operation()
+    } finally {
+      this[kUnref]()
+    }
+  }
+
   [kUnref] () {
     this[kRefs]--
     if (this[kRefs] === 0 && this[kPendingClose]) {
@@ -802,20 +792,9 @@ class RocksLevel extends AbstractLevel {
   }
 
   [kNativeClose] (callback, group) {
-    const land = (err) => {
-      this[kLandingClose] = true
-      try {
-        callback(err)
-      } finally {
-        this[kLandingClose] = false
-      }
-    }
+    const land = callback
 
     const complete = (err) => {
-      // A close admitted after the physical result is known is a new
-      // idempotent/retry group, even if no open request changed the epoch.
-      if (group) group.accepting = false
-
       let closed = false
       if (err) {
         try {
@@ -875,56 +854,34 @@ class RocksLevel extends AbstractLevel {
   }
 
   _close (callback) {
-    const token = this[kPublicCloseToken]
-    if (token) this[kPublicCloseToken] = null
-    const complete = token
-      ? (err, value) => completePublicEvents(
-          this, ['closed'], callback, err, value, token.errors
-        )
-      : callback
-    const group = this[kPhysicalCloseGroup]
-    this[kPhysicalCloseGroup] = null
+    if (callback === undefined) {
+      return new Promise((resolve, reject) => {
+        this._close(err => err ? reject(err) : resolve())
+      })
+    }
+
+    const group = closeContext.getStore() ?? null
 
     if (this[kRefs]) {
-      this[kPendingClose] = { callback: complete, group }
+      this[kPendingClose] = { callback, group }
     } else {
-      this[kNativeClose](complete, group)
+      this[kNativeClose](callback, group)
     }
   }
 
   _put (key, value, options, callback) {
     callback = fromCallback(callback, kPromise)
-    const publicEvent = claimPublicMutation(this, 'put')
 
     return this[kBatchAsync](
       [{ type: 'put', key, value }],
       options ?? kEmpty,
       callback,
-      options,
-      publicEvent && 'put'
+      options
     )
   }
 
-  put (key, value, options, callback) {
-    if (typeof options === 'function') {
-      callback = options
-      options = undefined
-    }
-    callback = fromCallback(callback, kPromise)
-    const owned = ownPublicCallback(this, callback)
-    const previous = this[kPublicEventToken]
-    this[kPublicEventToken] = 'put'
-
-    try {
-      super.put(key, value, options, owned.callback)
-    } catch (err) {
-      owned.release()
-      throw err
-    } finally {
-      this[kPublicEventToken] = previous
-    }
-
-    return callback[kPromise]
+  put (key, value, options) {
+    return this[kPublicOperation](() => super.put(key, value, options))
   }
 
   _get (key, options, callback) {
@@ -1064,52 +1021,48 @@ class RocksLevel extends AbstractLevel {
     return callback[kPromise]
   }
 
-  getMany (keys, options, callback) {
-    if (typeof options === 'function') {
-      callback = options
-      options = undefined
-    }
-    callback = fromCallback(callback, kPromise)
+  getMany (keys, options) {
     const deferPartialResults = deferredPartialResults.has(options)
 
-    const done = (err, values) => {
-      if (deferPartialResults) deferredPartialResults.delete(options)
-      if (!err && !deferPartialResults) restorePartialResults(values)
-      callback(err, values)
-    }
-    const owned = ownPublicCallback(this, done)
-
-    try {
-      if (options === undefined) {
-        super.getMany(keys, owned.callback)
-      } else {
-        super.getMany(keys, options, owned.callback)
+    return this[kPublicOperation](async () => {
+      try {
+        const values = await super.getMany(keys, options)
+        if (!deferPartialResults) restorePartialResults(values)
+        return values
+      } finally {
+        if (deferPartialResults) deferredPartialResults.delete(options)
       }
-    } catch (err) {
-      owned.release()
-      if (deferPartialResults) deferredPartialResults.delete(options)
-      throw err
-    }
-
-    return callback[kPromise]
+    })
   }
 
-  get (key, options, callback) {
-    if (typeof options === 'function') {
-      callback = options
-      options = undefined
-    }
-    callback = fromCallback(callback, kPromise)
-    const owned = ownPublicCallback(this, callback)
+  get (key, options) {
+    return this[kPublicOperation](async () => {
+      // The unchanged raw _get() reports a missing key with its legacy
+      // LEVEL_NOT_FOUND error, while abstract-level v3 implementor hooks return
+      // undefined. Adapt the native _getMany() result at the public boundary so
+      // user errors with that code retain identity. A subclass that supplies a
+      // v3 _get() hook must continue to receive the standard dispatch.
+      if (key === null || key === undefined || this.status !== 'open' ||
+          this._get !== RocksLevel.prototype._get) {
+        return super.get(key, options)
+      }
 
-    try {
-      super.get(key, options, owned.callback)
-    } catch (err) {
-      owned.release()
-      throw err
-    }
+      // getMany resolves encodings before validating its keys, unlike get().
+      // Preserve custom subclass validation ordering before using getMany as
+      // the public adapter. The base validator is left to getMany's own pass.
+      if (this._assertValidKey !== AbstractLevel.prototype._assertValidKey) {
+        this._assertValidKey(key)
+      }
 
-    return callback[kPromise]
+      const values = await super.getMany([key], options)
+      if (partialResults.has(values)) {
+        partialResults.delete(values)
+        throw new ModuleError('Multi-get stopped before the value was read', {
+          code: 'LEVEL_ABORTED'
+        })
+      }
+      return values[0]
+    })
   }
 
   _sublevel (name, options) {
@@ -1118,18 +1071,16 @@ class RocksLevel extends AbstractLevel {
 
   iterator (options) {
     options = snapshotIteratorOptions(options)
-    const noFields = hasNoFields(options)
     const iterator = super.iterator(options)
-    const wrapped = wrapNoFieldsIterator(iterator, noFields)
-    return iterator instanceof Iterator ? wrapped : protectPublicIterator(wrapped)
+    return iterator instanceof Iterator ? iterator : wrapIteratorCleanupRetry(iterator)
   }
 
   keys (options) {
-    return protectPublicIterator(super.keys(options))
+    return wrapIteratorCleanupRetry(super.keys(options))
   }
 
   values (options) {
-    return protectPublicIterator(super.values(options))
+    return wrapIteratorCleanupRetry(super.values(options))
   }
 
   _getManySync (keys, options) {
@@ -1156,49 +1107,24 @@ class RocksLevel extends AbstractLevel {
 
   _del (key, options, callback) {
     callback = fromCallback(callback, kPromise)
-    const publicEvent = claimPublicMutation(this, 'del')
 
     return this[kBatchAsync](
       [{ type: 'del', key }],
       options ?? kEmpty,
       callback,
-      options,
-      publicEvent && 'del'
+      options
     )
   }
 
-  del (key, options, callback) {
-    if (typeof options === 'function') {
-      callback = options
-      options = undefined
-    }
-    callback = fromCallback(callback, kPromise)
-    const owned = ownPublicCallback(this, callback)
-    const previous = this[kPublicEventToken]
-    this[kPublicEventToken] = 'del'
-
-    try {
-      super.del(key, options, owned.callback)
-    } catch (err) {
-      owned.release()
-      throw err
-    } finally {
-      this[kPublicEventToken] = previous
-    }
-
-    return callback[kPromise]
+  del (key, options) {
+    return this[kPublicOperation](() => super.del(key, options))
   }
 
   _clear (options, callback) {
     callback = fromCallback(callback, kPromise)
-    const publicEvent = claimPublicMutation(this, 'clear')
-
-    const complete = publicEvent
-      ? (err, value) => completePublicEvent(this, 'clear', callback, err, value)
-      : callback
 
     try {
-      binding.db_clear(this[kContext], options ?? kEmpty, complete)
+      binding.db_clear(this[kContext], options ?? kEmpty, callback)
     } catch (err) {
       process.nextTick(callback, err)
     }
@@ -1206,26 +1132,8 @@ class RocksLevel extends AbstractLevel {
     return callback[kPromise]
   }
 
-  clear (options, callback) {
-    if (typeof options === 'function') {
-      callback = options
-      options = undefined
-    }
-    callback = fromCallback(callback, kPromise)
-    const owned = ownPublicCallback(this, callback)
-    const previous = this[kPublicEventToken]
-    this[kPublicEventToken] = 'clear'
-
-    try {
-      super.clear(options, owned.callback)
-    } catch (err) {
-      owned.release()
-      throw err
-    } finally {
-      this[kPublicEventToken] = previous
-    }
-
-    return callback[kPromise]
+  clear (options) {
+    return this[kPublicOperation](() => super.clear(options))
   }
 
   _chainedBatch () {
@@ -1234,17 +1142,14 @@ class RocksLevel extends AbstractLevel {
 
   _batch (operations, options, callback) {
     callback = fromCallback(callback, kPromise)
-    const publicEvent = claimPublicMutation(this, 'batch')
     return this[kBatchAsync](
       operations,
       options,
-      callback,
-      undefined,
-      publicEvent && 'batch'
+      callback
     )
   }
 
-  [kBatchAsync] (operations, options, callback, columnOptions, publicEvent) {
+  [kBatchAsync] (operations, options, callback, columnOptions) {
     let batch
     try {
       batch = binding.batch_init(this[kContext])
@@ -1265,8 +1170,7 @@ class RocksLevel extends AbstractLevel {
 
       binding.batch_write(this[kContext], batch, options ?? {}, (err, val) => {
         err = clearNativeBatch(batch, err)
-        if (publicEvent) completePublicEvent(this, publicEvent, callback, err, val)
-        else callback(err, val)
+        callback(err, val)
       })
     } catch (err) {
       const completionError = batch ? clearNativeBatch(batch, err) : err
@@ -1276,41 +1180,17 @@ class RocksLevel extends AbstractLevel {
     return callback[kPromise]
   }
 
-  batch (operations, options, callback) {
+  batch (operations, options) {
     if (arguments.length === 0) {
-      const batch = super.batch()
-      return batch instanceof ChainedBatch ? batch : protectPublicChainedBatch(batch)
+      return super.batch()
     }
 
-    if (typeof operations === 'function') {
-      callback = operations
-      options = undefined
-    } else if (typeof options === 'function') {
-      callback = options
-      options = undefined
-    }
-    callback = fromCallback(callback, kPromise)
-    const owned = ownPublicCallback(this, callback)
-    const previous = this[kPublicEventToken]
-    this[kPublicEventToken] = 'batch'
-
-    try {
-      if (typeof operations === 'function') super.batch(owned.callback)
-      else super.batch(operations, options, owned.callback)
-    } catch (err) {
-      owned.release()
-      throw err
-    } finally {
-      this[kPublicEventToken] = previous
-    }
-
-    return callback[kPromise]
+    return this[kPublicOperation](() => super.batch(operations, options))
   }
 
   _iterator (options) {
     options = snapshotIteratorOptions(options)
-    const iterator = new Iterator(this, this[kContext], options ?? kEmpty)
-    return wrapNoFieldsIterator(iterator, hasNoFields(options))
+    return new Iterator(this, this[kContext], options ?? kEmpty)
   }
 
   get identity () {
@@ -1587,81 +1467,132 @@ function snapshotIteratorOptions (options) {
   })
 }
 
-function hasNoFields (options) {
-  if (options === null || options === undefined) return false
+function countErrorIdentity (err, target) {
+  if (err === target) return 1
+  if (!(err instanceof Error) || err.name !== 'CombinedError' ||
+      typeof err[Symbol.iterator] !== 'function') return 0
 
-  const keys = Object.getOwnPropertyDescriptor(options, 'keys')
-  const values = Object.getOwnPropertyDescriptor(options, 'values')
-  return keys?.enumerable === true && values?.enumerable === true &&
-    options.keys === false && options.values === false
+  let count = 0
+  for (const nested of err) count += countErrorIdentity(nested, target)
+  return count
 }
 
-function wrapNoFieldsIterator (iterator, noFields) {
-  if (!noFields || noFieldsIterators.has(iterator)) return iterator
+function dedupeCleanupError (err, cleanupFailure) {
+  if (cleanupFailure === null || !(err instanceof Error) || err.name !== 'CombinedError' ||
+      typeof err[Symbol.iterator] !== 'function') return err
 
-  const next = iterator.next
-  Object.defineProperty(iterator, 'next', {
+  const errors = [...err]
+  const duplicate = errors.findLastIndex(error => error === cleanupFailure.error)
+  if (duplicate === -1 || countErrorIdentity(err, cleanupFailure.error) < 2) return err
+
+  errors.splice(duplicate, 1)
+  return combineErrors(errors) ?? err
+}
+
+function wrapIteratorCleanupRetry (iterator) {
+  if (cleanupRetryIterators.has(iterator)) return iterator
+  cleanupRetryIterators.add(iterator)
+
+  const close = iterator.close
+  const all = iterator.all
+  let activeClose = null
+  let cleanupDebt = false
+  let cleanupFailure = null
+
+  Object.defineProperty(iterator, 'close', {
     configurable: true,
     writable: true,
-    value: function (callback) {
-      // AbstractIterator reserves undefined/undefined callback values as its
-      // end sentinel. nextv carries row boundaries explicitly, so route public
-      // promise iteration through it when both fields are disabled.
-      if (callback === undefined) {
-        return new Promise((resolve, reject) => {
-          this.nextv(1, noFieldsNextOptions, (err, entries) => {
-            if (err) reject(err)
-            else resolve(entries[0])
-          })
-        })
+    value: function () {
+      if (activeClose !== null) return activeClose.promise
+
+      const retry = cleanupDebt
+      const group = { promise: null }
+      activeClose = group
+      group.promise = (async () => {
+        try {
+          if (retry) {
+            // AbstractIterator permanently remembers a failed close. Retry its
+            // wrapper hook directly, without changing the private hook itself.
+            await iterator._close()
+            iterator.db.detachResource(iterator)
+          } else {
+            await close.call(iterator)
+          }
+          cleanupDebt = false
+        } catch (err) {
+          cleanupDebt = true
+          // Keep the actual wrapper-close rejection that abstract-level may
+          // combine with itself. User errors can also be iterable and named
+          // CombinedError, so shape alone is not sufficient provenance.
+          cleanupFailure = { error: err }
+          const cleanupErrors = closeContext.getStore()?.resourceCleanupErrors
+          if (cleanupErrors !== undefined) {
+            cleanupErrors.set(err, (cleanupErrors.get(err) ?? 0) + 1)
+          }
+          throw err
+        }
+      })()
+
+      const clear = () => {
+        if (activeClose === group) activeClose = null
       }
-
-      if (typeof callback !== 'function') return next.call(this, callback)
-
-      this.nextTick(callback, new TypeError(
-        'Callback-style next() is ambiguous when keys and values are disabled; ' +
-        'use promise-style next(), nextv() or all()'
-      ))
+      group.promise.then(clear, clear)
+      return group.promise
     }
   })
 
-  noFieldsIterators.add(iterator)
+  Object.defineProperty(iterator, Symbol.asyncIterator, {
+    configurable: true,
+    writable: true,
+    value: function () {
+      return iteratePublicIterator(this)
+    }
+  })
+
+  Object.defineProperty(iterator, 'all', {
+    configurable: true,
+    writable: true,
+    value: async function (options) {
+      const previousCleanupFailure = cleanupFailure
+      try {
+        return await all.call(this, options)
+      } catch (err) {
+        throw dedupeCleanupError(
+          err,
+          cleanupFailure !== previousCleanupFailure ? cleanupFailure : null
+        )
+      }
+    }
+  })
+
   return iterator
 }
 
 function wrapSublevel (db) {
-  const emit = db.emit
-  Object.defineProperty(db, 'emit', {
-    configurable: true,
-    writable: true,
-    value: function (event, ...args) {
-      return emitPublicEvent(this, event, () => emit.call(this, event, ...args))
-    }
-  })
-
-  wrapSublevelLifecycle(db)
-  wrapSublevelMutation(db, 'put', 'put', 3)
-  wrapSublevelMutation(db, 'del', 'del', 2)
-  wrapSublevelMutation(db, 'clear', 'clear', 1)
-  wrapSublevelMutation(db, 'batch', 'batch', 2)
+  for (const name of ['iterator', 'keys', 'values']) {
+    const create = db[name]
+    Object.defineProperty(db, name, {
+      configurable: true,
+      writable: true,
+      value: function (options) {
+        return wrapIteratorCleanupRetry(create.call(this, options))
+      }
+    })
+  }
 
   const getMany = db.getMany
   Object.defineProperty(db, 'getMany', {
     configurable: true,
     writable: true,
-    value: function (keys, options, callback) {
-      if (typeof options === 'function') {
-        callback = options
-        options = undefined
+    value: async function (keys, options) {
+      const deferPartialResults = deferredPartialResults.has(options)
+      try {
+        const values = await getMany.call(this, keys, options)
+        if (!deferPartialResults) restorePartialResults(values)
+        return values
+      } finally {
+        if (deferPartialResults) deferredPartialResults.delete(options)
       }
-      callback = fromCallback(callback, kPromise)
-
-      getMany.call(this, keys, options, (err, values) => {
-        if (!err) restorePartialResults(values)
-        callback(err, values)
-      })
-
-      return callback[kPromise]
     }
   })
 
@@ -1669,9 +1600,9 @@ function wrapSublevel (db) {
   Object.defineProperty(db, '_getMany', {
     configurable: true,
     writable: true,
-    value: function (keys, options, callback) {
+    value: function (keys, options) {
       if ((typeof options !== 'object' || options === null) && typeof options !== 'function') {
-        return getManyInternal.call(this, keys, options, callback)
+        return getManyInternal.call(this, keys, options)
       }
 
       const marked = new Proxy(options, {
@@ -1680,32 +1611,9 @@ function wrapSublevel (db) {
         }
       })
       deferredPartialResults.add(marked)
-      return getManyInternal.call(this, keys, marked, callback)
+      return getManyInternal.call(this, keys, marked)
     }
   })
-
-  const iterator = db.iterator
-  Object.defineProperty(db, 'iterator', {
-    configurable: true,
-    writable: true,
-    value: function (options) {
-      options = snapshotIteratorOptions(options)
-      const noFields = hasNoFields(options)
-      const result = iterator.call(this, options)
-      return protectPublicIterator(wrapNoFieldsIterator(result, noFields))
-    }
-  })
-
-  for (const method of ['keys', 'values']) {
-    const createIterator = db[method]
-    Object.defineProperty(db, method, {
-      configurable: true,
-      writable: true,
-      value: function (options) {
-        return protectPublicIterator(createIterator.call(this, options))
-      }
-    })
-  }
 
   const sublevel = db._sublevel
   Object.defineProperty(db, '_sublevel', {

@@ -27,7 +27,7 @@ function snapshotCount (db) {
   return Number(db.getProperty('rocksdb.num-snapshots'))
 }
 
-test('first public nextv() and all() use one asynchronous native worker', async function (t) {
+test('first public reads fuse only when options are omitted', async function (t) {
   const db = testCommon.factory()
   await db.open()
   await seed(db, 3)
@@ -72,6 +72,19 @@ test('first public nextv() and all() use one asynchronous native worker', async 
     for (const name of Object.keys(calls)) calls[name] = 0
   }
 
+  const checkSeparateWorkers = (label) => {
+    t.same(resourceTypes, ['leveldown.iterator_init', 'iterator.nextv'],
+      `${label} exposes separate initialization and read resources`)
+    t.same(calls, {
+      iterator_init: 1,
+      iterator_init_nextv: 0,
+      iterator_nextv: 1,
+      iterator_nextv_sync: 0
+    }, `${label} preserves explicit option access after initialization`)
+    resourceTypes.length = 0
+    for (const name of Object.keys(calls)) calls[name] = 0
+  }
+
   let iterator
   try {
     iterator = db.iterator()
@@ -80,6 +93,14 @@ test('first public nextv() and all() use one asynchronous native worker', async 
       'nextv() returns its first row')
     hook.disable()
     checkOneWorker('nextv()')
+    await iterator.close()
+
+    iterator = db.iterator()
+    hook.enable()
+    t.same(await iterator.nextv(1, {}), [['key00000', 'value0']],
+      'nextv({}) returns its first row')
+    hook.disable()
+    checkSeparateWorkers('nextv({})')
     await iterator.close()
 
     iterator = db.iterator({ keys: false, values: false })
@@ -106,6 +127,15 @@ test('first public nextv() and all() use one asynchronous native worker', async 
     checkOneWorker('all()')
     t.equal(iterator.count, 1, 'all() accounts for its returned row')
     t.equal(snapshotCount(db), 0, 'all() auto-close releases its snapshot')
+
+    iterator = db.iterator({ limit: 1 })
+    hook.enable()
+    t.same(await iterator.all({}), [['key00000', 'value0']],
+      'bounded all({}) preserves its public limit')
+    hook.disable()
+    checkSeparateWorkers('all({})')
+    t.equal(iterator.count, 1, 'all({}) accounts for its returned row')
+    t.equal(snapshotCount(db), 0, 'all({}) auto-close releases its snapshot')
   } finally {
     hook.disable()
     for (const [name, original] of Object.entries(originals)) binding[name] = original
@@ -116,67 +146,85 @@ test('first public nextv() and all() use one asynchronous native worker', async 
   t.end()
 })
 
-for (const operation of ['nextv', 'all']) {
-  test(`explicit ${operation} options retain lazy initialization error ordering`, async function (t) {
-    const db = testCommon.factory()
-    await db.open()
+test('explicit empty read options retain inherited and later properties', async function (t) {
+  const db = testCommon.factory()
+  await db.open()
+  await seed(db, 2)
 
-    const iterator = db.iterator({ keyFilter: '[' })
-    const originalInit = binding.iterator_init
-    const originalInitNextv = binding.iterator_init_nextv
-    const optionError = new Error('timeout getter must not run before initialization')
-    let initCalls = 0
-    let initNextvCalls = 0
-    let timeoutReads = 0
-    const options = {
-      get timeout () {
-        timeoutReads++
-        throw optionError
-      }
+  const inheritedIterator = db.iterator({ limit: 1 })
+  const mutatedIterator = db.iterator({ limit: 1 })
+  let inheritedReads = 0
+  const inheritedOptions = Object.create({
+    get timeout () {
+      inheritedReads++
+      return 0
     }
-
-    binding.iterator_init = function (...args) {
-      initCalls++
-      return originalInit(...args)
-    }
-    binding.iterator_init_nextv = function (...args) {
-      initNextvCalls++
-      return originalInitNextv(...args)
-    }
-
-    try {
-      const promise = operation === 'nextv'
-        ? iterator.nextv(1, options)
-        : iterator.all(options)
-      const err = await rejection(promise)
-      t.match(err && err.message, /Invalid key filter regex/,
-        'the initialization error wins over a read-options getter')
-      t.notEqual(err, optionError, 'the read-options error is not observed first')
-      t.equal(timeoutReads, 0, 'read options are not inspected after failed initialization')
-      t.equal(initCalls, operation === 'nextv' ? 1 : 0,
-        'initialization uses the expected worker path')
-      t.equal(initNextvCalls, operation === 'all' ? 1 : 0,
-        'only all() receives AbstractIterator safe internal options')
-      t.equal(snapshotCount(db), 0, 'failed initialization releases its snapshot')
-    } finally {
-      binding.iterator_init = originalInit
-      binding.iterator_init_nextv = originalInitNextv
-      await iterator.close()
-      await db.close()
-    }
-
-    t.end()
   })
-}
+  const mutatedOptions = {}
+  const mutationError = new Error('later timeout getter failed')
+  let mutationReads = 0
 
-test('forwarded explicit all options retain lazy initialization error ordering', async function (t) {
+  try {
+    t.same(await inheritedIterator.nextv(1, inheritedOptions), [['key00000', 'value0']],
+      'nextv({}) forwards an inherited read option')
+    t.equal(inheritedReads, 1, 'the inherited timeout getter is read once')
+
+    const reading = mutatedIterator.all(mutatedOptions)
+    Object.defineProperty(mutatedOptions, 'timeout', {
+      get () {
+        mutationReads++
+        throw mutationError
+      }
+    })
+    t.equal(await rejection(reading), mutationError,
+      'all({}) observes a property added while lazy initialization is pending')
+    t.equal(mutationReads, 1, 'the later timeout getter is read once')
+  } finally {
+    await inheritedIterator.close()
+    await mutatedIterator.close()
+    await db.close()
+  }
+
+  t.end()
+})
+
+test('explicit nextv options retain lazy initialization error ordering', async function (t) {
+  const db = testCommon.factory()
+  await db.open()
+
+  const iterator = db.iterator({ keyFilter: '[' })
+  const optionError = new Error('timeout getter must not run before initialization')
+  let timeoutReads = 0
+  const options = {
+    get timeout () {
+      timeoutReads++
+      throw optionError
+    }
+  }
+
+  try {
+    const err = await rejection(iterator.nextv(1, options))
+    t.match(err && err.message, /Invalid key filter regex/,
+      'the initialization error wins over a read-options getter')
+    t.notEqual(err, optionError, 'the read-options error is not observed first')
+    t.equal(timeoutReads, 0, 'read options are not inspected after failed initialization')
+    t.equal(snapshotCount(db), 0, 'failed initialization releases its snapshot')
+  } finally {
+    await iterator.close()
+    await db.close()
+  }
+
+  t.end()
+})
+
+test('explicit all options retain lazy initialization error ordering', async function (t) {
   const db = testCommon.factory()
   await db.open()
 
   const iterator = db.iterator({ keyFilter: '[' })
   const originalInit = binding.iterator_init
   const originalInitNextv = binding.iterator_init_nextv
-  const optionError = new Error('forwarded timeout getter must run after initialization')
+  const optionError = new Error('timeout getter must not run before initialization')
   let initCalls = 0
   let initNextvCalls = 0
   let timeoutReads = 0
@@ -187,11 +235,6 @@ test('forwarded explicit all options retain lazy initialization error ordering',
     }
   }
 
-  // Simulate a future AbstractIterator that forwards all() options to _nextv()
-  // instead of substituting its private empty options object.
-  iterator._all = function (options, callback) {
-    this._nextv(1, options, callback)
-  }
   binding.iterator_init = function (...args) {
     initCalls++
     return originalInit(...args)
@@ -204,11 +247,11 @@ test('forwarded explicit all options retain lazy initialization error ordering',
   try {
     const err = await rejection(iterator.all(options))
     t.match(err && err.message, /Invalid key filter regex/,
-      'the initialization error wins over the forwarded options getter')
-    t.notEqual(err, optionError, 'the forwarded getter error is not observed first')
-    t.equal(timeoutReads, 0, 'forwarded options are not inspected after failed initialization')
-    t.equal(initCalls, 1, 'forwarded caller options retain the separate initialization worker')
-    t.equal(initNextvCalls, 0, 'forwarded caller options do not use the combined read worker')
+      'the initialization error wins over a read-options getter')
+    t.notEqual(err, optionError, 'the read-options error is not observed first')
+    t.equal(timeoutReads, 0, 'read options are not inspected after failed initialization')
+    t.equal(initCalls, 1, 'explicit options use the separate initialization worker')
+    t.equal(initNextvCalls, 0, 'explicit options do not use the combined read worker')
     t.equal(snapshotCount(db), 0, 'failed initialization releases its snapshot')
   } finally {
     binding.iterator_init = originalInit

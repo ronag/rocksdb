@@ -7,9 +7,11 @@ let db
 
 test('highWaterMarkBytes setup', async function (t) {
   db = testCommon.factory()
+  await db.open()
 
   // Write 8 bytes
-  return db.batch().put('a', '0').put('b', '1').put('c', '2').put('d', '3').write()
+  await db.batch().put('a', '0').put('b', '1').put('c', '2').put('d', '3').write()
+  t.end()
 })
 
 test('highWaterMarkBytes limits byte length of nextv() entries', async function (t) {

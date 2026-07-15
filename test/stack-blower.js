@@ -13,7 +13,7 @@ if (process.argv[2] === 'run') {
   const db = testCommon.factory()
   let depth = 0
 
-  db.open(function () {
+  db.open().then(function () {
     function recurse () {
       db.iterator({ gte: '0' })
       depth++
@@ -25,5 +25,7 @@ if (process.argv[2] === 'run') {
     } catch (e) {
       process.send('Catchable error at depth ' + depth)
     }
+  }, function (err) {
+    throw err
   })
 }

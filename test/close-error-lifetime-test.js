@@ -37,22 +37,16 @@ test('terminal native close errors leave public and native state closed', async 
   }
 
   try {
-    let synchronous = true
-    const callbackClose = new Promise((resolve) => {
-      db.close((err) => {
-        t.notOk(synchronous, 'callback remains asynchronous')
-        resolve(err)
-      })
-    })
-    const promiseClose = rejection(db.close())
-    synchronous = false
+    const firstClose = rejection(db.close())
+    const peerClose = rejection(db.close())
+    const [firstError, peerError] = await Promise.all([firstClose, peerClose])
 
-    const [callbackError, promiseError] = await Promise.all([callbackClose, promiseClose])
-    for (const [kind, err] of [['callback', callbackError], ['promise', promiseError]]) {
+    for (const [kind, err] of [['first', firstError], ['peer', peerError]]) {
       t.equal(err && err.code, 'LEVEL_DATABASE_NOT_CLOSED', `${kind} close preserves the public error code`)
       t.equal(err && err.cause, injected, `${kind} close preserves the native error as its cause`)
     }
 
+    t.equal(peerError, firstError, 'concurrent closes receive the same error')
     t.equal(nativeCloseCalls, 1, 'concurrent closes share one native teardown')
     t.equal(db.status, 'closed', 'AbstractLevel publishes the terminal native state')
 
@@ -77,6 +71,347 @@ test('terminal native close errors leave public and native state closed', async 
   t.end()
 })
 
+test('open-event close reconciles terminal state and reentrant peers', async function (t) {
+  const db = new RocksLevel(temporaryDirectory())
+  const contextSymbol = Object.getOwnPropertySymbols(db)
+    .find(symbol => symbol.description === 'context')
+  const originalClose = binding.db_close
+  const injected = new Error('synthetic open-event terminal close failure')
+  let nativeCloseCalls = 0
+  let closingPeer
+  let openEventClose
+
+  binding.db_close = (context, callback) => {
+    nativeCloseCalls++
+    originalClose(context, (err) => callback(err || injected))
+  }
+  db.once('closing', () => {
+    closingPeer = rejection(db.close())
+  })
+  db.once('open', () => {
+    openEventClose = rejection(db.close())
+  })
+
+  try {
+    await db.open()
+    const firstError = await openEventClose
+    const peerError = await closingPeer
+
+    t.equal(firstError && firstError.code, 'LEVEL_DATABASE_NOT_CLOSED',
+      'the open-event close preserves the public terminal code')
+    t.equal(firstError && firstError.cause, injected,
+      'the open-event close preserves the native cause')
+    t.equal(peerError, firstError, 'a closing-event peer shares the exact terminal error')
+    t.equal(nativeCloseCalls, 1, 'reentrant peers share one native teardown')
+    t.equal(db.status, 'closed', 'AbstractLevel publishes the terminal closed state')
+    t.equal(binding.db_is_closed(db[contextSymbol]), true, 'the native reference is closed')
+  } finally {
+    binding.db_close = originalClose
+  }
+
+  await db.close()
+  t.end()
+})
+
+test('open-event close-open-close requests retain ordering', async function (t) {
+  const db = new RocksLevel(temporaryDirectory())
+  const originalClose = binding.db_close
+  let nativeCloseCalls = 0
+  let transitions
+
+  binding.db_close = function (...args) {
+    nativeCloseCalls++
+    return originalClose(...args)
+  }
+  db.once('open', () => {
+    transitions = Promise.all([
+      db.close(),
+      db.open({ createIfMissing: false }),
+      db.close()
+    ])
+  })
+
+  try {
+    await db.open()
+    await transitions
+    t.equal(nativeCloseCalls, 2, 'each ordered close owns one native teardown')
+    t.equal(db.status, 'closed', 'the final close request wins')
+  } finally {
+    binding.db_close = originalClose
+  }
+
+  await db.close()
+  t.end()
+})
+
+test('closing-event peers settle before a queued reopen', async function (t) {
+  const db = await RocksLevel.open(temporaryDirectory())
+  let peerStatus
+
+  db.once('closing', () => {
+    peerStatus = db.close().then(() => db.status)
+  })
+
+  const firstStatus = db.close().then(() => db.status)
+  const reopenStatus = db.open({ createIfMissing: false }).then(() => db.status)
+
+  t.equal(await firstStatus, 'closed', 'the initiating close settles in its own transition')
+  t.equal(await peerStatus, 'closed', 'the reentrant peer settles before the next transition')
+  t.equal(await reopenStatus, 'open', 'the queued reopen lands afterwards')
+
+  await db.close()
+  t.end()
+})
+
+test('postopen close still reaches the v3 status lock without deadlock', async function (t) {
+  t.timeoutAfter(5000)
+  const db = new RocksLevel(temporaryDirectory())
+  let closeError
+
+  db.hooks.postopen.add(async () => {
+    closeError = await rejection(db.close())
+  })
+
+  await db.open()
+  t.equal(closeError && closeError.code, 'LEVEL_STATUS_LOCKED',
+    'postopen close rejects from abstract-level instead of waiting on its own open')
+  t.equal(db.status, 'open', 'the rejected reentrant close leaves the database open')
+  await db.close()
+  t.end()
+})
+
+test('closing an imported handle before its first open releases the reservation', async function (t) {
+  const location = temporaryDirectory()
+  const source = await RocksLevel.open(location)
+  await source.put('key', 'value')
+  const imported = new RocksLevel(source.handle)
+  const contextSymbol = Object.getOwnPropertySymbols(imported)
+    .find(symbol => symbol.description === 'context')
+  const originalClose = binding.db_close
+  let nativeCloseCalls = 0
+
+  binding.db_close = function (...args) {
+    nativeCloseCalls++
+    return originalClose(...args)
+  }
+
+  try {
+    const firstClose = imported.close()
+    const peerClose = imported.close()
+    t.equal(peerClose, firstClose, 'concurrent initial closes share one public group')
+    await firstClose
+
+    t.equal(nativeCloseCalls, 1, 'the imported reservation is released once')
+    t.equal(imported.status, 'closed', 'the never-opened wrapper lands closed')
+    t.equal(binding.db_is_closed(imported[contextSymbol]), true,
+      'the imported native reference becomes inactive')
+    t.equal(await source.get('key'), 'value', 'the source lease remains usable')
+  } finally {
+    binding.db_close = originalClose
+  }
+
+  await imported.open({ createIfMissing: false })
+  t.equal(await imported.get('key'), 'value', 'the disposed wrapper can be reopened')
+  await imported.close()
+  await source.close()
+
+  const reopened = await RocksLevel.open(location, { createIfMissing: false })
+  t.equal(await reopened.get('key'), 'value', 'the initial reservation retained no directory lock')
+  await reopened.close()
+  t.end()
+})
+
+test('a closed-listener failure still releases an unadmitted imported reservation', async function (t) {
+  const location = temporaryDirectory()
+  const source = await RocksLevel.open(location)
+  await source.put('key', 'value')
+  const imported = new RocksLevel(source.handle)
+  const contextSymbol = Object.getOwnPropertySymbols(imported)
+    .find(symbol => symbol.description === 'context')
+  const closedError = new Error('synthetic imported closed listener failure')
+
+  imported.once('closed', () => {
+    throw closedError
+  })
+
+  const err = await rejection(imported.close())
+  t.equal(err, closedError, 'close preserves the closed-listener error identity')
+  t.equal(imported.status, 'closed', 'the never-opened wrapper still lands closed')
+  t.equal(binding.db_is_closed(imported[contextSymbol]), true,
+    'the same close releases the native reservation')
+  t.equal(await source.get('key'), 'value', 'the source lease remains usable')
+
+  await imported.close()
+  await source.close()
+
+  const reopened = await RocksLevel.open(location, { createIfMissing: false })
+  t.equal(await reopened.get('key'), 'value', 'the listener failure retained no directory lock')
+  await reopened.close()
+  t.end()
+})
+
+test('a closing-listener failure leaves an imported reservation recoverable', async function (t) {
+  const location = temporaryDirectory()
+  const source = await RocksLevel.open(location)
+  await source.put('key', 'value')
+  const imported = new RocksLevel(source.handle)
+  const contextSymbol = Object.getOwnPropertySymbols(imported)
+    .find(symbol => symbol.description === 'context')
+  const closingError = new Error('synthetic imported closing listener failure')
+
+  imported.once('closing', () => {
+    throw closingError
+  })
+
+  const err = await rejection(imported.close())
+  t.equal(err && err.code, 'LEVEL_DATABASE_NOT_CLOSED',
+    'the failed close retains its public error code')
+  t.equal(err && err.cause, closingError, 'the listener remains the close cause')
+  t.equal(imported.status, 'open', 'abstract-level retains a retryable public state')
+  t.equal(binding.db_is_closed(imported[contextSymbol]), false,
+    'the native reservation remains owned')
+
+  const opening = imported.open({ createIfMissing: false })
+  const closing = imported.close()
+  await Promise.all([opening, closing])
+  t.equal(imported.status, 'closed', 'a later public close wins over open reconciliation')
+
+  await imported.open({ createIfMissing: false })
+  t.equal(imported.status, 'open', 'the closed wrapper remains reopenable')
+  t.equal(await imported.get('key'), 'value', 'the recovered imported wrapper is usable')
+
+  await imported.close()
+  await source.close()
+  const reopened = await RocksLevel.open(location, { createIfMissing: false })
+  t.equal(await reopened.get('key'), 'value', 'recovery retained no directory lock')
+  await reopened.close()
+  t.end()
+})
+
+test('an imported opening-listener failure releases its unadmitted reservation', async function (t) {
+  const location = temporaryDirectory()
+  const source = await RocksLevel.open(location)
+  const imported = new RocksLevel(source.handle)
+  const contextSymbol = Object.getOwnPropertySymbols(imported)
+    .find(symbol => symbol.description === 'context')
+  const openingError = new Error('synthetic imported opening listener failure')
+
+  imported.once('opening', () => {
+    throw openingError
+  })
+
+  const err = await rejection(imported.open())
+  t.equal(err && err.code, 'LEVEL_DATABASE_NOT_OPEN', 'open retains the v3 public error code')
+  t.equal(err && err.cause, openingError, 'open retains the listener error identity')
+  t.equal(imported.status, 'closed', 'the failed imported wrapper lands closed')
+  t.equal(binding.db_is_closed(imported[contextSymbol]), true,
+    'pre-admission failure releases the native reservation')
+
+  await source.close()
+  const reopened = await RocksLevel.open(location, { createIfMissing: false })
+  t.pass('the failed imported wrapper retained no directory lock')
+  await reopened.close()
+  t.end()
+})
+
+test('an imported open-listener failure retains its admitted native lease', async function (t) {
+  const location = temporaryDirectory()
+  const source = await RocksLevel.open(location)
+  await source.put('key', 'value')
+  const imported = new RocksLevel(source.handle)
+  const contextSymbol = Object.getOwnPropertySymbols(imported)
+    .find(symbol => symbol.description === 'context')
+  const openError = new Error('synthetic imported open listener failure')
+
+  imported.once('open', () => {
+    throw openError
+  })
+
+  const err = await rejection(imported.open())
+  t.equal(err, openError, 'open preserves the listener error identity')
+  t.equal(imported.status, 'open', 'the admitted imported wrapper remains open')
+  t.equal(binding.db_is_closed(imported[contextSymbol]), false,
+    'the admitted native lease remains active')
+  t.equal(await imported.get('key'), 'value', 'the admitted wrapper remains usable')
+
+  await imported.close()
+  await source.close()
+
+  const reopened = await RocksLevel.open(location, { createIfMissing: false })
+  t.equal(await reopened.get('key'), 'value', 'normal cleanup releases the final directory lock')
+  await reopened.close()
+  t.end()
+})
+
+test('an imported open-event close preserves v3 settlement timing', async function (t) {
+  const location = temporaryDirectory()
+  const source = await RocksLevel.open(location)
+  const imported = new RocksLevel(source.handle)
+  let closing
+
+  imported.once('open', () => {
+    closing = imported.close()
+  })
+
+  const openStatus = await imported.open().then(() => imported.status)
+  t.equal(openStatus, 'open', 'the opening promise observes the open transition')
+  await closing
+  t.equal(imported.status, 'closed', 'the event-triggered close lands afterwards')
+
+  await source.close()
+  const reopened = await RocksLevel.open(location, { createIfMissing: false })
+  t.pass('the imported event transition retained no directory lock')
+  await reopened.close()
+  t.end()
+})
+
+test('failed initial-reservation cleanup remains retryable', async function (t) {
+  const location = temporaryDirectory()
+  const source = await RocksLevel.open(location)
+  const imported = new RocksLevel(source.handle)
+  const contextSymbol = Object.getOwnPropertySymbols(imported)
+    .find(symbol => symbol.description === 'context')
+  const originalClose = binding.db_close
+  const openingError = new Error('synthetic opening failure before reservation cleanup')
+  const cleanupError = new Error('synthetic reservation cleanup failure')
+  let cleanupCalls = 0
+
+  imported.once('opening', () => {
+    throw openingError
+  })
+  binding.db_close = (context, callback) => {
+    cleanupCalls++
+    process.nextTick(callback, cleanupError)
+  }
+
+  try {
+    const err = await rejection(imported.open())
+    t.equal(err && err.code, 'LEVEL_DATABASE_NOT_OPEN', 'open retains its public error code')
+    t.ok(err && err.cause instanceof AggregateError,
+      'open combines the operation and exhausted reservation cleanup')
+    t.equal(err && err.cause && err.cause.cause, openingError,
+      'the opening listener remains the aggregate cause')
+    t.same(err && err.cause && err.cause.errors,
+      [openingError, cleanupError, cleanupError, cleanupError],
+      'cleanup errors retain identity and bounded occurrence order')
+    t.equal(cleanupCalls, 3, 'initial reservation cleanup uses bounded retries')
+    t.equal(binding.db_is_closed(imported[contextSymbol]), false,
+      'the failed cleanup retains its native reservation')
+  } finally {
+    binding.db_close = originalClose
+  }
+
+  await imported.close()
+  t.equal(binding.db_is_closed(imported[contextSymbol]), true,
+    'a later public close retries and releases the reservation')
+  await source.close()
+
+  const reopened = await RocksLevel.open(location, { createIfMissing: false })
+  t.pass('reservation cleanup debt retained no directory lock')
+  await reopened.close()
+  t.end()
+})
+
 test('pre-teardown close errors retain an open and retryable database', async function (t) {
   const location = temporaryDirectory()
   const db = await RocksLevel.open(location)
@@ -94,26 +429,14 @@ test('pre-teardown close errors retain an open and retryable database', async fu
   }
 
   try {
-    const callbackThrown = new Error('synthetic close callback failure')
-    const uncaught = new Promise((resolve) => process.once('uncaughtException', resolve))
-    const callbackClose = new Promise((resolve) => {
-      db.close((err) => {
-        resolve(err)
-        throw callbackThrown
-      })
-    })
-    const promiseClose = rejection(db.close())
+    const firstClose = rejection(db.close())
+    const peerClose = rejection(db.close())
+    const [firstError, peerError] = await Promise.all([firstClose, peerClose])
 
-    const [callbackError, promiseError, uncaughtError] = await Promise.all([
-      callbackClose,
-      promiseClose,
-      uncaught
-    ])
-    t.equal(callbackError && callbackError.code, 'LEVEL_DATABASE_NOT_CLOSED',
-      'callback close keeps the established error code')
-    t.equal(callbackError && callbackError.cause, injected, 'callback close retains the worker failure')
-    t.equal(promiseError, callbackError, 'concurrent close callers receive the same error')
-    t.equal(uncaughtError, callbackThrown, 'a throwing callback is rethrown after fanout')
+    t.equal(firstError && firstError.code, 'LEVEL_DATABASE_NOT_CLOSED',
+      'close keeps the established error code')
+    t.equal(firstError && firstError.cause, injected, 'close retains the worker failure')
+    t.equal(peerError, firstError, 'concurrent close callers receive the same error')
     t.equal(nativeCloseCalls, 1, 'concurrent retryable closes share one native attempt')
     t.equal(db.status, 'open', 'AbstractLevel returns to open')
     t.equal(await db.get('key'), 'value', 'the native reference remains usable')
@@ -139,12 +462,13 @@ test('deferred public close bridges scheduling throws and settles once', async f
   const originalClose = binding.db_close
   const dispatchError = new Error('synthetic close dispatch throw after callback')
   let readCallback
-  let closeCallbackCalls = 0
+  let nativeCloseCalls = 0
 
   binding.db_get_many = (context, keys, options, callback) => {
     readCallback = callback
   }
   binding.db_close = (context, callback) => {
+    nativeCloseCalls++
     callback(null)
     throw dispatchError
   }
@@ -153,26 +477,21 @@ test('deferred public close bridges scheduling throws and settles once', async f
     const read = db.get('key')
     t.equal(typeof readCallback, 'function', 'the public read owns a native reference')
 
-    const callbackClose = new Promise((resolve) => {
-      db.close((err) => {
-        closeCallbackCalls++
-        resolve(err)
-      })
-    })
-    const promiseClose = rejection(db.close())
+    const firstClose = rejection(db.close())
+    const peerClose = rejection(db.close())
 
     readCallback(null, [Buffer.from('value')])
-    const [value, callbackError, promiseError] = await Promise.all([
+    const [value, firstError, peerError] = await Promise.all([
       read,
-      callbackClose,
-      promiseClose
+      firstClose,
+      peerClose
     ])
     await new Promise(setImmediate)
 
     t.deepEqual(value, Buffer.from('value'), 'the operation drains before close dispatch')
-    t.equal(callbackError, undefined, 'the first native completion wins')
-    t.equal(promiseError, null, 'the Promise peer settles successfully')
-    t.equal(closeCallbackCalls, 1, 'the callback settles at most once')
+    t.equal(firstError, null, 'the first native completion wins')
+    t.equal(peerError, null, 'the Promise peer settles successfully')
+    t.equal(nativeCloseCalls, 1, 'concurrent closes share one native dispatch')
     t.equal(db.status, 'closed', 'the deferred public close lands')
   } finally {
     binding.db_get_many = originalGetMany
@@ -222,7 +541,7 @@ test('close groups preserve close-open-close transition ordering', async functio
   const [firstError, openError, lastError] = await Promise.all([firstClose, reopen, lastClose])
 
   t.equal(firstError, null, 'the first physical close lands')
-  t.equal(openError && openError.code, 'LEVEL_DATABASE_NOT_OPEN', 'the superseded reopen rejects')
+  t.equal(openError, null, 'the middle reopen lands before the final close')
   t.equal(lastError, null, 'the final close request wins')
   t.equal(db.status, 'closed', 'the final public state follows request order')
   t.end()
@@ -247,8 +566,7 @@ test('open option reentry retains its original ordering epoch', async function (
 
   const [openError, closeError] = await Promise.all([opening, accessorClose])
   t.equal(openError, null, 'the accessor-triggered transition still lands the open')
-  t.equal(closeError && closeError.code, 'LEVEL_DATABASE_NOT_CLOSED',
-    'the queued open supersedes the accessor close')
+  t.equal(closeError, null, 'the accessor-triggered close lands before the queued open')
   t.equal(optionReads, 1, 'AbstractLevel materializes the accessor once')
   t.equal(db[openEpoch], initialEpoch + 1,
     'the internal continuation does not create a second public ordering epoch')
@@ -385,7 +703,7 @@ test('failed imported opens preserve cleanup errors and expose retryable cleanup
   t.end()
 })
 
-test('a public open cancels later cleanup-debt retries after native admission', async function (t) {
+test('a public open waits for cleanup-debt retries before native admission', async function (t) {
   const location = temporaryDirectory()
   const source = await RocksLevel.open(location)
   await source.put('key', 'value')
@@ -429,7 +747,7 @@ test('a public open cancels later cleanup-debt retries after native admission', 
     await new Promise(setImmediate)
 
     t.equal(reopenCalls, 0, 'native open waits for the admitted cleanup close')
-    t.equal(closeCalls, 4, 'open cancels cleanup retries that were not admitted')
+    t.equal(closeCalls, 4, 'the admitted cleanup attempt is in flight')
     heldClose(cleanupErrors[3])
 
     const [closeError] = await Promise.all([closing, opening, peerOpening])
@@ -439,7 +757,7 @@ test('a public open cancels later cleanup-debt retries after native admission', 
     t.equal(closeError && closeError.cause, cleanupErrors[3],
       'the overlapping close preserves its native cause')
     t.equal(reopenCalls, 1, 'concurrent public opens share one native admission')
-    t.equal(closeCalls, 4, 'open admission cancels the fifth stale cleanup attempt')
+    t.equal(closeCalls, 5, 'cleanup retries finish before native open admission')
     t.equal(imported.status, 'open', 'the admitted open remains landed')
     t.equal(await imported.get('key'), 'value', 'the reopened imported handle is usable')
   } finally {
@@ -495,7 +813,6 @@ test('cleanup-debt open waits through synchronous close completion faults', asyn
     for (const entry of cases) {
       db[cleanupDebt] = {}
       openCalls = 0
-      let closeCallbacks = 0
       let nativeCloseCalls = 0
 
       binding.db_close = (context, callback) => {
@@ -503,23 +820,19 @@ test('cleanup-debt open waits through synchronous close completion faults', asyn
         entry.dispatch(callback)
       }
 
-      const closing = new Promise(resolve => {
-        db.close(err => {
-          closeCallbacks++
-          resolve(err)
-        })
-      })
+      const closing = rejection(db.close())
+      const peerClosing = rejection(db.close())
       const opening = db.open({ createIfMissing: false })
 
       t.equal(openCalls, 0, `${entry.name}: native open waits for close settlement`)
-      const [closeError] = await Promise.all([closing, opening])
+      const [closeError, peerCloseError] = await Promise.all([closing, peerClosing, opening])
       await new Promise(setImmediate)
 
       t.equal(closeError && closeError.code, 'LEVEL_DATABASE_NOT_CLOSED',
         `${entry.name}: the admitted close reports its public error`)
       t.equal(closeError && closeError.cause, entry.expected,
         `${entry.name}: the first completion retains error identity`)
-      t.equal(closeCallbacks, 1, `${entry.name}: the public close callback settles once`)
+      t.equal(peerCloseError, closeError, `${entry.name}: concurrent closes share one error`)
       t.equal(nativeCloseCalls, 1, `${entry.name}: the admitted native close runs once`)
       t.equal(openCalls, 1, `${entry.name}: native open dispatches after close settlement`)
       t.equal(db.status, 'open', `${entry.name}: the later public open wins`)
@@ -573,7 +886,6 @@ test('cleanup-debt reopen contains deferred native open dispatch faults', async 
       let heldCleanupClose
       let nativeCloseCalls = 0
       let nativeOpenCalls = 0
-      let openCallbackCalls = 0
 
       db[cleanupDebt] = {}
       binding.db_close = (context, callback) => {
@@ -587,12 +899,7 @@ test('cleanup-debt reopen contains deferred native open dispatch faults', async 
       }
 
       const closing = rejection(db.close())
-      const opening = new Promise(resolve => {
-        db.open({ createIfMissing: false }, err => {
-          openCallbackCalls++
-          resolve(err)
-        })
-      })
+      const opening = rejection(db.open({ createIfMissing: false }))
       await new Promise(setImmediate)
 
       t.equal(nativeOpenCalls, 0, `${entry.name}: deferred native open waits for cleanup`)
@@ -608,7 +915,6 @@ test('cleanup-debt reopen contains deferred native open dispatch faults', async 
         `${entry.name}: deferred dispatch failure retains its public error`)
       t.equal(openError && openError.cause, entry.expected,
         `${entry.name}: the first open completion retains error identity`)
-      t.equal(openCallbackCalls, 1, `${entry.name}: the public open callback settles once`)
       t.equal(nativeOpenCalls, 1, `${entry.name}: deferred native open dispatches once`)
       t.equal(nativeCloseCalls, 2, `${entry.name}: failed open cleanup runs once`)
       t.equal(db[cleanupDebt], null, `${entry.name}: failed open cleanup clears its debt`)

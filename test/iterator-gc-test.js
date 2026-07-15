@@ -19,45 +19,49 @@ test('db without ref does not get GCed while iterating', function (t) {
 
   let db = testCommon.factory()
 
-  db.open(function (err) {
-    t.ifError(err, 'no open error')
+  db.open().then(function () {
+    t.pass('no open error')
 
     // Insert test data
-    db.batch(sourceData.slice(), function (err) {
-      t.ifError(err, 'no batch error')
+    return db.batch(sourceData.slice())
+  }).then(function () {
+    t.pass('no batch error')
 
-      // Set highWaterMarkBytes to 0 so that we don't preemptively fetch.
-      const it = db.iterator({ highWaterMarkBytes: 0 })
+    // Set highWaterMarkBytes to 0 so that we don't preemptively fetch.
+    const it = db.iterator({ highWaterMarkBytes: 0 })
 
-      // Remove reference
-      db = null
+    // Remove reference
+    db = null
 
-      if (global.gc) {
-        // This is the reliable way to trigger GC (and the bug if it exists).
-        // Useful for manual testing with "node --expose-gc".
-        global.gc()
-        iterate(it)
-      } else {
-        // But a timeout usually also allows GC to kick in. If not, the time
-        // between iterator ticks might. That's when "highWaterMarkBytes: 0" helps.
-        setTimeout(iterate.bind(null, it), 1000)
-      }
-    })
+    if (global.gc) {
+      // This is the reliable way to trigger GC (and the bug if it exists).
+      // Useful for manual testing with "node --expose-gc".
+      global.gc()
+      iterate(it)
+    } else {
+      // But a timeout usually also allows GC to kick in. If not, the time
+      // between iterator ticks might. That's when "highWaterMarkBytes: 0" helps.
+      setTimeout(iterate.bind(null, it), 1000)
+    }
+  }, function (err) {
+    t.ifError(err, 'no setup error')
   })
 
   function iterate (it) {
     // No reference to db here, could be GCed. It shouldn't..
-    it.all(function (err, entries) {
-      t.ifError(err, 'no iterator error')
+    it.all().then(function (entries) {
+      t.pass('no iterator error')
       t.is(entries.length, sourceData.length, 'got data')
 
       // Because we also have a reference on the iterator. That's the fix.
       t.ok(it.db, 'abstract iterator has reference to db')
 
       // Which as luck would have it, also allows us to properly end this test.
-      it.db.close(function (err) {
-        t.ifError(err, 'no close error')
-      })
+      return it.db.close()
+    }).then(function () {
+      t.pass('no close error')
+    }, function (err) {
+      t.ifError(err, 'no iterator or close error')
     })
   }
 })

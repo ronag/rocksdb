@@ -2,6 +2,11 @@
 
 A low-level RocksDB binding for Node.js 26 and later.
 
+The standard database, iterator and chained-batch APIs defined by
+[`abstract-level`](https://github.com/Level/abstract-level) v3 are promise-only.
+Project-specific extension methods and the explicitly unsafe low-level methods
+documented below retain their existing signatures.
+
 ## Background parallelism
 
 `parallelism` controls RocksDB's LOW-priority background pool used for
@@ -41,6 +46,27 @@ This also applies when an underscore method is an implementation hook such as
 `_get()`, `_put()`, `_clear()`, `_batch()`, `_next()`, `_seek()`, `_write()` or
 `_close()`: public methods may establish temporary ownership before dispatching
 through the same hook, while direct calls deliberately do not.
+
+### Raw chained-batch clear
+
+The chained batch's unsafe `_clear()` implementation remains unchanged: it
+clears only the native RocksDB batch. Abstract-level v3 keeps the queued
+operations, write-event data and prewrite data used by public `put()` and
+`del()` private, so calling `_clear()` directly cannot reset that bookkeeping.
+It is valid only for batches managed exclusively through the unsafe raw API.
+
+After any public `put()` or `del()`, and for every batch that mixes public and
+raw operations, use public `clear()` instead. It clears both the native batch
+and abstract-level's private bookkeeping.
+
+## Deferred iterator `all()` options
+
+Abstract-level 3.1.1 does not forward per-read options from `all(options)` when
+the iterator was created while the database was still automatically opening.
+This affects root, key, value and sublevel iterators, and includes RocksDB-
+specific read options such as `timeout`. Await `open()` before creating an
+iterator that will call `all(options)`. Awaiting only before the later `all()`
+call is not sufficient. Deferred `nextv()` does forward its per-read options.
 
 ## Packed raw reads
 

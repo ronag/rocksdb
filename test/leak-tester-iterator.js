@@ -12,36 +12,33 @@ if (!global.gc) {
 function run () {
   const it = db.iterator()
 
-  it.next(function (err) {
-    if (err) throw err
+  it.next().then(function () {
+    return it.close()
+  }).then(function () {
+    if (!rssBase) {
+      rssBase = process.memoryUsage().rss
+    }
 
-    it.close(function (err) {
-      if (err) throw err
+    if (++count % 1000 === 0) {
+      if (global.gc) global.gc()
 
-      if (!rssBase) {
-        rssBase = process.memoryUsage().rss
-      }
+      const rss = process.memoryUsage().rss
+      const percent = Math.round((rss / rssBase) * 100)
+      const mb = Math.round(rss / 1024 / 1024)
 
-      if (++count % 1000 === 0) {
-        if (global.gc) global.gc()
+      console.log('count = %d, rss = %d% %dM', count, percent, mb)
+    }
 
-        const rss = process.memoryUsage().rss
-        const percent = Math.round((rss / rssBase) * 100)
-        const mb = Math.round(rss / 1024 / 1024)
-
-        console.log('count = %d, rss = %d% %dM', count, percent, mb)
-      }
-
-      run()
-    })
+    run()
+  }, function (err) {
+    throw err
   })
 }
 
-db.open(function (err) {
-  if (err) throw err
-
-  db.put('key', 'value', function (err) {
-    if (err) throw err
-    run()
-  })
+db.open().then(function () {
+  return db.put('key', 'value')
+}).then(function () {
+  run()
+}, function (err) {
+  throw err
 })

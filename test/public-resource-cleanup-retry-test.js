@@ -3,6 +3,7 @@
 const { spawnSync } = require('node:child_process')
 const path = require('node:path')
 const test = require('tape')
+const combineErrors = require('maybe-combine-errors')
 const binding = require('../binding')
 const { RocksLevel } = require('..')
 const testCommon = require('./common')
@@ -13,6 +14,7 @@ async function rejection (promise) {
   } catch (err) {
     return err
   }
+  return null
 }
 
 async function settlement (promise) {
@@ -23,19 +25,53 @@ async function settlement (promise) {
   }
 }
 
-function callbackResult (call) {
+function rawCallbackResult (call) {
   return new Promise((resolve) => call(resolve))
-}
-
-function callbackArguments (call) {
-  return new Promise((resolve) => call((...args) => resolve(args)))
 }
 
 function childMessage (result, message) {
   return [message, result.stdout, result.stderr].filter(Boolean).join('\n')
 }
 
-test('public iterator cleanup failures reject every waiter and retry once', async function (t) {
+async function verifyWrappedIteratorCleanupRetry (t, label, db, iterator) {
+  const originalClose = binding.iterator_close_sync
+  const cleanupError = new Error(`${label} cleanup failed`)
+  let closeCalls = 0
+
+  binding.iterator_close_sync = function () {
+    closeCalls++
+    throw cleanupError
+  }
+
+  try {
+    const firstError = rejection(iterator.close())
+    const peerError = rejection(iterator.close())
+
+    t.equal(await firstError, cleanupError, `${label} first close reports the cleanup error`)
+    t.equal(await peerError, cleanupError, `${label} peer close reports the same cleanup error`)
+    t.equal(closeCalls, 1, `${label} concurrent closes share one native attempt`)
+    t.equal(Number(db.getProperty('rocksdb.num-snapshots')), 1,
+      `${label} failed cleanup retains the native snapshot for retry`)
+
+    binding.iterator_close_sync = function (...args) {
+      closeCalls++
+      return originalClose(...args)
+    }
+
+    await Promise.all([iterator.close(), iterator.close()])
+    t.equal(closeCalls, 2, `${label} concurrent retries share one native cleanup`)
+    t.equal(Number(db.getProperty('rocksdb.num-snapshots')), 0,
+      `${label} successful retry releases the native snapshot`)
+
+    await iterator.close()
+    t.equal(closeCalls, 2, `${label} later close remains idempotent`)
+  } finally {
+    binding.iterator_close_sync = originalClose
+    await iterator.close()
+  }
+}
+
+test('public iterator cleanup failures reject every waiter and coalesce retries', async function (t) {
   const db = testCommon.factory()
   await db.open()
   const iterator = db.iterator()
@@ -49,11 +85,11 @@ test('public iterator cleanup failures reject every waiter and retry once', asyn
   }
 
   try {
-    const callbackError = callbackResult((complete) => iterator.close(complete))
-    const promiseError = rejection(iterator.close())
+    const firstError = rejection(iterator.close())
+    const peerError = rejection(iterator.close())
 
-    t.equal(await callbackError, cleanupError, 'callback close reports the cleanup error')
-    t.equal(await promiseError, cleanupError, 'promise close reports the same cleanup error')
+    t.equal(await firstError, cleanupError, 'first close reports the cleanup error')
+    t.equal(await peerError, cleanupError, 'peer close reports the same cleanup error')
     t.equal(closeCalls, 1, 'concurrent initial closes share one native attempt')
     t.equal(Number(db.getProperty('rocksdb.num-snapshots')), 1,
       'failed cleanup retains the native snapshot for retry')
@@ -65,10 +101,10 @@ test('public iterator cleanup failures reject every waiter and retry once', asyn
       throw retryError
     }
 
-    const callbackRetryError = callbackResult((complete) => iterator.close(complete))
-    const promiseRetryError = rejection(iterator.close())
-    t.equal(await callbackRetryError, retryError, 'callback retry reports the new cleanup error')
-    t.equal(await promiseRetryError, retryError, 'promise retry reports the new cleanup error')
+    const firstRetryError = rejection(iterator.close())
+    const peerRetryError = rejection(iterator.close())
+    t.equal(await firstRetryError, retryError, 'later retry reports its cleanup error')
+    t.equal(await peerRetryError, retryError, 'concurrent retry reports the same error')
     t.equal(retryCalls, 1, 'concurrent failed retries share one native cleanup')
     t.equal(Number(db.getProperty('rocksdb.num-snapshots')), 1,
       'failed retry continues to retain the native snapshot')
@@ -78,16 +114,7 @@ test('public iterator cleanup failures reject every waiter and retry once', asyn
       return originalClose(...args)
     }
 
-    let callbackCalls = 0
-    const callbackRetry = callbackResult((complete) => iterator.close((err) => {
-      callbackCalls++
-      complete(err)
-    }))
-    const promiseRetry = iterator.close()
-    t.equal(await callbackRetry, undefined, 'callback retry succeeds with no error argument')
-    await promiseRetry
-
-    t.equal(callbackCalls, 1, 'callback retry settles once')
+    await Promise.all([iterator.close(), iterator.close()])
     t.equal(retryCalls, 2, 'concurrent successful retries share one native cleanup')
     t.equal(Number(db.getProperty('rocksdb.num-snapshots')), 0,
       'successful retry releases the native snapshot')
@@ -103,6 +130,49 @@ test('public iterator cleanup failures reject every waiter and retry once', asyn
   t.end()
 })
 
+test('public key and value iterator wrappers retain cleanup failures for retry', async function (t) {
+  const db = testCommon.factory()
+  await db.open()
+
+  try {
+    await verifyWrappedIteratorCleanupRetry(t, 'keys()', db, db.keys())
+    await verifyWrappedIteratorCleanupRetry(t, 'values()', db, db.values())
+  } finally {
+    await db.close()
+  }
+
+  t.end()
+})
+
+test('deferred root iterator wrapper retains cleanup failures for retry', async function (t) {
+  const db = testCommon.factory()
+  const iterator = db.iterator()
+  await db.open()
+
+  try {
+    await verifyWrappedIteratorCleanupRetry(t, 'deferred iterator()', db, iterator)
+  } finally {
+    await db.close()
+  }
+
+  t.end()
+})
+
+test('sublevel iterator wrappers retain cleanup failures for retry', async function (t) {
+  const db = testCommon.factory()
+  await db.open()
+  const sublevel = db.sublevel('cleanup-retry')
+
+  try {
+    await verifyWrappedIteratorCleanupRetry(t, 'sublevel iterator()', db, sublevel.iterator())
+    await verifyWrappedIteratorCleanupRetry(t, 'sublevel keys()', db, sublevel.keys())
+    await verifyWrappedIteratorCleanupRetry(t, 'sublevel values()', db, sublevel.values())
+  } finally {
+    await db.close()
+  }
+
+  t.end()
+})
 test('database close remains a fallback for iterator cleanup debt', async function (t) {
   const db = testCommon.factory()
   await db.open()
@@ -129,7 +199,136 @@ test('database close remains a fallback for iterator cleanup debt', async functi
   t.end()
 })
 
-test('public chained batch cleanup failures reject and retry once', async function (t) {
+test('database close deduplicates one wrapped iterator cleanup failure', async function (t) {
+  const db = testCommon.factory()
+  await db.open()
+  const iterator = db.keys()
+  const originalClose = binding.iterator_close_sync
+  const cleanupError = new Error('database-owned wrapped iterator cleanup failed')
+  let closeCalls = 0
+
+  binding.iterator_close_sync = function () {
+    closeCalls++
+    throw cleanupError
+  }
+
+  try {
+    const err = await rejection(db.close())
+    t.equal(err && err.code, 'LEVEL_DATABASE_NOT_CLOSED',
+      'wrapped resource cleanup rejects database close')
+    t.equal(err && err.cause, cleanupError,
+      'the same inner and wrapper failure is reported once by identity')
+    t.equal(closeCalls, 1, 'the wrapper and inner iterator share one native cleanup')
+    t.equal(db.status, 'open', 'the database remains open for cleanup retry')
+  } finally {
+    binding.iterator_close_sync = originalClose
+  }
+
+  await db.close()
+  await iterator.close()
+  t.end()
+})
+
+test('database close deduplicates each wrapped cleanup occurrence', async function (t) {
+  const originalClose = binding.iterator_close_sync
+  const cases = [
+    {
+      name: 'distinct errors',
+      errors: [new Error('first wrapped cleanup failed'), new Error('second wrapped cleanup failed')]
+    },
+    {
+      name: 'shared error identity',
+      errors: (() => {
+        const error = new Error('two wrapped cleanups shared this failure')
+        return [error, error]
+      })()
+    }
+  ]
+
+  for (const entry of cases) {
+    const db = testCommon.factory()
+    await db.open()
+    const iterators = [db.keys(), db.values()]
+    let closeCalls = 0
+
+    binding.iterator_close_sync = function () {
+      throw entry.errors[closeCalls++]
+    }
+
+    try {
+      const err = await rejection(db.close())
+      t.equal(err && err.code, 'LEVEL_DATABASE_NOT_CLOSED',
+        `${entry.name}: wrapped cleanups reject database close`)
+      t.equal(err && err.cause && err.cause.name, 'CombinedError',
+        `${entry.name}: independent cleanup occurrences remain combined`)
+      t.deepEqual(err && err.cause && [...err.cause], entry.errors,
+        `${entry.name}: one duplicate per wrapper is removed without losing multiplicity`)
+      t.equal(closeCalls, 2, `${entry.name}: each native iterator is closed once`)
+    } finally {
+      binding.iterator_close_sync = originalClose
+    }
+
+    await db.close()
+    await Promise.all(iterators.map(iterator => iterator.close()))
+  }
+
+  binding.iterator_close_sync = originalClose
+  t.end()
+})
+
+test('database close retries resource cleanup failures before native teardown', async function (t) {
+  const db = testCommon.factory()
+  await db.open()
+  const iterator = db.iterator()
+  const batch = db.batch().put('key', 'value')
+  const originalIteratorClose = binding.iterator_close_sync
+  const originalBatchClear = binding.batch_clear
+  const iteratorError = new Error('database-owned iterator cleanup failed')
+  const batchError = new Error('database-owned batch cleanup failed')
+  let iteratorCalls = 0
+  let batchCalls = 0
+
+  binding.iterator_close_sync = function () {
+    iteratorCalls++
+    throw iteratorError
+  }
+  binding.batch_clear = function () {
+    batchCalls++
+    throw batchError
+  }
+
+  try {
+    const err = await rejection(db.close())
+    t.equal(err && err.code, 'LEVEL_DATABASE_NOT_CLOSED', 'resource cleanup rejects database close')
+    t.equal(db.status, 'open', 'database remains open for retry')
+    t.equal(iteratorCalls, 1, 'first close attempts iterator cleanup once')
+    t.equal(batchCalls, 1, 'first close attempts batch cleanup once')
+
+    binding.iterator_close_sync = function (...args) {
+      iteratorCalls++
+      return originalIteratorClose(...args)
+    }
+    binding.batch_clear = function (...args) {
+      batchCalls++
+      return originalBatchClear(...args)
+    }
+
+    await db.close()
+    t.equal(iteratorCalls, 2, 'retry closes the retained iterator')
+    t.equal(batchCalls, 2, 'retry closes the retained batch')
+    t.equal(db.status, 'closed', 'native database teardown follows successful cleanup')
+  } finally {
+    binding.iterator_close_sync = originalIteratorClose
+    binding.batch_clear = originalBatchClear
+    await iterator.close()
+    await batch.close()
+    await db.close()
+  }
+
+  t.end()
+})
+
+test('public chained batch cleanup failures reject every waiter and coalesce retries', async function (t) {
   const db = testCommon.factory()
   await db.open()
   const batch = db.batch().put('key', 'value')
@@ -143,30 +342,38 @@ test('public chained batch cleanup failures reject and retry once', async functi
   }
 
   try {
-    const callbackError = callbackResult((complete) => batch.close(complete))
-    const promiseError = rejection(batch.close())
+    const firstError = rejection(batch.close())
+    const peerError = rejection(batch.close())
 
-    t.equal(await callbackError, cleanupError, 'callback close reports the cleanup error')
-    t.equal(await promiseError, cleanupError, 'promise close reports the same cleanup error')
+    t.equal(await firstError, cleanupError, 'first close reports the cleanup error')
+    t.equal(await peerError, cleanupError, 'peer close reports the same cleanup error')
     t.equal(clearCalls, 1, 'concurrent initial closes share one cleanup attempt')
     t.equal(batch.toArray().length, 4, 'failed cleanup retains native batch fields for retry')
 
+    const retryError = new Error('batch cleanup retry failed')
     let retryCalls = 0
+    binding.batch_clear = function () {
+      retryCalls++
+      throw retryError
+    }
+
+    const firstRetryError = rejection(batch.close())
+    const peerRetryError = rejection(batch.close())
+    t.equal(await firstRetryError, retryError, 'later retry reports its cleanup error')
+    t.equal(await peerRetryError, retryError, 'concurrent retry reports the same error')
+    t.equal(retryCalls, 1, 'concurrent failed retries share one native cleanup')
+    t.equal(batch.toArray().length, 4, 'failed retry retains native batch fields')
     binding.batch_clear = function (...args) {
       retryCalls++
       return originalClear(...args)
     }
 
-    const callbackRetry = callbackResult((complete) => batch.close(complete))
-    const promiseRetry = batch.close()
-    t.equal(await callbackRetry, null, 'callback retry succeeds')
-    await promiseRetry
-
-    t.equal(retryCalls, 1, 'concurrent retries share one native cleanup')
+    await Promise.all([batch.close(), batch.close()])
+    t.equal(retryCalls, 2, 'concurrent successful retries share one native cleanup')
     t.deepEqual(batch.toArray(), [], 'successful retry releases the native batch')
 
     await batch.close()
-    t.equal(retryCalls, 1, 'later idempotent close does not enter native code')
+    t.equal(retryCalls, 2, 'later idempotent close does not enter native code')
   } finally {
     binding.batch_clear = originalClear
     await batch.close()
@@ -198,7 +405,7 @@ test('chained batch write reports cleanup failure after committing', async funct
   t.end()
 })
 
-test('chained batch write aggregates operation and cleanup failures', async function (t) {
+test('chained batch write exposes an iterable CombinedError', async function (t) {
   const db = testCommon.factory()
   await db.open()
   const batch = db.batch().put('key', 'value')
@@ -214,11 +421,40 @@ test('chained batch write aggregates operation and cleanup failures', async func
 
   try {
     const err = await rejection(batch.write())
-    t.ok(err instanceof AggregateError, 'write and cleanup failures produce an AggregateError')
-    t.deepEqual(err.errors, [writeError, cleanupError], 'both errors remain observable in order')
-    t.equal(err.cause, writeError, 'the operation failure remains the primary cause')
+    t.equal(err && err.name, 'CombinedError', 'write and cleanup failures use CombinedError')
+    t.deepEqual(err && [...err], [writeError, cleanupError],
+      'the iterable preserves both errors in occurrence order')
   } finally {
     binding.batch_write = originalWrite
+    binding.batch_clear = originalClear
+  }
+
+  await batch.close()
+  await db.close()
+  t.end()
+})
+
+test('chained batch write combines listener and cleanup failures', async function (t) {
+  const db = testCommon.factory()
+  await db.open()
+  const listenerError = new Error('chained batch write listener failed')
+  const cleanupError = new Error('chained batch listener cleanup failed')
+  const originalClear = binding.batch_clear
+  const onWrite = () => { throw listenerError }
+
+  // AbstractChainedBatch snapshots whether write events are enabled at creation.
+  db.once('write', onWrite)
+  const batch = db.batch().put('key', 'value')
+  binding.batch_clear = function () { throw cleanupError }
+
+  try {
+    const err = await rejection(batch.write())
+    t.equal(err && err.name, 'CombinedError', 'listener and cleanup failures use CombinedError')
+    t.deepEqual(err && [...err], [listenerError, cleanupError],
+      'the iterable preserves both errors in occurrence order')
+    t.equal(batch.toArray().length, 4, 'failed cleanup remains retryable')
+  } finally {
+    db.off('write', onWrite)
     binding.batch_clear = originalClear
   }
 
@@ -259,12 +495,19 @@ test('unsafe raw close hooks remain caller-owned', async function (t) {
   binding.iterator_close_sync = function () { throw iteratorError }
   binding.batch_clear = function () { throw batchError }
   try {
-    const rawIteratorError = callbackResult((complete) => iterator._close(complete))
-    const rawBatchError = callbackResult((complete) => batch._close(complete))
-    t.equal(await rawIteratorError, iteratorError, 'raw iterator callback owns its cleanup error')
-    t.equal(await rawBatchError, batchError, 'raw batch callback owns its cleanup error')
+    const rawIteratorError = rawCallbackResult((complete) => iterator._close(complete))
+    const rawBatchError = rawCallbackResult((complete) => batch._close(complete))
+    t.equal(await rawIteratorError, iteratorError, 'raw iterator caller owns its cleanup error')
+    t.equal(await rawBatchError, batchError, 'raw batch caller owns its cleanup error')
+
+    const iteratorDebt = Object.getOwnPropertySymbols(iterator)
+      .find(symbol => symbol.description === 'cleanupDebt')
+    const batchDebt = Object.getOwnPropertySymbols(batch)
+      .find(symbol => symbol.description === 'cleanupDebt')
+    t.equal(iterator[iteratorDebt], null, 'raw iterator failure does not acquire public retry ownership')
+    t.equal(batch[batchDebt], null, 'raw batch failure does not acquire public retry ownership')
     t.equal(Number(db.getProperty('rocksdb.num-snapshots')), 1,
-      'raw iterator failure does not acquire public retry ownership')
+      'raw iterator failure leaves the caller-owned snapshot open')
     t.equal(batch.toArray().length, 4, 'raw batch failure leaves caller-owned native state')
   } finally {
     binding.iterator_close_sync = originalIteratorClose
@@ -274,75 +517,6 @@ test('unsafe raw close hooks remain caller-owned', async function (t) {
   await iterator.close()
   await batch.close()
   await db.close()
-  t.end()
-})
-
-test('cleanup callback exceptions do not abort public fanout', function (t) {
-  const script = String.raw`
-    const assert = require('node:assert/strict')
-    const binding = require('./binding')
-    const testCommon = require('./test/common')
-
-    const rejection = async (promise) => {
-      try { await promise } catch (err) { return err }
-    }
-    const uncaught = (expected) => new Promise((resolve, reject) => {
-      process.once('uncaughtException', (err) => {
-        if (err === expected) resolve()
-        else reject(err)
-      })
-    })
-
-    ;(async () => {
-      const db = testCommon.factory()
-      await db.open()
-
-      const iterator = db.iterator()
-      const originalIteratorClose = binding.iterator_close_sync
-      const iteratorCleanupError = new Error('iterator cleanup failed')
-      const iteratorCallbackError = new Error('iterator callback failed')
-      binding.iterator_close_sync = () => { throw iteratorCleanupError }
-
-      const iteratorUncaught = uncaught(iteratorCallbackError)
-      iterator.close((err) => {
-        assert.equal(err, iteratorCleanupError)
-        throw iteratorCallbackError
-      })
-      assert.equal(await rejection(iterator.close()), iteratorCleanupError)
-      await iteratorUncaught
-      binding.iterator_close_sync = originalIteratorClose
-      await Promise.all([iterator.close(), iterator.close()])
-
-      const batch = db.batch().put('key', 'value')
-      const originalBatchClear = binding.batch_clear
-      const batchCleanupError = new Error('batch cleanup failed')
-      const batchCallbackError = new Error('batch callback failed')
-      binding.batch_clear = () => { throw batchCleanupError }
-
-      const batchUncaught = uncaught(batchCallbackError)
-      batch.close((err) => {
-        assert.equal(err, batchCleanupError)
-        throw batchCallbackError
-      })
-      assert.equal(await rejection(batch.close()), batchCleanupError)
-      await batchUncaught
-      binding.batch_clear = originalBatchClear
-      await Promise.all([batch.close(), batch.close()])
-
-      await db.close()
-    })().catch((err) => {
-      console.error(err)
-      process.exitCode = 1
-    })
-  `
-
-  const result = spawnSync(process.execPath, ['-e', script], {
-    cwd: path.join(__dirname, '..'),
-    encoding: 'utf8',
-    timeout: 30_000
-  })
-
-  t.equal(result.status, 0, childMessage(result, 'callback exception child passed'))
   t.end()
 })
 
@@ -408,14 +582,14 @@ test('cleanup debt does not prevent resource finalization fallback', function (t
   t.end()
 })
 
-test('public iterator all owns cleanup errors and preserves callback shape', async function (t) {
+test('public iterator all owns cleanup errors', async function (t) {
   const db = testCommon.factory()
   await db.open()
   await db.put('key', 'value')
   const originalClose = binding.iterator_close_sync
   const cleanupError = new Error('iterator all cleanup failed')
-  const callbackIterator = db.iterator()
-  const promiseIterator = db.iterator()
+  const firstIterator = db.iterator()
+  const secondIterator = db.iterator()
   let closeCalls = 0
 
   binding.iterator_close_sync = function () {
@@ -424,28 +598,23 @@ test('public iterator all owns cleanup errors and preserves callback shape', asy
   }
 
   try {
-    const callback = callbackArguments((complete) => callbackIterator.all(complete))
-    const promise = rejection(promiseIterator.all())
-    const [args, promiseError] = await Promise.all([callback, promise])
+    const [firstError, secondError] = await Promise.all([
+      rejection(firstIterator.all()),
+      rejection(secondIterator.all())
+    ])
 
-    t.equal(args.length, 2, 'callback all settles with exactly (err, rows)')
-    t.equal(args[0], cleanupError, 'callback all reports cleanup-only failure')
-    t.deepEqual(args[1], [['key', 'value']], 'callback all retains successfully-read rows')
-    t.equal(promiseError, cleanupError, 'promise all rejects with cleanup-only failure')
+    t.equal(firstError, cleanupError, 'first all reports cleanup-only failure')
+    t.equal(secondError, cleanupError, 'second all reports cleanup-only failure')
     t.equal(closeCalls, 2, 'each iterator attempts its own cleanup once')
   } finally {
     binding.iterator_close_sync = originalClose
   }
 
-  const callbackClose = await callbackArguments((complete) => callbackIterator.close(complete))
-  t.equal(callbackClose.length, 0, 'successful callback close settles with zero arguments')
-  await promiseIterator.close()
+  await Promise.all([firstIterator.close(), secondIterator.close()])
 
   const successfulIterator = db.iterator()
-  const successfulAll = await callbackArguments((complete) => successfulIterator.all(complete))
-  t.equal(successfulAll.length, 2, 'successful callback all settles with exactly two arguments')
-  t.equal(successfulAll[0], null, 'successful callback all has a null error')
-  t.deepEqual(successfulAll[1], [['key', 'value']], 'successful callback all returns its rows')
+  t.deepEqual(await successfulIterator.all(), [['key', 'value']],
+    'successful all returns its rows')
 
   await db.close()
   t.end()
@@ -471,10 +640,8 @@ test('public iterator all owns empty, limit-zero and exhausted cleanup', async f
     const cleanupError = new Error(`${entry.name} cleanup failed`)
     binding.iterator_close_sync = function () { throw cleanupError }
 
-    const args = await callbackArguments((complete) => entry.iterator.all(complete))
-    t.equal(args.length, 2, `${entry.name}: callback keeps two arguments`)
-    t.equal(args[0], cleanupError, `${entry.name}: cleanup error remains observable`)
-    t.deepEqual(args[1], [], `${entry.name}: completed read retains its empty rows`)
+    t.equal(await rejection(entry.iterator.all()), cleanupError,
+      `${entry.name}: cleanup error remains observable`)
 
     binding.iterator_close_sync = originalClose
     await entry.iterator.close()
@@ -500,13 +667,10 @@ test('public iterator all aggregates read and cleanup errors', async function (t
   binding.iterator_close_sync = function () { throw cleanupError }
 
   try {
-    const args = await callbackArguments((complete) => iterator.all(complete))
-    const err = args[0]
-    t.equal(args.length, 2, 'dual-failure callback keeps exactly (err, rows)')
-    t.ok(err instanceof AggregateError, 'dual failure produces an AggregateError')
-    t.deepEqual(err.errors, [readError, cleanupError], 'read and cleanup errors retain order')
-    t.equal(err.cause, readError, 'read failure remains the primary cause')
-    t.equal(args[1], undefined, 'failed read has no rows')
+    const err = await rejection(iterator.all())
+    t.equal(err && err.name, 'CombinedError', 'dual failure produces a CombinedError')
+    t.deepEqual(err && [...err], [readError, cleanupError],
+      'read and cleanup errors retain order')
   } finally {
     binding.iterator_init_nextv = originalInitNextv
     binding.iterator_close_sync = originalClose
@@ -534,16 +698,14 @@ test('concurrent explicit close and all both own cleanup failure', async functio
   binding.iterator_close_sync = function () { throw cleanupError }
 
   try {
-    const all = callbackArguments((complete) => iterator.all(complete))
+    const all = rejection(iterator.all())
     const heldInitNextv = await initNextvCaptured
 
     const close = rejection(iterator.close())
     originalInitNextv(...heldInitNextv)
 
-    const [args, closeError] = await Promise.all([all, close])
-    t.equal(args.length, 2, 'all callback keeps exactly (err, rows)')
-    t.equal(args[0], cleanupError, 'all owns the shared cleanup failure')
-    t.deepEqual(args[1], [['key', 'value']], 'all retains rows completed before cleanup')
+    const [allError, closeError] = await Promise.all([all, close])
+    t.equal(allError, cleanupError, 'all owns the shared cleanup failure')
     t.equal(closeError, cleanupError, 'concurrent explicit close owns the same failure')
   } finally {
     binding.iterator_init_nextv = originalInitNextv
@@ -619,11 +781,11 @@ test('non-native iterator wrappers propagate cleanup debt and retry with fanout'
       throw cleanupError
     }
 
-    const callbackClose = callbackArguments((complete) => iterator.close(complete))
-    const promiseClose = rejection(iterator.close())
-    const [args, promiseError] = await Promise.all([callbackClose, promiseClose])
-    t.deepEqual(args, [cleanupError], `${entry.name}: callback owns inner cleanup debt`)
-    t.equal(promiseError, cleanupError, `${entry.name}: promise owns the same cleanup debt`)
+    const firstClose = rejection(iterator.close())
+    const peerClose = rejection(iterator.close())
+    const [firstError, peerError] = await Promise.all([firstClose, peerClose])
+    t.equal(firstError, cleanupError, `${entry.name}: first close owns inner cleanup debt`)
+    t.equal(peerError, cleanupError, `${entry.name}: peer close owns the same cleanup debt`)
     t.equal(closeCalls, 1, `${entry.name}: initial close fanout shares one native attempt`)
 
     binding.iterator_close_sync = function (...args) {
@@ -631,10 +793,7 @@ test('non-native iterator wrappers propagate cleanup debt and retry with fanout'
       return originalClose(...args)
     }
 
-    const callbackRetry = callbackArguments((complete) => iterator.close(complete))
-    const promiseRetry = iterator.close()
-    const [retryArgs] = await Promise.all([callbackRetry, promiseRetry])
-    t.equal(retryArgs.length, 0, `${entry.name}: successful callback retry has zero arguments`)
+    await Promise.all([iterator.close(), iterator.close()])
     t.equal(closeCalls, 2, `${entry.name}: retry fanout shares one native attempt`)
 
     binding.iterator_close_sync = originalClose
@@ -661,19 +820,81 @@ test('wrapped all propagates auto-close debt and later close retries it', async 
   }
 
   try {
-    const args = await callbackArguments((complete) => iterator.all(complete))
-    t.equal(args.length, 2, 'wrapped all settles with exactly (err, rows)')
-    t.equal(args[0], cleanupError, 'wrapped all propagates inner cleanup failure')
-    t.equal(args[1], undefined, 'wrapper does not invent rows dropped by its inner error path')
+    t.equal(await rejection(iterator.all()), cleanupError,
+      'wrapped all propagates one cleanup failure by identity')
     t.equal(closeCalls, 2, 'inner and outer auto-close attempts retain retry debt')
   } finally {
     binding.iterator_close_sync = originalClose
   }
 
-  const callbackRetry = callbackArguments((complete) => iterator.close(complete))
-  const promiseRetry = iterator.close()
-  const [retryArgs] = await Promise.all([callbackRetry, promiseRetry])
-  t.equal(retryArgs.length, 0, 'wrapped retry callback succeeds with zero arguments')
+  await Promise.all([iterator.close(), iterator.close()])
+  await db.close()
+  t.end()
+})
+
+test('wrapped all preserves a user CombinedError by identity', async function (t) {
+  const db = testCommon.factory()
+  await db.open()
+  const iterator = db.keys()
+  const inner = new Error('user repeated error')
+  const combined = combineErrors([inner, inner])
+  const options = {
+    get timeout () {
+      throw combined
+    }
+  }
+
+  t.equal(await rejection(iterator.all(options)), combined,
+    'iterable error shape alone does not trigger cleanup deduplication')
+  await iterator.close()
+  await db.close()
+  t.end()
+})
+
+test('wrapped all removes only its duplicated cleanup occurrence', async function (t) {
+  const db = testCommon.factory()
+  await db.open()
+  await db.batch([
+    { type: 'put', key: 'first', value: 'value' },
+    { type: 'put', key: 'second', value: 'value' }
+  ])
+  const originalNextv = binding.iterator_nextv
+  const originalClose = binding.iterator_close_sync
+  const cases = [
+    {
+      name: 'distinct read and cleanup errors',
+      readError: new Error('wrapped all read failed'),
+      cleanupError: new Error('wrapped all cleanup failed')
+    },
+    {
+      name: 'shared read and cleanup identity',
+      get readError () { return this.error },
+      get cleanupError () { return this.error },
+      error: new Error('wrapped all read and cleanup shared this failure')
+    }
+  ]
+
+  for (const entry of cases) {
+    const iterator = db.keys()
+    await iterator.next()
+    binding.iterator_nextv = function (...args) {
+      process.nextTick(args.at(-1), entry.readError)
+    }
+    binding.iterator_close_sync = function () { throw entry.cleanupError }
+
+    try {
+      const err = await rejection(iterator.all())
+      t.equal(err && err.name, 'CombinedError', `${entry.name}: actual failures stay combined`)
+      t.deepEqual(err && [...err], [entry.readError, entry.cleanupError],
+        `${entry.name}: read and one real cleanup occurrence retain order`)
+    } finally {
+      binding.iterator_nextv = originalNextv
+      binding.iterator_close_sync = originalClose
+    }
+
+    await iterator.close()
+  }
+
   await db.close()
   t.end()
 })
@@ -1057,7 +1278,7 @@ test('production raw wrapper close remains caller-owned', function (t) {
       const cleanupError = new Error('raw wrapper cleanup failed')
       binding.iterator_close_sync = () => { throw cleanupError }
 
-      const rawError = await new Promise((resolve) => iterator._close(resolve))
+      const rawError = await iterator._close().then(() => null, err => err)
       assert.equal(rawError, cleanupError)
       assert.equal(Number(db.getProperty('rocksdb.num-snapshots')), 1)
 

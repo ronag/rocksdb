@@ -10,8 +10,8 @@ test('chained batch without ref does not get GCed before write', function (t) {
 
   const db = testCommon.factory()
 
-  db.open(function (err) {
-    t.ifError(err, 'no open error')
+  db.open().then(function () {
+    t.pass('no open error')
 
     let batch = db.batch()
 
@@ -21,7 +21,9 @@ test('chained batch without ref does not get GCed before write', function (t) {
 
     // The sync option makes the operation slower and thus more likely to
     // cause a segfault (if the batch were to be GC-ed before it is written).
-    batch.write({ sync: true }, function (err) {
+    batch.write({ sync: true }).then(function () {
+      t.pass('no error from write()')
+    }, function (err) {
       t.ifError(err, 'no error from write()')
     })
 
@@ -33,5 +35,7 @@ test('chained batch without ref does not get GCed before write', function (t) {
       // Useful for manual testing with "node --expose-gc".
       global.gc()
     }
+  }, function (err) {
+    t.ifError(err, 'no open error')
   })
 })
