@@ -2,6 +2,9 @@
     "variables": {
         "openssl_fips": "0",
         "rocks_level_march%": "<!(node -p \"process.env.ROCKS_LEVEL_MARCH || ''\")",
+        # Compile narrow native fault hooks only for the explicit exception
+        # safety test build. Published binaries have no hook or hot-path check.
+        "rocks_level_test_faults%": "<!(node -p \"process.env.ROCKS_LEVEL_TEST_FAULTS === '1' ? '1' : '0'\")",
     },
     "targets": [
         {
@@ -13,6 +16,12 @@
                 "Release": {"defines": ["NDEBUG"]},
             },
             "conditions": [
+                [
+                    "rocks_level_test_faults == 1",
+                    {
+                        "defines": ["ROCKS_LEVEL_TEST_FAULTS=1"],
+                    },
+                ],
                 [
                     "OS == 'linux'",
                     {

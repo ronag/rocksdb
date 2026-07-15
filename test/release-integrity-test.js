@@ -163,11 +163,17 @@ test('dependency cache stamp contains commits and rejects the old tag stamp', fu
 
 test('release tests the Darwin prebuild before changing package state', function (t) {
   const script = fs.readFileSync(path.join(__dirname, '..', 'release.sh'), 'utf8')
+  const clearFaults = script.indexOf('export ROCKS_LEVEL_TEST_FAULTS=0')
+  const linuxBuild = script.indexOf('./build.sh')
   const build = script.indexOf('JOBS=16 npx prebuildify')
   const smokeTest = script.indexOf('npm run test-prebuild', build)
   const version = script.indexOf('npm version "$BUMP"')
   const publish = script.indexOf('npm publish --registry')
 
+  t.ok(clearFaults >= 0, 'release explicitly disables native fault injection')
+  t.ok(linuxBuild >= 0, 'Linux prebuild command exists')
+  t.ok(clearFaults < linuxBuild, 'fault injection is disabled before the Linux build')
+  t.ok(clearFaults < build, 'fault injection is disabled before the Darwin build')
   t.ok(build >= 0, 'Darwin prebuild command exists')
   t.ok(smokeTest > build, 'smoke test follows Darwin prebuild generation')
   t.ok(version > smokeTest, 'smoke test precedes the version bump')

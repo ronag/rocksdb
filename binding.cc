@@ -41,6 +41,10 @@
 #include <utility>
 #include <vector>
 
+#if defined(ROCKS_LEVEL_TEST_FAULTS)
+#include <stdexcept>
+#endif
+
 #ifdef __linux__
 #include <sys/syscall.h>
 #include <unistd.h>
@@ -909,6 +913,10 @@ struct BatchEntry {
   std::optional<ColumnFamily> column = std::nullopt;
 };
 
+#if defined(ROCKS_LEVEL_TEST_FAULTS)
+static std::atomic<bool> gFailBatchIteratorAfterFirstRow{false};
+#endif
+
 struct BatchIterator : public rocksdb::WriteBatch::Handler {
   BatchIterator(const bool keys,
                 const bool values,
@@ -924,6 +932,14 @@ struct BatchIterator : public rocksdb::WriteBatch::Handler {
         valueEncoding_(valueEncoding) {}
 
   napi_status Iterate(napi_env env, const rocksdb::WriteBatch& batch, napi_value* result) {
+    // Updates reuses one BatchIterator across WAL batches. Never let a failed
+    // RocksDB iteration or N-API conversion retain rows for the next call.
+    cache_.clear();
+    struct CacheClearGuard final {
+      std::vector<BatchEntry>& cache;
+      ~CacheClearGuard() noexcept { cache.clear(); }
+    } cacheClear{cache_};
+
     cache_.reserve(batch.Count());
 
     ROCKS_STATUS_RETURN_NAPI(batch.Iterate(this));
@@ -977,9 +993,14 @@ struct BatchIterator : public rocksdb::WriteBatch::Handler {
       // TODO (fix)
       // napi_value column = cache_[n].column ? cache_[n].column->val : nullVal;
       NAPI_STATUS_RETURN(napi_set_element(env, *result, n * 4 + 3, nullVal));
-    }
 
-    cache_.clear();
+#if defined(ROCKS_LEVEL_TEST_FAULTS)
+      if (n == 0 && gFailBatchIteratorAfterFirstRow.exchange(false, std::memory_order_relaxed)) {
+        napi_throw_error(env, "LEVEL_TEST_FAULT", "Injected batch iteration conversion failure");
+        return napi_pending_exception;
+      }
+#endif
+    }
 
     return napi_ok;
   }
@@ -2080,6 +2101,39 @@ static void FinalizeDatabase(napi_env env, void* data, void* hint) {
     delete holder;
   }
 }
+
+static napi_value ThrowUnhandledNativeMethodException(napi_env env,
+                                                       const char* message) noexcept {
+  // Conversion helpers can already have raised a more precise JavaScript
+  // exception before native stack unwinding begins. Preserve that exception
+  // instead of replacing it with the generic C++ boundary error.
+  bool pending = false;
+  if (napi_is_exception_pending(env, &pending) == napi_ok && pending) {
+    return nullptr;
+  }
+
+  napi_throw_error(env, "LEVEL_NATIVE_EXCEPTION", message);
+  return nullptr;
+}
+
+// napi-macros exports callbacks directly. Put one noexcept boundary around
+// every exported method so allocation failures and unexpected RocksDB or STL
+// exceptions can never unwind through Node's C callback ABI. C++ exception
+// tables make the healthy path branch-free on the supported toolchains.
+#undef NAPI_METHOD
+#define NAPI_METHOD(name)                                                            \
+  static napi_value name##_impl(napi_env env, napi_callback_info info);              \
+  static napi_value name(napi_env env, napi_callback_info info) noexcept {            \
+    try {                                                                             \
+      return name##_impl(env, info);                                                   \
+    } catch (const std::exception& exception) {                                        \
+      return ThrowUnhandledNativeMethodException(env, exception.what());               \
+    } catch (...) {                                                                    \
+      return ThrowUnhandledNativeMethodException(env,                                  \
+                                                 "Unknown exception in native method"); \
+    }                                                                                  \
+  }                                                                                    \
+  static napi_value name##_impl(napi_env env, napi_callback_info info)
 
 NAPI_METHOD(db_init) {
   NAPI_ARGV(2);
@@ -4561,14 +4615,16 @@ NAPI_METHOD(statistics_init) {
   bool enabled = false;
   NAPI_STATUS_THROWS(GetProperty(env, argv[0], "enabled", enabled));
 
-  auto statistics = new std::shared_ptr<rocksdb::Statistics>(rocksdb::CreateDBStatistics());
-  (*statistics)->set_stats_level(enabled ? rocksdb::StatsLevel::kExceptHistogramOrTimers
-                                        : rocksdb::StatsLevel::kExceptTickers);
+  auto statistics = rocksdb::CreateDBStatistics();
+  statistics->set_stats_level(enabled ? rocksdb::StatsLevel::kExceptHistogramOrTimers
+                                      : rocksdb::StatsLevel::kExceptTickers);
 
   napi_value result;
-  NAPI_STATUS_THROWS(napi_create_external(
-      env, statistics, Finalize<std::shared_ptr<rocksdb::Statistics>>, statistics, &result));
-  NAPI_STATUS_THROWS(napi_type_tag_object(env, result, &kStatisticsTypeTag));
+  // CreateResourceExternal holds the shared_ptr in a unique_ptr until N-API
+  // accepts the finalizer, then transfers ownership to the external before
+  // type tagging. This covers both failure points without leaking or risking a
+  // double delete if the already-created external becomes unreachable.
+  NAPI_STATUS_THROWS(CreateResourceExternal(env, statistics, kStatisticsTypeTag, result));
 
   return result;
 }
@@ -4779,6 +4835,88 @@ NAPI_METHOD(io_uring_available) {
 #endif
 }
 
+#if defined(ROCKS_LEVEL_TEST_FAULTS)
+// These hooks exist only in an explicit ROCKS_LEVEL_TEST_FAULTS build. They
+// exercise the exported-method boundary and the real libuv completion callback
+// without adding a test branch or atomic load to production paths.
+NAPI_METHOD(test_method_exception) {
+  NAPI_ARGV(2);
+
+  std::string fault;
+  NAPI_STATUS_THROWS(GetValue(env, argv[0], fault));
+
+  if (fault == "std") {
+    throw std::runtime_error("Injected native method exception");
+  }
+  if (fault == "unknown") {
+    throw 42;
+  }
+  if (fault == "pending") {
+    napi_value global;
+    NAPI_STATUS_THROWS(napi_get_global(env, &global));
+    // Deliberately leave the callback's exception pending, then unwind through
+    // C++ to prove the outer boundary does not replace a more precise JS error.
+    napi_call_function(env, global, argv[1], 0, nullptr, nullptr);
+    throw std::runtime_error("Must not replace the pending JavaScript exception");
+  }
+
+  napi_throw_type_error(env, nullptr, "Unknown native method test fault");
+  return nullptr;
+}
+
+NAPI_METHOD(test_complete_exception) {
+  NAPI_ARGV(2);
+
+  std::string fault;
+  NAPI_STATUS_THROWS(GetValue(env, argv[0], fault));
+
+  napi_value resourceName;
+  NAPI_STATUS_THROWS(
+      napi_create_string_utf8(env, "rocks-level.test_complete_exception", NAPI_AUTO_LENGTH, &resourceName));
+
+  try {
+    auto executeFault = fault;
+    NAPI_STATUS_THROWS(runAsync<std::nullptr_t>(
+        resourceName, env, argv[1],
+        [fault = std::move(executeFault)](auto&) {
+          if (fault == "execute-std") {
+            throw std::runtime_error("Injected native execution exception");
+          }
+          if (fault == "execute-unknown") {
+            throw 42;
+          }
+          return rocksdb::Status::OK();
+        },
+        [fault = std::move(fault)](auto&, napi_env env, napi_value* result) -> napi_status {
+          if (fault == "std") {
+            throw std::runtime_error("Injected native completion exception");
+          }
+          if (fault == "unknown") {
+            throw 42;
+          }
+          if (fault == "status") {
+            NAPI_STATUS_RETURN(napi_create_string_utf8(env, "partial", NAPI_AUTO_LENGTH, result));
+            return napi_invalid_arg;
+          }
+          return napi_create_string_utf8(env, "ok", NAPI_AUTO_LENGTH, result);
+        }));
+  } catch (const std::exception& exception) {
+    napi_throw_error(env, "LEVEL_NATIVE_EXCEPTION", exception.what());
+    return nullptr;
+  } catch (...) {
+    napi_throw_error(env, "LEVEL_NATIVE_EXCEPTION", "Unknown native exception while scheduling test work");
+    return nullptr;
+  }
+
+  return nullptr;
+}
+
+NAPI_METHOD(test_fail_batch_iterator_once) {
+  gFailBatchIteratorAfterFirstRow.store(true, std::memory_order_relaxed);
+  return nullptr;
+}
+#endif
+
 NAPI_INIT() {
   NAPI_EXPORT_FUNCTION(db_init);
   NAPI_EXPORT_FUNCTION(db_open);
@@ -4850,4 +4988,10 @@ NAPI_INIT() {
   NAPI_EXPORT_FUNCTION(write_buffer_manager_get_usage);
 
   NAPI_EXPORT_FUNCTION(io_uring_available);
+
+#if defined(ROCKS_LEVEL_TEST_FAULTS)
+  NAPI_EXPORT_FUNCTION(test_method_exception);
+  NAPI_EXPORT_FUNCTION(test_complete_exception);
+  NAPI_EXPORT_FUNCTION(test_fail_batch_iterator_once);
+#endif
 }
