@@ -6,12 +6,13 @@ const path = require('node:path')
 const { execFileSync } = require('node:child_process')
 const { persistentPrefixDir } = require('./deps-prefix.js')
 
-// Debian 11 (Bullseye) ceilings. Keeping these explicit turns a future base
-// image or compiler upgrade into a reviewed compatibility decision.
+// Project-audited portability ceilings, intentionally stricter than the
+// Bullseye toolchain defaults. Keeping these explicit turns a future compiler
+// or dependency upgrade into a reviewed compatibility decision.
 const ABI_LIMITS = {
-  GLIBC: '2.31',
-  GLIBCXX: '3.4.28',
-  CXXABI: '1.3.12'
+  GLIBC: '2.30',
+  GLIBCXX: '3.4.26',
+  CXXABI: '1.3.11'
 }
 
 const ALLOWED_DYNAMIC_LIBRARIES = new Set([

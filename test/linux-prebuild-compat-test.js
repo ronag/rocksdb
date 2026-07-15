@@ -2,6 +2,7 @@
 
 const test = require('tape')
 const {
+  ABI_LIMITS,
   assertBaselineCompilerMacros,
   assertX64ElfHeader,
   compareVersions,
@@ -9,6 +10,15 @@ const {
   requiredAbiVersions,
   validateDynamicDependencies
 } = require('../scripts/check-linux-prebuild.js')
+
+test('linux prebuild compatibility pins the audited project ABI ceilings', function (t) {
+  t.deepEqual(ABI_LIMITS, {
+    GLIBC: '2.30',
+    GLIBCXX: '3.4.26',
+    CXXABI: '1.3.11'
+  })
+  t.end()
+})
 
 test('linux prebuild compatibility version ordering', function (t) {
   t.equal(compareVersions('2.36', '2.36'), 0)
