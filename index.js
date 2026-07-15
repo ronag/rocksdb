@@ -16,7 +16,7 @@ const {
   emitPublicEvent,
   guardPublicEvents,
   protectPublicChainedBatch,
-  protectPublicClose,
+  protectPublicIterator,
   rethrowErrors,
   rethrowingCallback
 } = require('./public-lifecycle')
@@ -1122,15 +1122,15 @@ class RocksLevel extends AbstractLevel {
     const noFields = hasNoFields(options)
     const iterator = super.iterator(options)
     const wrapped = wrapNoFieldsIterator(iterator, noFields)
-    return iterator instanceof Iterator ? wrapped : protectPublicClose(wrapped)
+    return iterator instanceof Iterator ? wrapped : protectPublicIterator(wrapped)
   }
 
   keys (options) {
-    return protectPublicClose(super.keys(options))
+    return protectPublicIterator(super.keys(options))
   }
 
   values (options) {
-    return protectPublicClose(super.values(options))
+    return protectPublicIterator(super.values(options))
   }
 
   _getManySync (keys, options) {
@@ -1693,7 +1693,7 @@ function wrapSublevel (db) {
       options = snapshotIteratorOptions(options)
       const noFields = hasNoFields(options)
       const result = iterator.call(this, options)
-      return protectPublicClose(wrapNoFieldsIterator(result, noFields))
+      return protectPublicIterator(wrapNoFieldsIterator(result, noFields))
     }
   })
 
@@ -1703,7 +1703,7 @@ function wrapSublevel (db) {
       configurable: true,
       writable: true,
       value: function (options) {
-        return protectPublicClose(createIterator.call(this, options))
+        return protectPublicIterator(createIterator.call(this, options))
       }
     })
   }

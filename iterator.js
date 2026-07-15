@@ -7,7 +7,11 @@ const ModuleError = require('module-error')
 const assert = require('node:assert')
 const { Buffer } = require('node:buffer')
 const { getPackedMode, setPackedResult } = require('./util')
-const { rethrowingCallback } = require('./public-lifecycle')
+const {
+  combineIteratorCleanupError,
+  iteratePublicIterator,
+  rethrowingCallback
+} = require('./public-lifecycle')
 
 const binding = require('./binding')
 
@@ -383,11 +387,34 @@ class Iterator extends AbstractIterator {
 
   all (options, callback) {
     if (DEBUG) assert(!this[kUnsafeBusy], 'public all() must not overlap an unsafe operation')
-    if (!this[kBusy] || this[kCloseRequested]) return super.all(options, callback)
 
-    callback = fromCallback(typeof options === 'function' ? options : callback, kPromise)
+    if (typeof options === 'function') {
+      callback = options
+      options = undefined
+    }
+
+    callback = fromCallback(callback, kPromise)
+    const promise = callback[kPromise]
+    callback = rethrowingCallback(callback)
+
+    if (!this[kBusy] || this[kCloseRequested]) {
+      const previousDebt = this[kCleanupDebt]
+      const complete = (err, entries) => {
+        // AbstractIterator binds (err, entries) through its auto-close and
+        // therefore cannot receive a later close error as another argument.
+        // Recover the cleanup owned by this all() from its retained debt.
+        const debt = this[kCleanupDebt]
+        const cleanupError = debt !== previousDebt ? debt?.error : null
+        callback(combineIteratorCleanupError(err, cleanupError) || null, entries)
+      }
+
+      if (options === undefined) super.all(complete)
+      else super.all(options, complete)
+      return promise
+    }
+
     process.nextTick(callback, iteratorBusyError('all'))
-    return callback[kPromise]
+    return promise
   }
 
   seek (target, options) {
@@ -430,7 +457,12 @@ class Iterator extends AbstractIterator {
     super.close((err) => {
       this[kCloseLanded] = true
       const debt = this[kCleanupDebt]
-      callback(err || (debt !== previousDebt ? debt?.error : null))
+      const failure = combineIteratorCleanupError(
+        err,
+        debt !== previousDebt ? debt?.error : null
+      )
+      if (failure) callback(failure)
+      else callback()
     })
     this[kCloseRequested] = true
     return promise
@@ -461,8 +493,15 @@ class Iterator extends AbstractIterator {
       if (this[kCleanupDebtClose] === group) this[kCleanupDebtClose] = null
 
       const callbacks = group.callbacks.splice(0)
-      for (const complete of callbacks) complete(err)
+      for (const complete of callbacks) {
+        if (err) complete(err)
+        else complete()
+      }
     })
+  }
+
+  [Symbol.asyncIterator] () {
+    return iteratePublicIterator(this)
   }
 
   _seek (target) {
