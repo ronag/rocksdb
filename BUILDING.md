@@ -12,6 +12,11 @@ none does, it builds the dependencies and the addon from source automatically
 (into a temp dir that is removed afterward — nothing is left on the machine).
 Nothing extra to run.
 
+The Node.js runtime is TypeScript in `src/`. The package `prepare` lifecycle
+compiles it to the gitignored `lib/` directory during source installs and before
+publication. Run `npm run build` directly for a standalone typecheck and build;
+`npm test` always rebuilds the runtime before executing the test suite.
+
 # Generating prebuilds
 
 ## Linux

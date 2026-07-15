@@ -1,11 +1,14 @@
-'use strict'
-
 const DEBUG = process.env.NODE_ENV !== 'production'
 
-exports.kRef = Symbol('ref')
-exports.kUnref = Symbol('unref')
+type PackedMode = boolean | 'auto'
 
-exports.getPackedMode = function getPackedMode (options, fallback = false) {
+export const kRef = Symbol('ref')
+export const kUnref = Symbol('unref')
+
+export function getPackedMode (
+  options: { packed?: PackedMode } | null | undefined,
+  fallback: PackedMode | (() => PackedMode) = false
+): PackedMode {
   const packed = options?.packed
   if (packed === undefined) return typeof fallback === 'function' ? fallback() : fallback
   if (DEBUG && packed !== false && packed !== true && packed !== 'auto') {
@@ -14,7 +17,7 @@ exports.getPackedMode = function getPackedMode (options, fallback = false) {
   return packed
 }
 
-exports.setPackedResult = function setPackedResult (result, packed) {
+export function setPackedResult (result, packed) {
   Object.defineProperty(result, 'packed', { value: packed })
   return result
 }

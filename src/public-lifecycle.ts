@@ -1,5 +1,3 @@
-'use strict'
-
 const asyncGenerator = (async function * () {})()
 const asyncGeneratorPrototype = Object.getPrototypeOf(Object.getPrototypeOf(asyncGenerator))
 const asyncGeneratorNext = asyncGeneratorPrototype.next
@@ -79,10 +77,10 @@ function iteratePublicIterator (iterator) {
   const terminalizing = 2
   const terminalized = 3
   let state = unstarted
-  let earlyTermination = null
+  let earlyTermination: Promise<any> | null = null
 
   const gateEarlyTermination = (operation) => {
-    const transition = earlyTermination
+    const transition = earlyTermination!
     // Observe a natively-queued rejection immediately, while deferring its
     // public settlement until the earlier cleanup has landed.
     const observed = settleProtocolCall(operation)
@@ -150,4 +148,4 @@ function iteratePublicIterator (iterator) {
   })
 }
 
-exports.iteratePublicIterator = iteratePublicIterator
+export { iteratePublicIterator }

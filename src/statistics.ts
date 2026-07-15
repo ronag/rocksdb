@@ -1,6 +1,4 @@
-'use strict'
-
-const binding = require('./binding')
+import binding = require('./binding')
 
 const kStatisticsContext = Symbol('statisticsContext')
 
@@ -8,12 +6,13 @@ const kStatisticsContext = Symbol('statisticsContext')
 // Collection starts disabled by default, toggling never resets counts, and
 // snapshots use Numbers (counts above Number.MAX_SAFE_INTEGER lose precision).
 class RocksStatistics {
-  constructor (options = {}) {
+  constructor (options: unknown = {}) {
     if (typeof options !== 'object' || options === null || Array.isArray(options)) {
       throw new TypeError("The 'options' argument must be an object")
     }
 
-    const enabled = options.enabled === undefined ? false : options.enabled
+    const enabledOption = (options as { enabled?: unknown }).enabled
+    const enabled = enabledOption === undefined ? false : enabledOption
     if (typeof enabled !== 'boolean') {
       throw new TypeError("The 'enabled' option must be a boolean")
     }
@@ -43,5 +42,4 @@ function getStatisticsContext (statistics) {
   return context
 }
 
-exports.RocksStatistics = RocksStatistics
-exports.getStatisticsContext = getStatisticsContext
+export { RocksStatistics, getStatisticsContext }

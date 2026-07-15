@@ -1,12 +1,9 @@
-'use strict'
-
-const { fromCallback } = require('catering')
-const { AbstractChainedBatch } = require('abstract-level')
-const ModuleError = require('module-error')
-const assert = require('node:assert')
-const combineErrors = require('maybe-combine-errors')
-
-const binding = require('./binding')
+import assert from 'node:assert'
+import { AbstractChainedBatch } from 'abstract-level'
+import { fromCallback } from 'catering'
+import combineErrors = require('maybe-combine-errors')
+import ModuleError = require('module-error')
+import binding = require('./binding')
 
 const kPromise = Symbol('promise')
 const kBatchContext = Symbol('batchContext')
@@ -60,7 +57,9 @@ function combineCleanupError (operationError, cleanupError) {
   return combineErrors([operationError, cleanupError])
 }
 
-class ChainedBatch extends AbstractChainedBatch {
+class ChainedBatch extends AbstractChainedBatch<any, any, any> {
+  [key: symbol]: any
+
   constructor (db, context) {
     super(db)
 
@@ -99,7 +98,7 @@ class ChainedBatch extends AbstractChainedBatch {
     return this[kLength] + super.length - this[kAbstractLength]
   }
 
-  put (key, value, options) {
+  put (key, value, options?) {
     if (this[kRawWrite] !== null || this[kPendingPublicClose] !== null) {
       throw batchNotOpenError('put')
     }
@@ -115,7 +114,7 @@ class ChainedBatch extends AbstractChainedBatch {
     }
   }
 
-  del (key, options) {
+  del (key, options?) {
     if (this[kRawWrite] !== null || this[kPendingPublicClose] !== null) {
       throw batchNotOpenError('del')
     }
@@ -141,7 +140,7 @@ class ChainedBatch extends AbstractChainedBatch {
     return result
   }
 
-  write (options) {
+  write (options?): any {
     if (this[kRawWrite] !== null || this[kPublicClose] !== null ||
         this[kPendingPublicClose] !== null || this[kCleanupDebt] !== null ||
         this[kBatchContext] === null) {
@@ -154,7 +153,7 @@ class ChainedBatch extends AbstractChainedBatch {
     this[kPublicWriteToken] = true
 
     let promise
-    let rawGroup = null
+    let rawGroup: any = null
     try {
       // Custom unsafe operations (for example _merge()) are intentionally not
       // reflected in AbstractChainedBatch's private length. Bridge only the
@@ -164,7 +163,7 @@ class ChainedBatch extends AbstractChainedBatch {
       } else if (super.length === 0) {
         let resolveClose
         let rejectClose
-        const closeResult = new Promise((resolve, reject) => {
+        const closeResult = new Promise<void>((resolve, reject) => {
           resolveClose = resolve
           rejectClose = reject
         })
@@ -315,8 +314,8 @@ class ChainedBatch extends AbstractChainedBatch {
     const active = this[kCleanupDebtClose]
     if (active !== null && active.debt === debt) return active.promise
 
-    const group = { debt, promise: null }
-    group.promise = new Promise((resolve, reject) => {
+    const group: any = { debt, promise: null }
+    group.promise = new Promise<void>((resolve, reject) => {
       process.nextTick(() => {
         let err
         try {
@@ -405,9 +404,9 @@ class ChainedBatch extends AbstractChainedBatch {
     this[kLength] = 0
   }
 
-  _write (options, callback) {
+  _write (options, callback?) {
     if (callback === undefined) {
-      return new Promise((resolve, reject) => {
+      return new Promise<void>((resolve, reject) => {
         this._write(options, err => err ? reject(err) : resolve())
       })
     }
@@ -463,10 +462,10 @@ class ChainedBatch extends AbstractChainedBatch {
     }
   }
 
-  _close (callback) {
+  _close (callback?) {
     if (callback === undefined) {
       if (this[kPublicCleanup] > 0) this[kPublicCloseStarted]++
-      return new Promise((resolve, reject) => {
+      return new Promise<void>((resolve, reject) => {
         this._close(err => err ? reject(err) : resolve())
       })
     }
@@ -555,7 +554,7 @@ class ChainedBatch extends AbstractChainedBatch {
     }
   }
 
-  toArray (options) {
+  toArray (options?) {
     if (DEBUG) assert(!this[kUnsafeBusy], 'public toArray() must not overlap an unsafe operation')
     if (this[kBusy] || this[kPublicWriting]) throw batchBusyError()
 
@@ -578,4 +577,4 @@ class ChainedBatch extends AbstractChainedBatch {
   }
 }
 
-exports.ChainedBatch = ChainedBatch
+export { ChainedBatch }

@@ -1,6 +1,4 @@
-'use strict'
-
-const binding = require('./binding')
+import binding = require('./binding')
 
 const kCacheContext = Symbol('cacheContext')
 
@@ -14,4 +12,4 @@ class RocksCache {
   }
 }
 
-exports.RocksCache = RocksCache
+export { RocksCache }

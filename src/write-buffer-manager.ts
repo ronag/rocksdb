@@ -1,6 +1,4 @@
-'use strict'
-
-const binding = require('./binding')
+import binding = require('./binding')
 
 const kWriteBufferManagerContext = Symbol('writeBufferManagerContext')
 
@@ -18,4 +16,4 @@ class RocksWriteBufferManager {
   }
 }
 
-exports.RocksWriteBufferManager = RocksWriteBufferManager
+export { RocksWriteBufferManager }
