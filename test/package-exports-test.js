@@ -13,8 +13,13 @@ function importFromEntry (names) {
     `import { ${names.join(', ')} } from ${JSON.stringify(entry)}`
   ], {
     encoding: 'utf8',
-    env: { ...process.env, NODE_OPTIONS: '' }
+    env: { ...process.env, NODE_OPTIONS: '' },
+    timeout: 20_000
   })
+}
+
+function childFailure (result) {
+  return [result.error?.message, result.stderr].filter(Boolean).join('\n')
 }
 
 test('ESM named imports match the public runtime exports', (t) => {
@@ -26,7 +31,13 @@ test('ESM named imports match the public runtime exports', (t) => {
     'ioUringAvailable'
   ])
 
-  t.equal(publicResult.status, 0, publicResult.stderr)
+  t.equal(
+    publicResult.status,
+    0,
+    publicResult.status === 0
+      ? 'public named imports succeed'
+      : childFailure(publicResult) || 'public named imports failed'
+  )
 
   for (const name of [
     'columnHandleBrand',
@@ -35,10 +46,23 @@ test('ESM named imports match the public runtime exports', (t) => {
     'writeBufferManagerHandleBrand'
   ]) {
     const internalResult = importFromEntry([name])
+    const diagnostic = childFailure(internalResult)
+
+    t.error(
+      internalResult.error,
+      internalResult.error
+        ? diagnostic
+        : `${name} import child starts successfully`
+    )
     t.notEqual(internalResult.status, 0, `${name} is not a runtime export`)
+    const missingNamedExport = internalResult.stderr?.includes(
+      `Named export '${name}' not found`
+    )
     t.ok(
-      internalResult.stderr.includes(`Named export '${name}' not found`),
-      `${name} fails as a missing named export`
+      missingNamedExport,
+      missingNamedExport
+        ? `${name} fails as a missing named export`
+        : diagnostic || `${name} did not fail as a missing named export`
     )
   }
 
