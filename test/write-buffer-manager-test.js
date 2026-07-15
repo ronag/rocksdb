@@ -194,10 +194,12 @@ test('memTableHugePageSize: accepted per column', async (t) => {
   t.end()
 })
 
-test('ioUringAvailable: returns boolean on linux, null elsewhere', (t) => {
+test('ioUringAvailable: reports RocksDB async-I/O capability', (t) => {
   const available = ioUringAvailable()
   if (process.platform === 'linux') {
-    t.equal(typeof available, 'boolean')
+    // The package's RocksDB target does not define ROCKSDB_IOURING_PRESENT.
+    // A capable host kernel alone must therefore not produce a false positive.
+    t.equal(available, false, 'a binary without the io_uring path reports false')
   } else {
     t.equal(available, null)
   }

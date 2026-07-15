@@ -9,6 +9,7 @@
 #include <rocksdb/convenience.h>
 #include <rocksdb/db.h>
 #include <rocksdb/env.h>
+#include <rocksdb/file_system.h>
 #include <rocksdb/filter_policy.h>
 #include <rocksdb/merge_operator.h>
 #include <rocksdb/options.h>
@@ -44,19 +45,6 @@
 #if defined(ROCKS_LEVEL_TEST_FAULTS)
 #include <stdexcept>
 #include <cstdlib>
-#endif
-
-#ifdef __linux__
-#include <sys/syscall.h>
-#include <unistd.h>
-
-#include <cerrno>
-
-// Older libc headers may lack the SYS_ alias for io_uring_setup even though
-// the kernel number (__NR_) is available — keep the Linux probe a boolean.
-#if !defined(SYS_io_uring_setup) && defined(__NR_io_uring_setup)
-#define SYS_io_uring_setup __NR_io_uring_setup
-#endif
 #endif
 
 #include "max_rev_operator.h"
@@ -5161,32 +5149,36 @@ NAPI_METHOD(write_buffer_manager_get_usage) {
   return result;
 }
 
-// Probes whether io_uring is actually usable in this process: RocksDB gates its
-// async MultiGet / prefetch I/O on io_uring_setup succeeding at runtime and
-// falls back to serial reads SILENTLY when the syscall is denied (seccomp — the
-// default Docker/containerd profiles since late 2023 — or the
-// kernel.io_uring_disabled sysctl) or missing (ENOSYS). io_uring_setup(0, NULL)
-// never succeeds; a functional kernel rejects the arguments (EINVAL/EFAULT)
-// while a blocked one fails with EPERM/EACCES/ENOSYS before looking at them.
+static constexpr int64_t kAsyncIoSupported = int64_t{1} << rocksdb::FSSupportedOps::kAsyncIO;
+
+#if defined(ROCKS_LEVEL_TEST_FAULTS)
+static int64_t OverrideIoUringSupportedOpsForTest(int64_t supportedOps) {
+  const auto* const value = std::getenv("ROCKS_LEVEL_TEST_IO_URING_SUPPORTED_OPS");
+  if (value == nullptr) return supportedOps;
+
+  // Exercise the real public method with both outcomes without depending on
+  // the host kernel. This branch and environment variable do not exist in
+  // production builds.
+  if (value[0] == '0' && value[1] == '\0') return 0;
+  if (value[0] == '1' && value[1] == '\0') return kAsyncIoSupported;
+  return supportedOps;
+}
+#endif
+
+// Query the same FileSystem capability that RocksDB uses to decide whether to
+// issue async reads. It incorporates the compiled path, the application opt-in
+// hook and RocksDB's runtime probe with the exact queue depth and flags.
 NAPI_METHOD(io_uring_available) {
-#if defined(__linux__) && defined(SYS_io_uring_setup)
-  errno = 0;
-  const long rc = syscall(SYS_io_uring_setup, 0, nullptr);
-  const bool available = rc >= 0 || (errno != ENOSYS && errno != EPERM && errno != EACCES);
-  if (rc >= 0) {
-    close(static_cast<int>(rc));
-  }
+#if defined(__linux__)
+  int64_t supportedOps = 0;
+  rocksdb::FileSystem::Default()->SupportedOps(supportedOps);
+
+#if defined(ROCKS_LEVEL_TEST_FAULTS)
+  supportedOps = OverrideIoUringSupportedOpsForTest(supportedOps);
+#endif
 
   napi_value result;
-  NAPI_STATUS_THROWS(napi_get_boolean(env, available, &result));
-
-  return result;
-#elif defined(__linux__)
-  // Built without any syscall number for io_uring_setup (pre-io_uring-era
-  // headers): this binary cannot use io_uring regardless of the running
-  // kernel, so report it unavailable — the Linux contract stays boolean.
-  napi_value result;
-  NAPI_STATUS_THROWS(napi_get_boolean(env, false, &result));
+  NAPI_STATUS_THROWS(napi_get_boolean(env, (supportedOps & kAsyncIoSupported) != 0, &result));
 
   return result;
 #else
