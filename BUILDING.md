@@ -14,8 +14,11 @@ Nothing extra to run.
 
 The Node.js runtime is TypeScript in `src/`. The package `prepare` lifecycle
 compiles it to the gitignored `lib/` directory during source installs and before
-publication. Run `npm run build` directly for a standalone typecheck and build;
-`npm test` always rebuilds the runtime before executing the test suite.
+publication. As in `nxtedition/lib`, `npm run typecheck` uses the no-emit
+`tsconfig.json`, while `npm run build` cleans `lib/` and emits with
+`tsconfig.build.json`. TypeScript and rimraf remain development dependencies;
+npm installs both dependency sets before running `prepare` for Git installs.
+`npm test` runs typechecking and a clean build before executing the test suite.
 
 # Generating prebuilds
 

@@ -1,21 +1,18 @@
 {
   "compilerOptions": {
-    "target": "ES2024",
+    "lib": ["es2025"],
     "module": "NodeNext",
-    "moduleResolution": "NodeNext",
+    "target": "es2025",
     "moduleDetection": "force",
-    "rootDir": "src",
-    "outDir": "lib",
-    "noEmitOnError": true,
-    "sourceMap": true,
-    "inlineSources": true,
     "strict": true,
     "noImplicitAny": false,
     "useUnknownInCatchVariables": false,
+    "allowJs": false,
     "esModuleInterop": true,
     "forceConsistentCasingInFileNames": true,
-    "skipLibCheck": false,
+    "skipLibCheck": true,
+    "noEmit": true,
     "types": ["node"]
   },
-  "include": ["src/**/*.ts"]
+  "include": ["src"]
 }
