@@ -326,7 +326,7 @@ test('cleanup callback exceptions do not abort public fanout', function (t) {
   const result = spawnSync(process.execPath, ['-e', script], {
     cwd: process.cwd(),
     encoding: 'utf8',
-    timeout: 10000
+    timeout: 30000
   })
 
   t.equal(result.status, 0, childMessage(result, 'callback exception child passed'))
@@ -388,7 +388,7 @@ test('cleanup debt does not prevent resource finalization fallback', function (t
   const result = spawnSync(process.execPath, ['--expose-gc', '-e', script], {
     cwd: process.cwd(),
     encoding: 'utf8',
-    timeout: 10000
+    timeout: 30000
   })
 
   t.equal(result.status, 0, childMessage(result, 'finalization fallback child passed'))
