@@ -489,12 +489,12 @@ test('public iterator all aggregates read and cleanup errors', async function (t
   const db = testCommon.factory()
   await db.open()
   const iterator = db.iterator()
-  const originalNextv = binding.iterator_nextv
+  const originalInitNextv = binding.iterator_init_nextv
   const originalClose = binding.iterator_close_sync
   const readError = new Error('iterator all read failed')
   const cleanupError = new Error('iterator all cleanup failed')
 
-  binding.iterator_nextv = function (...args) {
+  binding.iterator_init_nextv = function (...args) {
     process.nextTick(args.at(-1), readError)
   }
   binding.iterator_close_sync = function () { throw cleanupError }
@@ -508,7 +508,7 @@ test('public iterator all aggregates read and cleanup errors', async function (t
     t.equal(err.cause, readError, 'read failure remains the primary cause')
     t.equal(args[1], undefined, 'failed read has no rows')
   } finally {
-    binding.iterator_nextv = originalNextv
+    binding.iterator_init_nextv = originalInitNextv
     binding.iterator_close_sync = originalClose
   }
 
@@ -522,23 +522,23 @@ test('concurrent explicit close and all both own cleanup failure', async functio
   await db.open()
   await db.put('key', 'value')
   const iterator = db.iterator()
-  const originalNextv = binding.iterator_nextv
+  const originalInitNextv = binding.iterator_init_nextv
   const originalClose = binding.iterator_close_sync
   const cleanupError = new Error('concurrent iterator cleanup failed')
-  let captureNextv
-  const nextvCaptured = new Promise((resolve) => { captureNextv = resolve })
+  let captureInitNextv
+  const initNextvCaptured = new Promise((resolve) => { captureInitNextv = resolve })
 
-  binding.iterator_nextv = function (...args) {
-    captureNextv(args)
+  binding.iterator_init_nextv = function (...args) {
+    captureInitNextv(args)
   }
   binding.iterator_close_sync = function () { throw cleanupError }
 
   try {
     const all = callbackArguments((complete) => iterator.all(complete))
-    const heldNextv = await nextvCaptured
+    const heldInitNextv = await initNextvCaptured
 
     const close = rejection(iterator.close())
-    originalNextv(...heldNextv)
+    originalInitNextv(...heldInitNextv)
 
     const [args, closeError] = await Promise.all([all, close])
     t.equal(args.length, 2, 'all callback keeps exactly (err, rows)')
@@ -546,7 +546,7 @@ test('concurrent explicit close and all both own cleanup failure', async functio
     t.deepEqual(args[1], [['key', 'value']], 'all retains rows completed before cleanup')
     t.equal(closeError, cleanupError, 'concurrent explicit close owns the same failure')
   } finally {
-    binding.iterator_nextv = originalNextv
+    binding.iterator_init_nextv = originalInitNextv
     binding.iterator_close_sync = originalClose
   }
 

@@ -267,6 +267,24 @@ try {
     return rows * 1000 / duration
   })
 
+  await measure('steady', 'steady public nextv(256)', 'M rows/s', async () => {
+    const iterator = db.iterator(options)
+    await iterator.nextv(1)
+    iterator._refreshSync()
+
+    let rows = 0
+    const start = process.hrtime.bigint()
+    while (rows < rowCount) {
+      const entries = await iterator.nextv(batchSize)
+      assert(entries.length > 0)
+      rows += entries.length
+    }
+    const duration = elapsedNs(start)
+    await iterator.close()
+    assert.equal(rows, rowCount)
+    return rows * 1000 / duration
+  })
+
   const publicIteration = async (trackEventLoopDelay) => {
     const iterator = db.iterator(options)
     await iterator._nextvAsync(1, { packed: false })

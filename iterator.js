@@ -42,8 +42,13 @@ const kValueEncoding = Symbol('valueEncoding')
 const kSeekSync = Symbol('seekSync')
 const kNextvSync = Symbol('nextvSync')
 const kNextvAsync = Symbol('nextvAsync')
+const kInitNextvAsync = Symbol('initNextvAsync')
+const kCompleteNextv = Symbol('completeNextv')
+const kFinishInitialization = Symbol('finishInitialization')
+const kPublicFirstUse = Symbol('publicFirstUse')
 
 const kEmpty = Object.freeze([])
+const noFieldsNextOptions = Object.freeze({ [kNoFieldsNext]: true })
 const DEBUG = process.env.NODE_ENV !== 'production'
 
 const kUninitialized = 0
@@ -261,6 +266,7 @@ class Iterator extends AbstractIterator {
       this[kCleanupDebtClose] = null
       this[kCloseLanded] = false
       this[kPublicSeek] = false
+      this[kPublicFirstUse] = false
       if (DEBUG) this[kUnsafeBusy] = false
     } catch (err) {
       // AbstractIterator attaches itself to the database in super(). A failed
@@ -360,6 +366,36 @@ class Iterator extends AbstractIterator {
     }
   }
 
+  [kFinishInitialization] (err) {
+    let initialized = !err
+    if (err) {
+      try {
+        // A combined worker may fail after initialization (for example,
+        // while reading or converting the first batch). Such errors stay
+        // recoverable by seek and must not become sticky init failures.
+        // This native probe only reads protected in-memory state; all
+        // RocksDB work has already completed on the worker.
+        initialized = binding.iterator_is_initialized(this[kContext])
+      } catch (stateError) {
+        err = new AggregateError(
+          [err, stateError],
+          'Iterator read failed and its initialization state could not be determined',
+          { cause: err }
+        )
+      }
+    }
+
+    if (!initialized) {
+      this[kInitState] = kFailed
+      this[kInitError] = err
+    } else {
+      this[kInitState] = kReady
+    }
+    this[kInitialTarget] = null
+
+    return err
+  }
+
   [Symbol.asyncDispose] () {
     return this.close()
   }
@@ -375,7 +411,19 @@ class Iterator extends AbstractIterator {
 
   nextv (size, options, callback) {
     if (DEBUG) assert(!this[kUnsafeBusy], 'public nextv() must not overlap an unsafe operation')
-    if (!this[kBusy] || this[kCloseRequested]) return super.nextv(size, options, callback)
+    if (!this[kBusy] || this[kCloseRequested]) {
+      const previous = this[kPublicFirstUse]
+      // Explicit read options are inspected only after lazy initialization in
+      // the existing path. Keep that exception/access ordering; the common
+      // no-options form can safely initialize and read in one worker.
+      this[kPublicFirstUse] = options === undefined ||
+        typeof options === 'function' || options === noFieldsNextOptions
+      try {
+        return super.nextv(size, options, callback)
+      } finally {
+        this[kPublicFirstUse] = previous
+      }
+    }
 
     callback = fromCallback(typeof options === 'function' ? options : callback, kPromise)
     const err = Number.isInteger(size)
@@ -408,8 +456,14 @@ class Iterator extends AbstractIterator {
         callback(combineIteratorCleanupError(err, cleanupError) || null, entries)
       }
 
-      if (options === undefined) super.all(complete)
-      else super.all(options, complete)
+      const previous = this[kPublicFirstUse]
+      this[kPublicFirstUse] = true
+      try {
+        if (options === undefined) super.all(complete)
+        else super.all(options, complete)
+      } finally {
+        this[kPublicFirstUse] = previous
+      }
       return promise
     }
 
@@ -592,31 +646,7 @@ class Iterator extends AbstractIterator {
 
     const complete = (err, result) => {
       if (initialize) {
-        let initialized = !err
-        if (err) {
-          try {
-            // A combined worker may fail after initialization (for example,
-            // while reading or converting the first batch). Such errors stay
-            // recoverable by seek and must not become sticky init failures.
-            // This native probe only reads protected in-memory state; all
-            // RocksDB work has already completed on the worker.
-            initialized = binding.iterator_is_initialized(this[kContext])
-          } catch (stateError) {
-            err = new AggregateError(
-              [err, stateError],
-              'Iterator read failed and its initialization state could not be determined',
-              { cause: err }
-            )
-          }
-        }
-
-        if (!initialized) {
-          this[kInitState] = kFailed
-          this[kInitError] = err
-        } else {
-          this[kInitState] = kReady
-        }
-        this[kInitialTarget] = null
+        err = this[kFinishInitialization](err)
       }
 
       if (err) {
@@ -682,9 +712,9 @@ class Iterator extends AbstractIterator {
       }
     }
 
-    if (options?.[kNoFieldsNext] === true) {
+    if (options === noFieldsNextOptions) {
       if (this[kPosition] < this[kCache].length || this[kFinished]) {
-        this[kNextvAsync](size, null, done, false)
+        this[kNextvAsync](size, null, done, false, false, this[kPublicFirstUse])
       } else {
         const prefetch = this[kFirst] ? 1 : 1000
         this[kFirst] = false
@@ -696,13 +726,13 @@ class Iterator extends AbstractIterator {
           this[kFinished] = result.finished
           this[kPosition] = 0
           done(null, this._nextvCached(size))
-        }, false)
+        }, false, false, this[kPublicFirstUse])
       }
 
       return callback[kPromise]
     }
 
-    this[kNextvAsync](size, options, done, false)
+    this[kNextvAsync](size, options, done, false, false, this[kPublicFirstUse])
 
     return callback[kPromise]
   }
@@ -857,17 +887,21 @@ class Iterator extends AbstractIterator {
     assertIteratorIdle(this, '_nextvAsync')
     callback = fromCallback(callback, kPromise)
     if (DEBUG) this[kUnsafeBusy] = true
-    return this[kNextvAsync](size, options, callback, packed, DEBUG)
+    return this[kNextvAsync](size, options, callback, packed, DEBUG, false)
   }
 
-  [kNextvAsync] (size, options, callback, packed, unsafe) {
+  [kNextvAsync] (size, options, callback, packed, unsafe, initialize) {
+    if (initialize && this[kInitState] === kUninitialized) {
+      return this[kInitNextvAsync](size, options, callback, unsafe)
+    }
+
     if (this[kInitState] !== kReady) {
       this._initialize((err) => {
         if (err) {
           if (unsafe) this[kUnsafeBusy] = false
           callback(err)
         } else {
-          this[kNextvAsync](size, options, callback, packed, unsafe)
+          this[kNextvAsync](size, options, callback, packed, unsafe, false)
         }
       })
       return callback[kPromise]
@@ -893,22 +927,7 @@ class Iterator extends AbstractIterator {
             ? binding.iterator_nextv_auto
             : binding.iterator_nextv
         nextv(this[kContext], size, options, (err, result) => {
-          if (unsafe) this[kUnsafeBusy] = false
-          if (err) {
-            callback(err)
-          } else {
-            let packedResult
-            try {
-              this[kFinished] = result.finished
-              packedResult = !('rows' in result)
-              result = convertIteratorResult(this, result)
-              setPackedResult(result, packedResult)
-            } catch (err) {
-              callback(err)
-              return
-            }
-            callback(null, result, packedResult)
-          }
+          this[kCompleteNextv](err, result, callback, unsafe)
         })
       }
     } catch (err) {
@@ -916,6 +935,56 @@ class Iterator extends AbstractIterator {
     }
 
     return callback[kPromise]
+  }
+
+  [kInitNextvAsync] (size, options, callback, unsafe) {
+    this[kInitState] = kInitializing
+    let initializationScheduled = false
+
+    const complete = (err, result) => {
+      err = this[kFinishInitialization](err)
+      this[kCompleteNextv](err, result, callback, unsafe)
+    }
+
+    try {
+      binding.iterator_init_nextv(
+        this[kContext],
+        this[kInitialTarget],
+        size,
+        options,
+        complete
+      )
+      initializationScheduled = true
+    } catch (err) {
+      let error = err
+      if (!initializationScheduled) error = this._cleanupFailedInitialization(error)
+      this[kInitState] = kFailed
+      this[kInitError] = error
+      this[kInitialTarget] = null
+      this._deferNextResult(callback, error, undefined, undefined, unsafe)
+    }
+
+    return callback[kPromise]
+  }
+
+  [kCompleteNextv] (err, result, callback, unsafe) {
+    if (unsafe) this[kUnsafeBusy] = false
+    if (err) {
+      callback(err)
+      return
+    }
+
+    let packedResult
+    try {
+      this[kFinished] = result.finished
+      packedResult = !('rows' in result)
+      result = convertIteratorResult(this, result)
+      setPackedResult(result, packedResult)
+    } catch (err) {
+      callback(err)
+      return
+    }
+    callback(null, result, packedResult)
   }
 
   _deferNextResult (callback, err, result, packed, unsafe) {
@@ -970,4 +1039,4 @@ class Iterator extends AbstractIterator {
 }
 
 exports.Iterator = Iterator
-exports.kNoFieldsNext = kNoFieldsNext
+exports.noFieldsNextOptions = noFieldsNextOptions
