@@ -1,7 +1,7 @@
 'use strict'
 
 const test = require('tape')
-const tempy = require('tempy')
+const temporaryDirectory = require('./temporary-directory')
 const fork = require('child_process').fork
 const path = require('path')
 const { RocksLevel } = require('..')
@@ -9,7 +9,7 @@ const { RocksLevel } = require('..')
 test('lock held by same process', async function (t) {
   t.plan(2)
 
-  const location = tempy.directory()
+  const location = temporaryDirectory()
   const db1 = new RocksLevel(location)
   await db1.open()
   const db2 = new RocksLevel(location)
@@ -27,7 +27,7 @@ test('lock held by same process', async function (t) {
 test('lock held by other process', function (t) {
   t.plan(6)
 
-  const location = tempy.directory()
+  const location = temporaryDirectory()
   const db = new RocksLevel(location)
 
   db.open(function (err) {

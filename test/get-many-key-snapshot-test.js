@@ -2,6 +2,7 @@
 
 const test = require('tape')
 const { spawnSync } = require('node:child_process')
+const temporaryDirectoryPath = JSON.stringify(require.resolve('./temporary-directory'))
 
 test('async getMany always snapshots Buffer and SliceLike keys before queueing', function (t) {
   const packagePath = JSON.stringify(require.resolve('..'))
@@ -9,7 +10,7 @@ test('async getMany always snapshots Buffer and SliceLike keys before queueing',
     'use strict'
     const assert = require('node:assert/strict')
     const { pbkdf2 } = require('node:crypto')
-    const tempy = require('tempy')
+    const temporaryDirectory = require(${temporaryDirectoryPath})
     const { RocksLevel } = require(${packagePath})
 
     const occupyWorker = () => new Promise((resolve, reject) => {
@@ -20,7 +21,7 @@ test('async getMany always snapshots Buffer and SliceLike keys before queueing',
     })
 
     ;(async () => {
-      const db = await RocksLevel.open(tempy.directory(), {
+      const db = await RocksLevel.open(temporaryDirectory(), {
         keyEncoding: 'buffer',
         valueEncoding: 'buffer'
       })

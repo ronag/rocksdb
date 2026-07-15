@@ -1,13 +1,13 @@
 'use strict'
 
 const test = require('tape')
-const tempy = require('tempy')
+const temporaryDirectory = require('./temporary-directory')
 const path = require('path')
 const fs = require('fs')
 const { RocksLevel } = require('..')
 
 test('creates location directory recursively', async function (t) {
-  const location = path.join(tempy.directory(), 'beep', 'boop')
+  const location = path.join(temporaryDirectory(), 'beep', 'boop')
   const db = new RocksLevel(location)
 
   t.is(fs.existsSync(location), false)
@@ -19,7 +19,7 @@ test('creates location directory recursively', async function (t) {
 test('does not create location directory recursively if createIfMissing is false', async function (t) {
   t.plan(3)
 
-  const location = path.join(tempy.directory(), 'beep', 'boop')
+  const location = path.join(temporaryDirectory(), 'beep', 'boop')
   const db = new RocksLevel(location, { createIfMissing: false })
 
   try {

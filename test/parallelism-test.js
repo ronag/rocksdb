@@ -1,14 +1,14 @@
 'use strict'
 
 const test = require('tape')
-const tempy = require('tempy')
+const temporaryDirectory = require('./temporary-directory')
 const { spawnSync } = require('node:child_process')
 const fs = require('node:fs')
 
 const modulePath = require.resolve('..')
 
 function runOpen (options, recover = false) {
-  const location = tempy.directory()
+  const location = temporaryDirectory()
   const script = `
     'use strict'
 

@@ -3,6 +3,7 @@
 const test = require('tape')
 const { spawnSync } = require('node:child_process')
 const binding = require('../binding')
+const temporaryDirectoryPath = JSON.stringify(require.resolve('./temporary-directory'))
 
 const nativeFaults = typeof binding.test_faults_enabled === 'function' &&
   binding.test_faults_enabled() === true
@@ -36,7 +37,7 @@ test('resource finalizers contain CloseResources exceptions', { skip: !nativeFau
   const script = `
     'use strict'
     const assert = require('node:assert/strict')
-    const tempy = require('tempy')
+    const temporaryDirectory = require(${temporaryDirectoryPath})
     const binding = require(${bindingPath})
 
     const open = (context, createIfMissing) => new Promise((resolve, reject) => {
@@ -53,7 +54,7 @@ test('resource finalizers contain CloseResources exceptions', { skip: !nativeFau
     })
 
     ;(async () => {
-      const location = tempy.directory()
+      const location = temporaryDirectory()
       let context = binding.db_init(location)
       await open(context, true)
       let batch = binding.batch_init(context)
@@ -105,7 +106,7 @@ test('public updates cleanup retries one native CloseResources exception', { ski
   const script = `
     'use strict'
     const assert = require('node:assert/strict')
-    const tempy = require('tempy')
+    const temporaryDirectory = require(${temporaryDirectoryPath})
     const { RocksLevel } = require(${packagePath})
 
     const rejection = async (promise) => {
@@ -118,7 +119,7 @@ test('public updates cleanup retries one native CloseResources exception', { ski
     }
 
     ;(async () => {
-      const location = tempy.directory()
+      const location = temporaryDirectory()
       const db = await RocksLevel.open(location)
       await db.put('key', 'value')
 
@@ -151,7 +152,7 @@ test('failed imported open retries a real pre-transfer cleanup exception', { ski
   const script = `
     'use strict'
     const assert = require('node:assert/strict')
-    const tempy = require('tempy')
+    const temporaryDirectory = require(${temporaryDirectoryPath})
     const { RocksLevel } = require(${packagePath})
 
     const rejection = async (promise) => {
@@ -164,7 +165,7 @@ test('failed imported open retries a real pre-transfer cleanup exception', { ski
     }
 
     ;(async () => {
-      const location = tempy.directory()
+      const location = temporaryDirectory()
       const source = await RocksLevel.open(location)
       await source.put('key', 'value')
 
@@ -200,7 +201,7 @@ test('database finalizer retries a pre-transfer close exception', { skip: !nativ
   const script = `
     'use strict'
     const assert = require('node:assert/strict')
-    const tempy = require('tempy')
+    const temporaryDirectory = require(${temporaryDirectoryPath})
     const binding = require(${bindingPath})
 
     const open = (context, createIfMissing) => new Promise((resolve, reject) => {
@@ -211,7 +212,7 @@ test('database finalizer retries a pre-transfer close exception', { skip: !nativ
     })
 
     ;(async () => {
-      const location = tempy.directory()
+      const location = temporaryDirectory()
       let context = binding.db_init(location)
       await open(context, true)
 
@@ -248,7 +249,7 @@ test('environment cleanup abandons a resource whose close throws', { skip: !nati
   const bindingPath = JSON.stringify(require.resolve('../binding'))
   const script = `
     'use strict'
-    const tempy = require('tempy')
+    const temporaryDirectory = require(${temporaryDirectoryPath})
     const binding = require(${bindingPath})
 
     const open = (context) => new Promise((resolve, reject) => {
@@ -259,7 +260,7 @@ test('environment cleanup abandons a resource whose close throws', { skip: !nati
       // Keep both externals alive until environment teardown. The cleanup hook
       // runs before their finalizers, observes the injected resource failure,
       // abandons that resource and retries the native database close.
-      globalThis.context = binding.db_init(tempy.directory())
+      globalThis.context = binding.db_init(temporaryDirectory())
       await open(globalThis.context)
       globalThis.updates = binding.updates_init(globalThis.context, { since: 0 })
       console.log('environment-cleanup-armed')
@@ -280,7 +281,7 @@ test('partial open exceptions restore state and consume cleanup handles once', {
   const script = `
     'use strict'
     const assert = require('node:assert/strict')
-    const tempy = require('tempy')
+    const temporaryDirectory = require(${temporaryDirectoryPath})
     const binding = require(${bindingPath})
 
     const open = (context, options) => new Promise((resolve, reject) => {
@@ -291,7 +292,7 @@ test('partial open exceptions restore state and consume cleanup handles once', {
     })
 
     ;(async () => {
-      const location = tempy.directory()
+      const location = temporaryDirectory()
       const columns = { default: {}, first: {}, second: {} }
       const context = binding.db_init(location)
 
@@ -330,7 +331,7 @@ test('terminal exception after ownership transfer releases the database', { skip
   const script = `
     'use strict'
     const assert = require('node:assert/strict')
-    const tempy = require('tempy')
+    const temporaryDirectory = require(${temporaryDirectoryPath})
     const { RocksLevel } = require(${packagePath})
 
     const rejection = async (promise) => {
@@ -343,7 +344,7 @@ test('terminal exception after ownership transfer releases the database', { skip
     }
 
     ;(async () => {
-      const location = tempy.directory()
+      const location = temporaryDirectory()
       const db = await RocksLevel.open(location)
       await db.put('key', 'value')
 
@@ -378,7 +379,7 @@ test('terminal exception classifies an imported final lease as closed', { skip: 
   const script = `
     'use strict'
     const assert = require('node:assert/strict')
-    const tempy = require('tempy')
+    const temporaryDirectory = require(${temporaryDirectoryPath})
     const { RocksLevel } = require(${packagePath})
 
     const rejection = async (promise) => {
@@ -391,7 +392,7 @@ test('terminal exception classifies an imported final lease as closed', { skip: 
     }
 
     ;(async () => {
-      const location = tempy.directory()
+      const location = temporaryDirectory()
       const source = await RocksLevel.open(location)
       await source.put('key', 'value')
       const imported = new RocksLevel(source.handle)
@@ -427,7 +428,7 @@ test('multi-column destruction exceptions finish terminal cleanup', { skip: !nat
   const script = `
     'use strict'
     const assert = require('node:assert/strict')
-    const tempy = require('tempy')
+    const temporaryDirectory = require(${temporaryDirectoryPath})
     const { RocksLevel } = require(${packagePath})
 
     const columns = { default: {}, first: {}, second: {} }
@@ -441,7 +442,7 @@ test('multi-column destruction exceptions finish terminal cleanup', { skip: !nat
     }
 
     ;(async () => {
-      const location = tempy.directory()
+      const location = temporaryDirectory()
       const db = await RocksLevel.open(location, { columns })
       await db.put('key', 'value')
 
