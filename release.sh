@@ -50,21 +50,38 @@ fi
 # Generate both platforms' prebuilds up front, before any version bump or
 # publish, so a build failure aborts the release with nothing changed.
 
+# Never let private CPU tuning leak into either public artifact. Exporting the
+# empty value here also covers every dependency build below, including Darwin
+# when the release shell started with ROCKS_LEVEL_MARCH set.
+export ROCKS_LEVEL_MARCH=
+
+# A caller may use ROCKS_LEVEL_DEPS_PREFIX for a one-off source build. Public
+# builds must instead use the dependencies created by their pinned build path:
+# Linux builds inside Docker, while the Darwin helper explicitly selects the
+# persistent deps/.prefix/darwin-arm64 populated below.
+unset ROCKS_LEVEL_DEPS_PREFIX
+
+# GYP_DEFINES is a generic caller escape hatch. Public builds accept their
+# audited project variables and explicit ROCKS_LEVEL_* inputs only; in
+# particular, a caller must not be able to re-enable native test fault hooks.
+unset GYP_DEFINES
+
 echo "Building linux prebuilds (docker)..."
-# build.sh runs the Docker image, which builds its deps (Zen 3-tuned) and the
-# prebuild inside the container, then extracts prebuilds/linux-x64.
+# build.sh still supports explicit tuned builds outside the release flow.
 ./build.sh
 
 echo "Building darwin-arm64 prebuilds (node $NODE_TARGET)..."
 # The local mac prebuild links re2/abseil/zstd statically, so build them into
-# deps/.prefix/darwin-arm64 first (portable/native tuning — Zen 3 is x86-only).
+# deps/.prefix/darwin-arm64 first with portable tuning. Generate into a staging
+# directory and atomically install only the validated known platform, preserving
+# the previous artifact if generation or installation fails.
 npm run build-deps
-JOBS=16 npx prebuildify -t "$NODE_TARGET" --napi --strip --arch arm64
+JOBS=16 ./scripts/build-darwin-prebuild.sh "$NODE_TARGET"
 
-echo "Testing darwin-arm64 prebuilds..."
-# PREBUILDS_ONLY makes node-gyp-build fail instead of silently falling back to
-# build/Release, proving the artifact that will be published actually loads.
-npm run test-prebuild
+echo "Checking release prebuild manifest..."
+# Validate both the working tree and npm's exact dry-run pack list. Extra
+# platform directories or native files abort before versioning or publishing.
+node scripts/check-release-prebuilds.js
 
 read -r -p "Version bump (patch/minor/major): " BUMP
 case "$BUMP" in

@@ -39,6 +39,22 @@ test('native dependencies use exact audited upstream commits', function (t) {
   t.end()
 })
 
+test('Linux prebuild base is pinned to the audited amd64 image manifest', function (t) {
+  const dockerfile = fs.readFileSync(path.join(__dirname, '..', 'Dockerfile'), 'utf8')
+  const from = dockerfile.match(/^FROM\s+(\S+)\s+AS\s+build$/m)?.[1]
+
+  t.equal(
+    from,
+    'node:26.4.0-bullseye@sha256:547115894d02507bae039a4eecdc0feb1ce337d7e7dcda5cd19d521bb29da4d3'
+  )
+  t.match(
+    dockerfile,
+    /FROM scratch AS artifact\nCOPY --from=build \/rocks-level\/prebuilds\/linux-x64\/@nxtedition\+rocksdb\.node \/@nxtedition\+rocksdb\.node/,
+    'the final stage exports exactly the validated addon'
+  )
+  t.end()
+})
+
 test('dependency checkout requires Git object-format support', function (t) {
   t.notOk(supportsSha1ObjectFormat('git version 2.26.3'), 'Git 2.26 is rejected')
   t.ok(supportsSha1ObjectFormat('git version 2.27.0'), 'Git 2.27 is accepted')
@@ -163,10 +179,15 @@ test('dependency cache stamp contains commits and rejects the old tag stamp', fu
 
 test('release tests the Darwin prebuild before changing package state', function (t) {
   const script = fs.readFileSync(path.join(__dirname, '..', 'release.sh'), 'utf8')
+  const helper = fs.readFileSync(path.join(__dirname, '..', 'scripts', 'build-darwin-prebuild.sh'), 'utf8')
+  const darwinBuildCommand = 'JOBS=16 ./scripts/build-darwin-prebuild.sh "$NODE_TARGET"'
   const clearFaults = script.indexOf('export ROCKS_LEVEL_TEST_FAULTS=0')
   const linuxBuild = script.indexOf('./build.sh')
-  const build = script.indexOf('JOBS=16 npx prebuildify')
-  const smokeTest = script.indexOf('npm run test-prebuild', build)
+  const build = script.indexOf(darwinBuildCommand)
+  const candidateInstall = helper.indexOf('mv "$CANDIDATE_DIR" "$TARGET_DIR"')
+  const smokeTest = helper.indexOf('npm run test-prebuild', candidateInstall)
+  const commit = helper.indexOf('COMMITTED=1', smokeTest)
+  const manifestCheck = script.indexOf('node scripts/check-release-prebuilds.js', build)
   const version = script.indexOf('npm version "$BUMP"')
   const publish = script.indexOf('npm publish --registry')
 
@@ -175,9 +196,110 @@ test('release tests the Darwin prebuild before changing package state', function
   t.ok(clearFaults < linuxBuild, 'fault injection is disabled before the Linux build')
   t.ok(clearFaults < build, 'fault injection is disabled before the Darwin build')
   t.ok(build >= 0, 'Darwin prebuild command exists')
-  t.ok(smokeTest > build, 'smoke test follows Darwin prebuild generation')
-  t.ok(version > smokeTest, 'smoke test precedes the version bump')
-  t.ok(publish > smokeTest, 'smoke test precedes publish')
-  t.equal((script.match(/npm run test-prebuild/g) || []).length, 1, 'release performs one local artifact smoke test')
+  t.ok(smokeTest > candidateInstall, 'the installed candidate is smoke-tested')
+  t.ok(commit > smokeTest, 'smoke failure remains inside the rollback boundary')
+  t.ok(manifestCheck > build, 'pack manifest is checked after artifact smoke testing')
+  t.ok(version > build, 'smoke-tested helper precedes the version bump')
+  t.ok(version > manifestCheck, 'pack manifest is checked before the version bump')
+  t.ok(publish > build, 'smoke-tested helper precedes publish')
+  t.ok(publish > manifestCheck, 'pack manifest is checked before publish')
+  t.equal(
+    ((script + helper).match(/npm run test-prebuild/g) || []).length,
+    1,
+    'release performs one local artifact smoke test'
+  )
+  t.end()
+})
+
+test('release stages and atomically installs only its known Darwin platform directory', function (t) {
+  const script = fs.readFileSync(path.join(__dirname, '..', 'release.sh'), 'utf8')
+  const helper = fs.readFileSync(path.join(__dirname, '..', 'scripts', 'build-darwin-prebuild.sh'), 'utf8')
+  const dependencies = script.indexOf('npm run build-deps')
+  const buildDarwin = script.indexOf('JOBS=16 ./scripts/build-darwin-prebuild.sh "$NODE_TARGET"')
+
+  t.ok(buildDarwin > dependencies, 'Darwin dependency failure leaves the prior artifact untouched')
+  t.match(helper, /--out "\$OUT_DIR"/, 'prebuildify writes to an isolated output root')
+  t.match(helper, /EXPECTED_PREBUILD="\$CANDIDATE_DIR\/\$ADDON"/, 'the staged addon is validated')
+  t.match(helper, /BACKUP_ROOT=.*backup/, 'the prior platform is backed up for rollback')
+  t.notOk(/rm -rf prebuilds(?:\s|$)/m.test(script), 'unrelated platform directories are not deleted')
+  t.end()
+})
+
+test('release clears private CPU tuning before every public build', function (t) {
+  const script = fs.readFileSync(path.join(__dirname, '..', 'release.sh'), 'utf8')
+  const clearTuning = script.indexOf('export ROCKS_LEVEL_MARCH=')
+  const linuxBuild = script.indexOf('./build.sh', clearTuning)
+  const darwinDependencies = script.indexOf('npm run build-deps', linuxBuild)
+  const darwinBuild = script.indexOf(
+    'JOBS=16 ./scripts/build-darwin-prebuild.sh "$NODE_TARGET"',
+    darwinDependencies
+  )
+
+  t.ok(clearTuning >= 0, 'the release environment clears CPU tuning')
+  t.ok(linuxBuild > clearTuning, 'Linux builds after tuning is cleared')
+  t.ok(darwinDependencies > linuxBuild, 'Darwin dependencies inherit the cleared value')
+  t.ok(darwinBuild > darwinDependencies, 'Darwin prebuild uses the portable dependencies')
+  t.equal(
+    (script.match(/^\s*(?:export\s+)?ROCKS_LEVEL_MARCH=/gm) || []).length,
+    1,
+    'there is one release-wide tuning assignment'
+  )
+  t.end()
+})
+
+test('release clears private dependency prefix overrides before public builds', function (t) {
+  const script = fs.readFileSync(path.join(__dirname, '..', 'release.sh'), 'utf8')
+  const helper = fs.readFileSync(path.join(__dirname, '..', 'scripts', 'build-darwin-prebuild.sh'), 'utf8')
+  const clearPrefix = script.indexOf('unset ROCKS_LEVEL_DEPS_PREFIX')
+  const linuxBuild = script.indexOf('./build.sh', clearPrefix)
+  const darwinDependencies = script.indexOf('npm run build-deps', linuxBuild)
+  const darwinBuild = script.indexOf(
+    'JOBS=16 ./scripts/build-darwin-prebuild.sh "$NODE_TARGET"',
+    darwinDependencies
+  )
+
+  t.ok(clearPrefix >= 0, 'the release environment clears private dependency overrides')
+  t.ok(linuxBuild > clearPrefix, 'the Linux public build starts with no caller prefix')
+  t.ok(darwinDependencies > linuxBuild, 'Darwin dependencies use their persistent prefix')
+  t.ok(darwinBuild > darwinDependencies, 'Darwin prebuild runs after its dependencies')
+  t.match(
+    helper,
+    /ROCKS_LEVEL_DEPS_PREFIX="\$DEPS_PREFIX" JOBS=/,
+    'the Darwin helper pins prebuildify to its matching persistent prefix'
+  )
+  t.equal(
+    (script.match(/^unset ROCKS_LEVEL_DEPS_PREFIX$/gm) || []).length,
+    1,
+    'there is one release-wide dependency override reset'
+  )
+  t.end()
+})
+
+test('public prebuild generation cannot inherit caller GYP definitions', function (t) {
+  const bindingGyp = fs.readFileSync(path.join(__dirname, '..', 'binding.gyp'), 'utf8')
+  const release = fs.readFileSync(path.join(__dirname, '..', 'release.sh'), 'utf8')
+  const helper = fs.readFileSync(path.join(__dirname, '..', 'scripts', 'build-darwin-prebuild.sh'), 'utf8')
+  const prebuildify = fs.readFileSync(path.join(__dirname, '..', 'scripts', 'prebuildify.js'), 'utf8')
+  const clearGyp = release.indexOf('unset GYP_DEFINES')
+  const linuxBuild = release.indexOf('./build.sh', clearGyp)
+  const darwinBuild = release.indexOf(
+    'JOBS=16 ./scripts/build-darwin-prebuild.sh "$NODE_TARGET"',
+    linuxBuild
+  )
+
+  t.match(
+    bindingGyp,
+    /"rocks_level_test_faults":\s*"<!\(node/,
+    'the fault variable is assigned rather than defined as an overridable default'
+  )
+  t.notOk(
+    /"rocks_level_test_faults%"/.test(bindingGyp),
+    'GYP_DEFINES cannot override the intended fault-test environment switch'
+  )
+  t.ok(clearGyp >= 0, 'the release clears caller GYP definitions')
+  t.ok(linuxBuild > clearGyp, 'the Linux public build follows the reset')
+  t.ok(darwinBuild > linuxBuild, 'the Darwin public build follows the reset')
+  t.match(helper, /GYP_DEFINES= ROCKS_LEVEL_DEPS_PREFIX=/, 'the Darwin helper also sanitizes GYP')
+  t.match(prebuildify, /GYP_DEFINES: ''/, 'the general prebuild helper also sanitizes GYP')
   t.end()
 })

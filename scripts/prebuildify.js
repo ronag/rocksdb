@@ -15,6 +15,7 @@ execFileSync(process.execPath, [require.resolve('prebuildify/bin.js'), '--napi',
   stdio: 'inherit',
   env: {
     ...process.env,
+    GYP_DEFINES: '',
     JOBS: buildDeps.jobs(),
     ROCKS_LEVEL_DEPS_PREFIX: prefix
   }
