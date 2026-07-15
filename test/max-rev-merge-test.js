@@ -5,7 +5,7 @@ const testCommon = require('./common')
 
 let db
 
-test('setUp db', function (t) {
+test('setUp db', async function (t) {
   db = testCommon.factory({
     valueEncoding: 'buffer',
     columns: {
@@ -14,7 +14,8 @@ test('setUp db', function (t) {
       }
     }
   })
-  db.open(t.end.bind(t))
+  await db.open()
+  t.end()
 })
 
 function makeVersion (str) {

@@ -18,81 +18,75 @@ make('updates yields put updates', async function (db, t, done) {
   done()
 })
 
-make('updates with since option skips earlier updates', function (db, t, done) {
-  db.put('four', '4', async function (err) {
-    t.ifError(err, 'no error from put()')
+make('updates with since option skips earlier updates', async function (db, t, done) {
+  await db.put('four', '4')
 
-    const allUpdates = []
-    for await (const update of db.updates()) {
-      allUpdates.push(update)
-    }
+  const allUpdates = []
+  for await (const update of db.updates()) {
+    allUpdates.push(update)
+  }
 
-    // The last update should be our put of 'four'
-    const last = allUpdates[allUpdates.length - 1]
-    const sinceUpdates = []
-    for await (const update of db.updates({ since: last.seq })) {
-      sinceUpdates.push(update)
-    }
+  // The last update should be our put of 'four'
+  const last = allUpdates[allUpdates.length - 1]
+  const sinceUpdates = []
+  for await (const update of db.updates({ since: last.seq })) {
+    sinceUpdates.push(update)
+  }
 
-    t.equal(sinceUpdates.length, 1, 'has exactly one update since last seq')
-    t.equal(sinceUpdates[0].seq, last.seq, 'seq matches')
+  t.equal(sinceUpdates.length, 1, 'has exactly one update since last seq')
+  t.equal(sinceUpdates[0].seq, last.seq, 'seq matches')
 
-    const rows = sinceUpdates[0].rows
-    t.equal(rows[0], 'put', 'operation is put')
-    t.equal(rows[1], 'four', 'key matches')
-    t.equal(rows[2], '4', 'value matches')
+  const rows = sinceUpdates[0].rows
+  t.equal(rows[0], 'put', 'operation is put')
+  t.equal(rows[1], 'four', 'key matches')
+  t.equal(rows[2], '4', 'value matches')
 
-    done()
-  })
+  done()
 })
 
-make('updates with del operations', function (db, t, done) {
-  db.del('one', async function (err) {
-    t.ifError(err, 'no error from del()')
+make('updates with del operations', async function (db, t, done) {
+  await db.del('one')
 
-    const allUpdates = []
-    for await (const update of db.updates()) {
-      allUpdates.push(update)
-    }
+  const allUpdates = []
+  for await (const update of db.updates()) {
+    allUpdates.push(update)
+  }
 
-    const last = allUpdates[allUpdates.length - 1]
-    const rows = last.rows
-    t.equal(rows[0], 'del', 'operation is del')
-    t.equal(rows[1], 'one', 'key matches')
+  const last = allUpdates[allUpdates.length - 1]
+  const rows = last.rows
+  t.equal(rows[0], 'del', 'operation is del')
+  t.equal(rows[1], 'one', 'key matches')
 
-    done()
-  })
+  done()
 })
 
-make('updates with batch operations', function (db, t, done) {
-  db.batch([
+make('updates with batch operations', async function (db, t, done) {
+  await db.batch([
     { type: 'put', key: 'x', value: '24' },
     { type: 'put', key: 'y', value: '25' },
     { type: 'del', key: 'one' }
-  ], async function (err) {
-    t.ifError(err, 'no error from batch()')
+  ])
 
-    const allUpdates = []
-    for await (const update of db.updates()) {
-      allUpdates.push(update)
-    }
+  const allUpdates = []
+  for await (const update of db.updates()) {
+    allUpdates.push(update)
+  }
 
-    const last = allUpdates[allUpdates.length - 1]
-    const rows = last.rows
-    // rows is a flat array with stride 4: [op, key, value, column, ...]
-    t.equal(rows[0], 'put', 'first op is put')
-    t.equal(rows[1], 'x', 'first key matches')
-    t.equal(rows[2], '24', 'first value matches')
+  const last = allUpdates[allUpdates.length - 1]
+  const rows = last.rows
+  // rows is a flat array with stride 4: [op, key, value, column, ...]
+  t.equal(rows[0], 'put', 'first op is put')
+  t.equal(rows[1], 'x', 'first key matches')
+  t.equal(rows[2], '24', 'first value matches')
 
-    t.equal(rows[4], 'put', 'second op is put')
-    t.equal(rows[5], 'y', 'second key matches')
-    t.equal(rows[6], '25', 'second value matches')
+  t.equal(rows[4], 'put', 'second op is put')
+  t.equal(rows[5], 'y', 'second key matches')
+  t.equal(rows[6], '25', 'second value matches')
 
-    t.equal(rows[8], 'del', 'third op is del')
-    t.equal(rows[9], 'one', 'third key matches')
+  t.equal(rows[8], 'del', 'third op is del')
+  t.equal(rows[9], 'one', 'third key matches')
 
-    done()
-  })
+  done()
 })
 
 make('updates since:0 returns all updates', async function (db, t, done) {

@@ -14,24 +14,25 @@ function makeTest (name, testFn) {
         return
       }
 
-      db.close(function (err) {
+      db.close().then(function () {
+        t.pass('no error from close()')
+        t.end()
+      }, function (err) {
         t.ifError(err, 'no error from close()')
         t.end()
       })
     }
-    db.open(function (err) {
-      t.ifError(err, 'no error from open()')
-      db.batch([
+    db.open().then(function () {
+      t.pass('no error from open()')
+      return db.batch([
         { type: 'put', key: 'one', value: '1' },
         { type: 'put', key: 'two', value: '2' },
         { type: 'put', key: 'three', value: '3' }
-      ], function (err) {
-        t.ifError(err, 'no error from batch()')
-        Promise.resolve()
-          .then(() => testFn(db, t, done))
-          .catch(done)
-      })
-    })
+      ])
+    }).then(function () {
+      t.pass('no error from batch()')
+      return testFn(db, t, done)
+    }).catch(done)
   })
 }
 

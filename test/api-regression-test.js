@@ -13,15 +13,38 @@ async function rejection (promise) {
   return null
 }
 
-test('put and del do not emit spurious batch events', async function (t) {
+test('open ignores callable options without observing their properties', async function (t) {
+  const db = testCommon.factory()
+  const options = () => {}
+  let passiveReads = 0
+  Object.defineProperty(options, 'passive', {
+    get () {
+      passiveReads++
+      throw new Error('callable options must be ignored')
+    }
+  })
+
+  let opening
+  t.doesNotThrow(() => {
+    opening = db.open(options)
+  }, 'open returns a promise instead of reading callable options synchronously')
+  await opening
+  t.equal(passiveReads, 0, 'open matches abstract-level and ignores callable options')
+
+  await db.close()
+  t.end()
+})
+
+test('mutations emit v3 write and clear events', async function (t) {
   const db = testCommon.factory()
   await db.open()
   const events = []
-  for (const name of ['put', 'del', 'batch']) db.on(name, () => events.push(name))
+  for (const name of ['write', 'clear']) db.on(name, () => events.push(name))
 
   await db.put('key', 'value')
   await db.del('key')
-  t.same(events, ['put', 'del'])
+  await db.clear()
+  t.same(events, ['write', 'write', 'clear'])
 
   await db.close()
   t.end()
@@ -176,7 +199,7 @@ test('flushWAL accepts boolean sync and validates other options', async function
   t.end()
 })
 
-test('array batch reports a foreign column through its callback', async function (t) {
+test('array batch rejects a foreign column', async function (t) {
   const first = testCommon.factory()
   const second = testCommon.factory()
   await Promise.all([
@@ -184,19 +207,10 @@ test('array batch reports a foreign column through its callback', async function
     second.open({ columns: { default: {}, records: {} } })
   ])
 
-  await new Promise((resolve) => {
-    let synchronous = true
-    t.doesNotThrow(() => {
-      first.batch([
-        { type: 'put', key: 'key', value: 'value', column: second.columns.records }
-      ], (err) => {
-        t.notOk(synchronous, 'callback is asynchronous')
-        t.equal(err && err.code, 'LEVEL_INVALID_COLUMN')
-        resolve()
-      })
-    })
-    synchronous = false
-  })
+  const err = await rejection(first.batch([
+    { type: 'put', key: 'key', value: 'value', column: second.columns.records }
+  ]))
+  t.equal(err && err.code, 'LEVEL_INVALID_COLUMN')
 
   await Promise.all([first.close(), second.close()])
   t.end()
@@ -211,6 +225,119 @@ test('chained batch length remains readable after write and close', async functi
   t.equal(batch.length, 2, 'length after write')
   await batch.close()
   t.equal(batch.length, 2, 'length after idempotent close')
+  await db.close()
+  t.end()
+})
+
+test('public chained mutations defer reentrant database close', async function (t) {
+  for (const [name, mutate] of [
+    ['put', (batch, options) => batch.put('key', 'value', options)],
+    ['del', (batch, options) => batch.del('key', options)]
+  ]) {
+    const db = testCommon.factory()
+    await db.open()
+    const batch = db.batch()
+    let closing
+    let nestedError
+    let optionReads = 0
+    const options = {}
+    Object.defineProperty(options, 'sublevel', {
+      enumerable: true,
+      get () {
+        optionReads++
+        if (closing === undefined) {
+          closing = db.close()
+          try {
+            batch.put('nested', 'value')
+          } catch (err) {
+            nestedError = err
+          }
+        }
+        return null
+      }
+    })
+
+    let result
+    t.doesNotThrow(() => {
+      result = mutate(batch, options)
+    }, `${name} does not leak an unsafe assertion when its options close the database`)
+    t.equal(result, batch, `${name} completes its accepted synchronous mutation`)
+    t.equal(nestedError && nestedError.code, 'LEVEL_BATCH_NOT_OPEN',
+      `${name} rejects a later nested mutation once close is requested`)
+    await closing
+    t.ok(optionReads > 0, `${name} exercised the reentrant option accessor`)
+    t.equal(db.status, 'closed', `${name} lets the deferred database close land`)
+
+    await db.open({ createIfMissing: false })
+    t.equal(await db.get('key'), undefined, `${name} close discarded the unwritten batch`)
+    await db.close()
+  }
+
+  t.end()
+})
+
+test('public chained clear removes native and v3 private bookkeeping', async function (t) {
+  const db = testCommon.factory()
+  await db.open()
+  const hook = (op, batch) => batch.add({
+    type: 'put',
+    key: `hook:${op.key}`,
+    value: `hook:${op.value}`
+  })
+  const events = []
+  db.hooks.prewrite.add(hook)
+  db.on('write', operations => events.push(operations.map(op => op.key)))
+
+  const batch = db.batch()
+  batch._put('raw-before', 'raw-before')
+  batch.put('public-before', 'public-before')
+  batch.clear()
+  batch._put('raw-after', 'raw-after')
+  batch.put('public-after', 'public-after')
+  await batch.write()
+
+  t.same(await db.getMany([
+    'raw-before',
+    'public-before',
+    'hook:public-before',
+    'raw-after',
+    'public-after',
+    'hook:public-after'
+  ]), [undefined, undefined, undefined, 'raw-after', 'public-after', 'hook:public-after'],
+  'public clear removes earlier raw, public and queued prewrite operations')
+  t.same(events, [['public-after', 'hook:public-after']],
+    'public clear removes stale write-event metadata')
+
+  db.hooks.prewrite.delete(hook)
+  await db.close()
+  t.end()
+})
+
+test('raw chained _clear retains documented v3 private bookkeeping', async function (t) {
+  const db = testCommon.factory()
+  await db.open()
+  const hook = (op, batch) => batch.add({
+    type: 'put',
+    key: `hook:${op.key}`,
+    value: `hook:${op.value}`
+  })
+  const events = []
+  db.hooks.prewrite.add(hook)
+  db.on('write', operations => events.push(operations.map(op => op.key)))
+
+  const batch = db.batch()
+  batch.put('public-stale', 'public-stale')
+  batch._clear()
+  batch._put('raw-final', 'raw-final')
+  await batch.write()
+
+  t.same(await db.getMany(['public-stale', 'hook:public-stale', 'raw-final']),
+    [undefined, 'hook:public-stale', 'raw-final'],
+    'raw _clear clears native operations but cannot clear queued prewrite data')
+  t.same(events, [['public-stale', 'hook:public-stale']],
+    'raw _clear also leaves abstract-level write-event metadata intact')
+
+  db.hooks.prewrite.delete(hook)
   await db.close()
   t.end()
 })
@@ -331,7 +458,80 @@ test('single get never returns a partial marker', async function (t) {
   t.end()
 })
 
-test('getMany reports option accessor failures asynchronously', async function (t) {
+test('public get translates only the unchanged raw missing-key result', async function (t) {
+  const db = testCommon.factory()
+  await db.open()
+
+  t.equal(await db.get('missing'), undefined, 'a native missing key fulfills with undefined')
+  t.equal(await db.sublevel('sub').get('missing'), undefined,
+    'a sublevel missing key fulfills with undefined')
+
+  const expected = Object.assign(new Error('user option failed'), {
+    code: 'LEVEL_NOT_FOUND'
+  })
+  const options = {}
+  Object.defineProperty(options, 'valueEncoding', {
+    get () {
+      throw expected
+    }
+  })
+
+  t.equal(await rejection(db.get('key', options)), expected,
+    'a root option error with the legacy code retains identity')
+  t.equal(await rejection(db.sublevel('sub').get('key', options)), expected,
+    'a sublevel option error with the legacy code retains identity')
+
+  let invalidOptionReads = 0
+  const invalidOptions = {
+    get keyEncoding () {
+      invalidOptionReads++
+      throw expected
+    }
+  }
+  const invalidError = await rejection(db.get(null, invalidOptions))
+  t.equal(invalidError && invalidError.code, 'LEVEL_INVALID_KEY',
+    'single get validates its key before reading encodings')
+  t.equal(invalidOptionReads, 0, 'an invalid key prevents option accessor reads')
+
+  const hookError = Object.assign(new Error('subclass get failed'), {
+    code: 'LEVEL_NOT_FOUND'
+  })
+  class CustomGetLevel extends db.constructor {
+    async _get () {
+      throw hookError
+    }
+  }
+  const custom = await CustomGetLevel.open(db.handle)
+  t.equal(await rejection(custom.get('key')), hookError,
+    'a subclass v3 _get hook keeps standard public dispatch and error identity')
+
+  const validationError = new Error('subclass key validation failed')
+  const encodingError = new Error('encoding must not win validation ordering')
+  let encodingReads = 0
+  class CustomValidationLevel extends db.constructor {
+    _assertValidKey (key) {
+      if (key === 'invalid') throw validationError
+      return super._assertValidKey(key)
+    }
+  }
+  const validating = await CustomValidationLevel.open(db.handle)
+  const validationOptions = {
+    get keyEncoding () {
+      encodingReads++
+      throw encodingError
+    }
+  }
+  t.equal(await rejection(validating.get('invalid', validationOptions)), validationError,
+    'a subclass validator retains get ordering before encoding access')
+  t.equal(encodingReads, 0, 'custom invalid keys prevent encoding accessor reads')
+
+  await validating.close()
+  await custom.close()
+  await db.close()
+  t.end()
+})
+
+test('getMany rejects option accessor failures', async function (t) {
   const db = testCommon.factory()
   await db.open()
   const expected = new Error('timeout getter failed')
@@ -340,15 +540,11 @@ test('getMany reports option accessor failures asynchronously', async function (
     get: () => { throw expected }
   })
 
-  await new Promise((resolve) => {
-    let synchronous = true
-    db.getMany(['key'], options, (err) => {
-      t.notOk(synchronous, 'callback is asynchronous')
-      t.equal(err, expected, 'callback receives the accessor error')
-      resolve()
-    })
-    synchronous = false
-  })
+  let reading
+  t.doesNotThrow(() => {
+    reading = db.getMany(['key'], options)
+  }, 'returns a rejected promise instead of throwing')
+  t.equal(await rejection(reading), expected, 'promise preserves the accessor error')
 
   await db.close()
   t.end()
@@ -502,21 +698,11 @@ test('getMany does not inspect symbols on user options', async function (t) {
     }
   })
 
-  await new Promise((resolve) => {
-    let synchronous = true
-    try {
-      db.getMany([], options, (err, rows) => {
-        t.notOk(synchronous, 'callback is asynchronous')
-        t.error(err)
-        t.same(rows, [])
-        resolve()
-      })
-    } catch (err) {
-      t.fail(`threw synchronously: ${err.message}`)
-      resolve()
-    }
-    synchronous = false
-  })
+  let reading
+  t.doesNotThrow(() => {
+    reading = db.getMany([], options)
+  }, 'returns a promise without probing private symbols')
+  t.same(await reading, [])
   t.equal(symbolReads, 0, 'user options are not probed with private symbols')
 
   await db.close()
@@ -566,13 +752,13 @@ test('sublevel getMany preserves option accessor receivers', async function (t) 
   t.end()
 })
 
-test('put and del report option spread failures asynchronously', async function (t) {
+test('put and del reject option spread failures', async function (t) {
   const db = testCommon.factory()
   await db.open()
 
   for (const [name, options, invoke] of [
-    ['put', { keyEncoding: 'utf8', valueEncoding: 'utf8' }, (callback, value) => db.put('key', 'value', value, callback)],
-    ['del', { keyEncoding: 'utf8' }, (callback, value) => db.del('key', value, callback)]
+    ['put', { keyEncoding: 'utf8', valueEncoding: 'utf8' }, (value) => db.put('key', 'value', value)],
+    ['del', { keyEncoding: 'utf8' }, (value) => db.del('key', value)]
   ]) {
     const expected = new Error(`${name} option getter failed`)
     Object.defineProperty(options, name === 'put' ? 'sync' : 'lowPriority', {
@@ -580,36 +766,24 @@ test('put and del report option spread failures asynchronously', async function 
       get: () => { throw expected }
     })
 
-    await new Promise((resolve) => {
-      let synchronous = true
-      invoke((err) => {
-        t.notOk(synchronous, `${name} callback is asynchronous`)
-        t.equal(err, expected, `${name} callback receives the accessor error`)
-        resolve()
-      }, options)
-      synchronous = false
-    })
+    let writing
+    t.doesNotThrow(() => {
+      writing = invoke(options)
+    }, `${name} returns a rejected promise instead of throwing`)
+    t.equal(await rejection(writing), expected, `${name} preserves the accessor error`)
   }
 
   await db.close()
   t.end()
 })
 
-test('clear is asynchronous and covers keys beyond the old synthetic maximum', async function (t) {
+test('clear covers keys beyond the old synthetic maximum', async function (t) {
   const db = testCommon.factory({ keyEncoding: 'buffer' })
   await db.open()
   const veryLargeKey = Buffer.alloc(1_000_001, 0xff)
   await db.put(veryLargeKey, 'value')
 
-  await new Promise((resolve, reject) => {
-    let synchronous = true
-    db.clear((err) => {
-      t.notOk(synchronous, 'clear callback is asynchronous')
-      if (err) return reject(err)
-      resolve()
-    })
-    synchronous = false
-  })
+  await db.clear()
 
   t.same(await db.getMany([veryLargeKey]), [undefined], 'unbounded clear removed the large key')
   await db.close()

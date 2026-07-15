@@ -123,20 +123,6 @@ test('iterator with keys:false and values:false yields undefined pairs', async f
     'nextv drains the entry prefetched by next')
   t.same(await mixedIterator.all(), [], 'all sees natural exhaustion after mixed reads')
 
-  const callbackIterator = db.iterator({ keys: false, values: false })
-  await new Promise((resolve) => {
-    callbackIterator.next((err) => {
-      t.ok(err instanceof TypeError, 'callback next rejects the ambiguous result')
-      t.match(err.message, /use promise-style next\(\), nextv\(\) or all\(\)/,
-        'callback error points to unambiguous alternatives')
-      resolve()
-    })
-  })
-  t.is(callbackIterator.count, 0, 'rejected callback next does not consume an entry')
-  t.same(await callbackIterator.next(), [undefined, undefined],
-    'promise next can still consume the first entry')
-  await callbackIterator.close()
-
   let iterated = 0
   for await (const entry of db.iterator({ keys: false, values: false })) {
     t.same(entry, [undefined, undefined], `async iterator returns entry ${iterated + 1}`)
@@ -153,14 +139,9 @@ test('iterator with keys:false and values:false yields undefined pairs', async f
 
   const inheritedOptions = Object.create({ keys: false, values: false })
   const inheritedIterator = db.iterator(inheritedOptions)
-  await new Promise((resolve, reject) => {
-    inheritedIterator.next((err, key, value) => {
-      if (err) return reject(err)
-      t.is(key, 'a', 'inherited keys:false is ignored like abstract-level options')
-      t.is(value, '1', 'inherited values:false is ignored like abstract-level options')
-      resolve()
-    })
-  })
+  const [inheritedKey, inheritedValue] = await inheritedIterator.next()
+  t.is(inheritedKey, 'a', 'inherited keys:false is ignored like abstract-level options')
+  t.is(inheritedValue, '1', 'inherited values:false is ignored like abstract-level options')
   await inheritedIterator.close()
 
   const sublevel = db.sublevel('no-fields')

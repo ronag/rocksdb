@@ -5,6 +5,7 @@ const { RocksLevel } = require('..')
 const location = process.argv[2]
 const db = new RocksLevel(location)
 
-db.open(function (err) {
-  process.send(err)
-})
+db.open().then(
+  () => process.send(null),
+  (err) => process.send(err)
+)

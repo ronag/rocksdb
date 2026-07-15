@@ -45,12 +45,13 @@ function jsMax (revs) {
 
 let db
 
-test('maxRev edge setup', function (t) {
+test('maxRev edge setup', async function (t) {
   db = testCommon.factory({
     valueEncoding: 'buffer',
     columns: { default: { mergeOperator: 'maxRev' } }
   })
-  db.open(t.end.bind(t))
+  await db.open()
+  t.end()
 })
 
 test('maxRev: higher numeric revision wins regardless of leading zeros', async function (t) {

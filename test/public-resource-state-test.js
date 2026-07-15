@@ -122,9 +122,6 @@ test('public iterator busy admission stays outside raw hooks', async function (t
   const operations = [
     ['next', (iterator) => iterator.next()],
     ['nextv', (iterator) => iterator.nextv(1)],
-    ['nextv callback', (iterator) => new Promise((resolve, reject) => {
-      iterator.nextv(1, (err) => err ? reject(err) : resolve())
-    })],
     ['all', (iterator) => iterator.all()]
   ]
 
@@ -146,26 +143,6 @@ test('public iterator busy admission stays outside raw hooks', async function (t
     t.equal(err && err.code, 'LEVEL_ITERATOR_BUSY', `${name} reports public busy state`)
     await iterator.close()
   }
-
-  const callbackAll = db.iterator()
-  let callbackAllArgs
-  callbackAll.seek('a', {
-    keyEncoding: {
-      name: 'nested-all-callback-shape',
-      format: 'buffer',
-      encode (value) {
-        callbackAllArgs = new Promise(resolve => callbackAll.all((...args) => resolve(args)))
-        return Buffer.from(value)
-      },
-      decode: value => value.toString()
-    }
-  })
-  const busyAllArgs = await callbackAllArgs
-  t.equal(busyAllArgs.length, 2, 'busy all callback receives exactly (err, rows)')
-  t.equal(busyAllArgs[0] && busyAllArgs[0].code, 'LEVEL_ITERATOR_BUSY',
-    'busy all callback reports public busy state')
-  t.equal(busyAllArgs[1], undefined, 'busy all callback has no rows')
-  await callbackAll.close()
 
   const invalid = db.iterator()
   let invalidSize
@@ -213,53 +190,46 @@ test('public batch reads avoid the native mutex during write', async function (t
   }
 
   try {
-    for (const style of ['promise', 'callback']) {
-      const batch = db.batch()
-      batches.push(batch)
-      batch.put('first', 'value')
-      batch.del('second')
-      complete = null
+    const batch = db.batch()
+    batches.push(batch)
+    batch.put('first', 'value')
+    batch.del('second')
 
-      const writing = style === 'promise'
-        ? batch.write()
-        : new Promise((resolve, reject) => {
-          batch.write((err) => err ? reject(err) : resolve())
-        })
+    const writing = batch.write()
 
-      t.equal(typeof complete, 'function', `${style} write entered native code`)
-      t.equal(batch.length, 2, `${style} length uses the exact cached count while busy`)
-      t.equal(nativeCounts, 0, `${style} length does not enter native code`)
-      t.throws(
-        () => batch.toArray(),
-        hasCode('LEVEL_BATCH_BUSY'),
-        `${style} toArray fails fast instead of waiting for the native write mutex`
-      )
-      t.equal(nativeIterations, 0, `${style} busy toArray does not enter native code`)
+    t.equal(typeof complete, 'function', 'write entered native code')
+    t.equal(batch.length, 2, 'length uses the exact cached count while busy')
+    t.equal(nativeCounts, 0, 'length does not enter native code')
+    t.throws(
+      () => batch.toArray(),
+      hasCode('LEVEL_BATCH_BUSY'),
+      'toArray fails fast instead of waiting for the native write mutex'
+    )
+    t.equal(nativeIterations, 0, 'busy toArray does not enter native code')
 
-      const acceptedComplete = complete
-      const secondWriteError = await batch.write().then(() => null, err => err)
-      t.equal(secondWriteError && secondWriteError.code, 'LEVEL_BATCH_NOT_OPEN',
-        `${style} concurrent write is rejected by the public state machine`)
-      t.equal(complete, acceptedComplete, `${style} rejected write did not enter native code`)
-      t.throws(
-        () => batch.toArray(),
-        hasCode('LEVEL_BATCH_BUSY'),
-        `${style} rejected write does not clear the accepted write marker`
-      )
-      t.equal(nativeIterations, 0, `${style} marker race does not enter native code`)
+    const acceptedComplete = complete
+    const secondWriteError = await batch.write().then(() => null, err => err)
+    t.equal(secondWriteError && secondWriteError.code, 'LEVEL_BATCH_NOT_OPEN',
+      'concurrent write is rejected by the public state machine')
+    t.equal(complete, acceptedComplete, 'rejected write did not enter native code')
+    t.throws(
+      () => batch.toArray(),
+      hasCode('LEVEL_BATCH_BUSY'),
+      'rejected write does not clear the accepted write marker'
+    )
+    t.equal(nativeIterations, 0, 'marker race does not enter native code')
 
-      let closeSettled = false
-      const closing = batch.close().then(() => { closeSettled = true })
-      await new Promise(resolve => setImmediate(resolve))
-      t.equal(closeSettled, false, `${style} close waits for the public write`)
+    let closeSettled = false
+    const closing = batch.close().then(() => { closeSettled = true })
+    await new Promise(resolve => setImmediate(resolve))
+    t.equal(closeSettled, false, 'close waits for the public write')
 
-      complete(null)
-      await writing
-      await closing
+    complete(null)
+    await writing
+    await closing
 
-      t.equal(nativeCounts, 0, `${style} close preserves the cached count`)
-      t.equal(batch.length, 2, `${style} final cached count remains readable after close`)
-    }
+    t.equal(nativeCounts, 0, 'close preserves the cached count')
+    t.equal(batch.length, 2, 'final cached count remains readable after close')
   } finally {
     binding.batch_write = originalWrite
     binding.batch_count = originalCount

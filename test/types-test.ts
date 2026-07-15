@@ -59,6 +59,24 @@ expectType<AbstractLevel<RocksFormat, string, string>>(db)
 expectType<Promise<RocksLevel<string, string>>>(RocksLevel.open('/tmp/rocks-level-types'))
 expectType<boolean | null>(ioUringAvailable())
 
+const removedPublicCallback = (_err?: Error | null, _value?: unknown): void => {}
+// @ts-expect-error Standard open callbacks were removed by abstract-level v3
+void db.open(removedPublicCallback)
+// @ts-expect-error Standard close callbacks were removed by abstract-level v3
+void db.close(removedPublicCallback)
+// @ts-expect-error Standard get callbacks were removed by abstract-level v3
+void db.get('key', removedPublicCallback)
+// @ts-expect-error Standard getMany callbacks were removed by abstract-level v3
+void db.getMany(['key'], removedPublicCallback)
+// @ts-expect-error Standard put callbacks were removed by abstract-level v3
+void db.put('key', 'value', removedPublicCallback)
+// @ts-expect-error Standard del callbacks were removed by abstract-level v3
+void db.del('key', removedPublicCallback)
+// @ts-expect-error Standard array-batch callbacks were removed by abstract-level v3
+void db.batch([{ type: 'put', key: 'key', value: 'value' }], removedPublicCallback)
+// @ts-expect-error Standard clear callbacks were removed by abstract-level v3
+void db.clear(removedPublicCallback)
+
 const missingColumn = db.columns.missing
 expectType<RocksColumn | undefined>(missingColumn)
 // @ts-expect-error A dynamic column lookup must be narrowed before use as a handle
@@ -67,7 +85,7 @@ expectType<RocksColumn>(missingColumn)
 const defaultColumn = db.columns.default
 ok(defaultColumn)
 expectType<RocksColumn>(defaultColumn)
-expectType<Promise<string>>(db.get('key', { column: defaultColumn }))
+expectType<Promise<string | undefined>>(db.get('key', { column: defaultColumn }))
 
 const cache = new RocksCache({ capacity: 1024 })
 expectType<bigint>(cache.handle)
@@ -267,11 +285,14 @@ expectTrue<Equal<
   ReturnType<typeof publicValuesOnlyIterator[typeof Symbol.asyncIterator]>,
   AsyncGenerator<[undefined, string], void, unknown>
 >>()
-publicValuesOnlyIterator.next((err, key, value) => {
-  expectType<Error | null | undefined>(err)
-  expectType<undefined>(key)
-  expectType<string | undefined>(value)
-})
+// @ts-expect-error Public iterator callbacks were removed by abstract-level v3
+publicValuesOnlyIterator.next(() => {})
+// @ts-expect-error Public iterator callbacks were removed by abstract-level v3
+publicValuesOnlyIterator.nextv(1, {}, removedPublicCallback)
+// @ts-expect-error Public iterator callbacks were removed by abstract-level v3
+publicValuesOnlyIterator.all({}, removedPublicCallback)
+// @ts-expect-error Public iterator callbacks were removed by abstract-level v3
+publicValuesOnlyIterator.close(removedPublicCallback)
 
 const publicHexIterator = db.iterator({ valueEncoding: 'hex' })
 const publicHexRows = publicHexIterator._nextvAsync(10, { packed: false })
@@ -349,6 +370,10 @@ expectType<RocksPackedIteratorResult>(
 )
 
 const batch = db.batch()
+// @ts-expect-error Standard chained-batch write callbacks were removed by abstract-level v3
+void batch.write(removedPublicCallback)
+// @ts-expect-error Standard chained-batch close callbacks were removed by abstract-level v3
+void batch.close(removedPublicCallback)
 const batchParts: RocksBatchSlice = [Buffer.from('va'), slice, Buffer.from('ue')]
 batch._put(slice, Buffer.from('value'))
 batch._putParts([Buffer.from('k'), slice], batchParts)

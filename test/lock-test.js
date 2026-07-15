@@ -30,8 +30,8 @@ test('lock held by other process', function (t) {
   const location = temporaryDirectory()
   const db = new RocksLevel(location)
 
-  db.open(function (err) {
-    t.ifError(err, 'no open error')
+  db.open().then(function () {
+    t.pass('no open error')
 
     const child = fork(path.join(__dirname, 'lock.js'), [location])
 
@@ -46,7 +46,13 @@ test('lock held by other process', function (t) {
       t.is(code, 0, 'child exited normally')
       t.is(sig, null, 'not terminated due to signal')
 
-      db.close(t.ifError.bind(t))
+      db.close().then(function () {
+        t.pass('no close error')
+      }, function (err) {
+        t.ifError(err, 'no close error')
+      })
     })
+  }, function (err) {
+    t.ifError(err, 'no open error')
   })
 })

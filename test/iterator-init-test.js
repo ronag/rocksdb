@@ -266,20 +266,9 @@ test('failed initialization releases native resources and preserves its error', 
     t.equal(repeatedError, firstError, 'subsequent operations replay the same error object')
     t.equal(initCalls, 1, 'a terminal failure is not initialized again')
 
-    let synchronous = true
-    let callbackCalls = 0
-    const callbackError = await new Promise((resolve) => {
-      invalidValue.next((err) => {
-        callbackCalls++
-        t.equal(synchronous, false, 'failure callback is asynchronous')
-        resolve(err)
-      })
-      synchronous = false
-    })
-    await new Promise((resolve) => setImmediate(resolve))
-    t.match(callbackError && callbackError.message, /Invalid value filter regex/,
-      'invalid value regex reaches callback style')
-    t.equal(callbackCalls, 1, 'failure callback runs exactly once')
+    const valueError = await rejection(invalidValue.next())
+    t.match(valueError && valueError.message, /Invalid value filter regex/,
+      'invalid value regex rejects the public promise')
     t.equal(snapshotCount(db), 0, 'every failed iterator releases its snapshot')
     t.equal(initCalls, 2, 'each iterator attempted initialization once')
     t.equal(synchronousCloseCalls, 0, 'async failures clean up in their worker')
@@ -313,13 +302,7 @@ test('iterator close waits for held failed initialization cleanup', async functi
   let closing
   let cleanupError
   try {
-    let callbackCalls = 0
-    pending = new Promise((resolve) => {
-      iterator.next((err) => {
-        callbackCalls++
-        resolve(err)
-      })
-    })
+    pending = rejection(iterator.next())
     if (!heldInitialization.captured) {
       throw new Error('failing read did not enter the initializing state')
     }
@@ -337,7 +320,6 @@ test('iterator close waits for held failed initialization cleanup', async functi
       'the original initialization error reaches the read')
     await closing
     await new Promise((resolve) => setImmediate(resolve))
-    t.equal(callbackCalls, 1, 'the failed read callback settles exactly once')
     t.equal(closeSettled, true, 'close settles after worker-side failure cleanup')
     t.equal(snapshotCount(db), 0, 'worker-side failure cleanup releases the held snapshot')
   } finally {

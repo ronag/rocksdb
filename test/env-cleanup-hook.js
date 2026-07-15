@@ -21,38 +21,38 @@ function test (steps) {
   if (nextStep() !== 'open') {
     if (nextStep() === 'open-error') {
       // If opening fails the cleanup hook should be a noop.
-      db.open({ createIfMissing: false, errorIfExists: true }, function (err) {
-        if (!err) throw new Error('Expected an open() error')
-      })
+      db.open({ createIfMissing: false, errorIfExists: true }).then(function () {
+        throw new Error('Expected an open() error')
+      }, function () {})
     }
 
     return process.send(step)
   }
 
   // Open the db, expected to be closed by the cleanup hook.
-  db.open(function (err) {
-    if (err) throw err
-
+  db.open().then(function () {
     if (nextStep() === 'create-iterator') {
       // Create an iterator, expected to be closed by the cleanup hook.
       const it = db.iterator()
 
       if (nextStep() === 'nexting') {
         // This async work should finish before the cleanup hook is called.
-        it.next(function (err) {
-          if (err) throw err
+        it.next().catch(function (err) {
+          throw err
         })
       }
     }
 
     if (nextStep() === 'close') {
       // Close the db, after which the cleanup hook is a noop.
-      db.close(function (err) {
-        if (err) throw err
+      db.close().catch(function (err) {
+        throw err
       })
     }
 
     process.send(step)
+  }, function (err) {
+    throw err
   })
 }
 

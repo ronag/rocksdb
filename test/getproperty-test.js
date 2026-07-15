@@ -5,9 +5,10 @@ const testCommon = require('./common')
 
 let db
 
-test('setUp db', function (t) {
+test('setUp db', async function (t) {
   db = testCommon.factory()
-  db.open(t.end.bind(t))
+  await db.open()
+  t.end()
 })
 
 test('test argument-less getProperty() throws', function (t) {
@@ -114,8 +115,9 @@ test('test getProperties() batches values keyed by name', function (t) {
   t.end()
 })
 
-test('tearDown', function (t) {
-  db.close(t.end.bind(t))
+test('tearDown', async function (t) {
+  await db.close()
+  t.end()
 })
 
 test('getProperties() throws if db is closed', function (t) {
