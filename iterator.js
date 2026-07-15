@@ -457,7 +457,10 @@ class Iterator extends AbstractIterator {
       }
 
       const previous = this[kPublicFirstUse]
-      this[kPublicFirstUse] = true
+      // AbstractIterator currently substitutes its private empty options in
+      // _all(), so explicit caller options do not reach the native read. Keep
+      // their identity as a guard in case a future version forwards them.
+      this[kPublicFirstUse] = options === undefined ? true : options
       try {
         if (options === undefined) super.all(complete)
         else super.all(options, complete)
@@ -696,6 +699,9 @@ class Iterator extends AbstractIterator {
   _nextv (size, options, callback) {
     if (DEBUG) assert(!this[kUnsafeBusy], 'unsafe _nextv() must not overlap an unsafe operation')
     callback = fromCallback(callback, kPromise)
+    const publicFirstUse = this[kPublicFirstUse]
+    const combineInitialization = publicFirstUse === true ||
+      (typeof publicFirstUse === 'object' && publicFirstUse !== null && publicFirstUse !== options)
 
     const done = (err, val) => {
       if (err) {
@@ -714,7 +720,7 @@ class Iterator extends AbstractIterator {
 
     if (options === noFieldsNextOptions) {
       if (this[kPosition] < this[kCache].length || this[kFinished]) {
-        this[kNextvAsync](size, null, done, false, false, this[kPublicFirstUse])
+        this[kNextvAsync](size, null, done, false, false, combineInitialization)
       } else {
         const prefetch = this[kFirst] ? 1 : 1000
         this[kFirst] = false
@@ -726,13 +732,13 @@ class Iterator extends AbstractIterator {
           this[kFinished] = result.finished
           this[kPosition] = 0
           done(null, this._nextvCached(size))
-        }, false, false, this[kPublicFirstUse])
+        }, false, false, combineInitialization)
       }
 
       return callback[kPromise]
     }
 
-    this[kNextvAsync](size, options, done, false, false, this[kPublicFirstUse])
+    this[kNextvAsync](size, options, done, false, false, combineInitialization)
 
     return callback[kPromise]
   }

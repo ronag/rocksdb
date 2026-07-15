@@ -182,6 +182,19 @@ try {
     return median(latencies)
   })
 
+  await measure('first-use', 'first all(limit=1, explicit options) sequential p50', 'us/op', async () => {
+    const latencies = []
+    for (let index = 0; index < firstUseCount; index++) {
+      const iterator = db.iterator(limitOneOptions)
+      const start = process.hrtime.bigint()
+      const entries = await iterator.all({})
+      assert.equal(entries.length, 1)
+      latencies.push(elapsedNs(start) / 1000)
+      await iterator.close()
+    }
+    return median(latencies)
+  })
+
   for (const [name, iteratorOptions] of [
     ['construct + first next default p50', options],
     ['construct + first next bounded + filter p50', filteredOptions]
