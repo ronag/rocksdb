@@ -35,7 +35,8 @@ function fixture () {
 
   executable(path.join(bin, 'npx'), `#!/bin/bash
 set -euo pipefail
-printf 'JOBS=%s %s\\n' "\${JOBS:-}" "$*" >> "$FAKE_NPX_LOG"
+printf 'JOBS=%s ROCKS_LEVEL_DEPS_PREFIX=%s %s\\n' \
+  "\${JOBS:-}" "\${ROCKS_LEVEL_DEPS_PREFIX:-}" "$*" >> "$FAKE_NPX_LOG"
 if [ "\${FAKE_PREBUILDIFY_MODE:-success}" = "fail" ]; then
   exit 42
 fi
@@ -170,7 +171,7 @@ test('Darwin prebuild generation stages and atomically replaces only its platfor
     t.equal(fs.readFileSync(path.join(context.linux, addon), 'utf8'), 'linux', 'Linux is untouched')
     t.match(
       fs.readFileSync(context.log, 'utf8'),
-      /^JOBS=16 prebuildify -t 26\.4\.0 --napi --strip --arch arm64 --out prebuilds\/\.darwin-arm64-out\./,
+      /^JOBS=16 ROCKS_LEVEL_DEPS_PREFIX=.*\/deps\/\.prefix\/darwin-arm64 prebuildify -t 26\.4\.0 --napi --strip --arch arm64 --out prebuilds\/\.darwin-arm64-out\./,
       'prebuildify writes to a same-filesystem staging root'
     )
     t.equal(
@@ -179,6 +180,27 @@ test('Darwin prebuild generation stages and atomically replaces only its platfor
       'the installed candidate is smoke-tested before commit'
     )
     assertNoTemporaryPlatforms(t, context)
+  } finally {
+    fs.rmSync(context.root, { recursive: true, force: true })
+  }
+
+  t.end()
+})
+
+test('Darwin prebuild generation pins its persistent dependency prefix', function (t) {
+  const context = fixture()
+
+  try {
+    const result = runBuild(context, { ROCKS_LEVEL_DEPS_PREFIX: '/tmp/rogue' })
+    const log = fs.readFileSync(context.log, 'utf8')
+
+    t.equal(result.status, 0, result.stderr || 'Darwin prebuild generation succeeds')
+    t.match(
+      log,
+      /^JOBS=16 ROCKS_LEVEL_DEPS_PREFIX=.*\/deps\/\.prefix\/darwin-arm64 prebuildify /,
+      'prebuildify uses the freshly built persistent prefix'
+    )
+    t.notOk(/\/tmp\/rogue/.test(log), 'the caller dependency prefix is not forwarded')
   } finally {
     fs.rmSync(context.root, { recursive: true, force: true })
   }

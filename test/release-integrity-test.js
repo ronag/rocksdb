@@ -246,3 +246,31 @@ test('release clears private CPU tuning before every public build', function (t)
   )
   t.end()
 })
+
+test('release clears private dependency prefix overrides before public builds', function (t) {
+  const script = fs.readFileSync(path.join(__dirname, '..', 'release.sh'), 'utf8')
+  const helper = fs.readFileSync(path.join(__dirname, '..', 'scripts', 'build-darwin-prebuild.sh'), 'utf8')
+  const clearPrefix = script.indexOf('unset ROCKS_LEVEL_DEPS_PREFIX')
+  const linuxBuild = script.indexOf('./build.sh', clearPrefix)
+  const darwinDependencies = script.indexOf('npm run build-deps', linuxBuild)
+  const darwinBuild = script.indexOf(
+    'JOBS=16 ./scripts/build-darwin-prebuild.sh "$NODE_TARGET"',
+    darwinDependencies
+  )
+
+  t.ok(clearPrefix >= 0, 'the release environment clears private dependency overrides')
+  t.ok(linuxBuild > clearPrefix, 'the Linux public build starts with no caller prefix')
+  t.ok(darwinDependencies > linuxBuild, 'Darwin dependencies use their persistent prefix')
+  t.ok(darwinBuild > darwinDependencies, 'Darwin prebuild runs after its dependencies')
+  t.match(
+    helper,
+    /ROCKS_LEVEL_DEPS_PREFIX="\$DEPS_PREFIX" JOBS=/,
+    'the Darwin helper pins prebuildify to its matching persistent prefix'
+  )
+  t.equal(
+    (script.match(/^unset ROCKS_LEVEL_DEPS_PREFIX$/gm) || []).length,
+    1,
+    'there is one release-wide dependency override reset'
+  )
+  t.end()
+})

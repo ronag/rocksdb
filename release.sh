@@ -55,6 +55,12 @@ fi
 # when the release shell started with ROCKS_LEVEL_MARCH set.
 export ROCKS_LEVEL_MARCH=
 
+# A caller may use ROCKS_LEVEL_DEPS_PREFIX for a one-off source build. Public
+# builds must instead use the dependencies created by their pinned build path:
+# Linux builds inside Docker, while the Darwin helper explicitly selects the
+# persistent deps/.prefix/darwin-arm64 populated below.
+unset ROCKS_LEVEL_DEPS_PREFIX
+
 echo "Building linux prebuilds (docker)..."
 # build.sh still supports explicit tuned builds outside the release flow.
 ./build.sh

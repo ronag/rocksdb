@@ -11,6 +11,7 @@ cd "$(dirname "$0")/.."
 PLATFORM=darwin-arm64
 ADDON=@nxtedition+rocksdb.node
 TARGET_DIR="prebuilds/$PLATFORM"
+DEPS_PREFIX="$PWD/deps/.prefix/$PLATFORM"
 OUT_DIR=
 CANDIDATE_DIR=
 BACKUP_ROOT=
@@ -91,7 +92,10 @@ CANDIDATE_DIR="$OUT_DIR/prebuilds/$PLATFORM"
 
 # prebuildify writes <out>/prebuilds/<platform>-<arch>. Keeping the output root
 # below prebuilds ensures the candidate and destination live on one filesystem.
-JOBS="${JOBS:-16}" npx prebuildify -t "$1" --napi --strip --arch arm64 --out "$OUT_DIR"
+# Pin the matching persistent dependency prefix just like scripts/prebuildify.js
+# so a caller's temporary ROCKS_LEVEL_DEPS_PREFIX cannot contaminate a release.
+ROCKS_LEVEL_DEPS_PREFIX="$DEPS_PREFIX" JOBS="${JOBS:-16}" \
+  npx prebuildify -t "$1" --napi --strip --arch arm64 --out "$OUT_DIR"
 
 EXPECTED_PREBUILD="$CANDIDATE_DIR/$ADDON"
 if [ ! -d "$CANDIDATE_DIR" ]; then
