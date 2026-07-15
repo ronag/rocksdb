@@ -1,28 +1,137 @@
 #!/bin/bash
-set -e
+set -euo pipefail
 
-# The Dockerfile targets x86-64 explicitly (znver3 march flags, prebuildify
-# --arch x64), so the image must be built for linux/amd64 even on arm64 hosts
-# (e.g. Apple Silicon), where it runs under emulation. Without this the native
-# arm64 gcc rejects -march=znver3 ("unknown value 'znver3'") and the build fails.
+# The published prebuild targets portable x86-64 explicitly, so the build must
+# use linux/amd64 even on arm64 hosts (e.g. Apple Silicon under emulation).
 PLATFORM=linux/amd64
+TARGET_DIR=prebuilds/linux-x64
+STAGE_DIR=
+BACKUP_ROOT=
+BACKUP_DIR=
+COMMITTED=0
+HAD_TARGET=0
+
+if [ -e "$TARGET_DIR" ] || [ -L "$TARGET_DIR" ]; then
+  HAD_TARGET=1
+fi
+
+cleanup_resources() {
+  local cleanup_status=0
+  local preserve_backup=0
+
+  if [ -n "$STAGE_DIR" ]; then
+    if rm -rf "$STAGE_DIR"; then
+      STAGE_DIR=
+    else
+      cleanup_status=1
+    fi
+  fi
+
+  if [ -n "$BACKUP_DIR" ] && { [ -e "$BACKUP_DIR" ] || [ -L "$BACKUP_DIR" ]; }; then
+    if [ "$COMMITTED" -eq 1 ]; then
+      :
+    else
+      if { [ -e "$TARGET_DIR" ] || [ -L "$TARGET_DIR" ]; } && ! rm -rf "$TARGET_DIR"; then
+        preserve_backup=1
+      elif ! mv "$BACKUP_DIR" "$TARGET_DIR"; then
+        preserve_backup=1
+      fi
+    fi
+  fi
+
+  if [ "$preserve_backup" -eq 1 ]; then
+    echo "Could not restore the prior Linux prebuild; preserved it at $BACKUP_DIR." >&2
+    cleanup_status=1
+  elif [ -n "$BACKUP_ROOT" ]; then
+    if rm -rf "$BACKUP_ROOT"; then
+      BACKUP_ROOT=
+      BACKUP_DIR=
+    else
+      cleanup_status=1
+    fi
+  fi
+
+  # If there was no prior platform, a failed mv or signal can arrive after the
+  # candidate rename but before COMMITTED is set. Remove that uncommitted target.
+  if [ "$COMMITTED" -eq 0 ] && [ "$HAD_TARGET" -eq 0 ] && \
+      { [ -e "$TARGET_DIR" ] || [ -L "$TARGET_DIR" ]; }; then
+    if ! rm -rf "$TARGET_DIR"; then
+      echo "Could not remove the uncommitted Linux prebuild at $TARGET_DIR; remove it manually." >&2
+      cleanup_status=1
+    fi
+  fi
+
+  return "$cleanup_status"
+}
+
+on_exit() {
+  local status=$?
+  trap - EXIT INT TERM
+  if ! cleanup_resources && [ "$status" -eq 0 ]; then
+    status=1
+  fi
+  exit "$status"
+}
+
+trap on_exit EXIT
+trap 'exit 130' INT
+trap 'exit 143' TERM
 
 echo "Initializing submodules..."
 git submodule update --init
 
-echo "Building image..."
-# JOBS caps build parallelism for the memory-heavy rocksdb compile (default 8,
-# see Dockerfile). Lower it (e.g. JOBS=4 ./build.sh) if the build still OOMs on
-# a memory-constrained Docker, or raise it on a large host.
-docker build --platform "$PLATFORM" ${JOBS:+--build-arg JOBS="$JOBS"} --iidfile prebuilds.iid .
+# BuildKit's local exporter writes the scratch artifact stage directly into a
+# same-filesystem candidate directory. No image or extraction container needs
+# to outlive docker build.
+mkdir -p prebuilds
+STAGE_DIR=$(mktemp -d "prebuilds/.linux-x64.XXXXXX")
 
-echo "Extracting prebuilds from image..."
-IMG=$(cat prebuilds.iid)
-ID=$(docker create --platform "$PLATFORM" $IMG)
-docker cp "$ID:/rocks-level/prebuilds" ./
+echo "Building and exporting prebuild..."
+# JOBS caps build parallelism for the memory-heavy rocksdb compile (default 8,
+# see Dockerfile). Lower it (e.g. JOBS=4 ./build.sh) on a memory-constrained
+# Docker host. ROCKS_LEVEL_MARCH is deliberately opt-in: the generic npm
+# prebuild must run on baseline x64.
+BUILD_ARGS=(
+  --platform "$PLATFORM"
+  --target artifact
+  --output "type=local,dest=$STAGE_DIR"
+)
+if [ -n "${JOBS:-}" ]; then
+  BUILD_ARGS+=(--build-arg "JOBS=$JOBS")
+fi
+if [ -n "${ROCKS_LEVEL_MARCH:-}" ]; then
+  BUILD_ARGS+=(--build-arg "ROCKS_LEVEL_MARCH=$ROCKS_LEVEL_MARCH")
+fi
+DOCKER_BUILDKIT=1 docker build "${BUILD_ARGS[@]}" .
+
+EXPECTED_PREBUILD="$STAGE_DIR/@nxtedition+rocksdb.node"
+EXTRACTED_ENTRIES=$(find "$STAGE_DIR" -mindepth 1 -maxdepth 1 -print | wc -l | tr -d ' ')
+if [ ! -f "$EXPECTED_PREBUILD" ] || [ -L "$EXPECTED_PREBUILD" ] || [ "$EXTRACTED_ENTRIES" -ne 1 ]; then
+  echo "Expected exactly one Linux prebuild named @nxtedition+rocksdb.node." >&2
+  exit 1
+fi
+chmod 0755 "$STAGE_DIR"
+
+# Preserve the prior known-good platform until the validated candidate is
+# installed. The backup child does not exist until the target rename succeeds.
+if [ -e "$TARGET_DIR" ] || [ -L "$TARGET_DIR" ]; then
+  BACKUP_ROOT=$(mktemp -d "prebuilds/.linux-x64-backup.XXXXXX")
+  BACKUP_DIR="$BACKUP_ROOT/linux-x64"
+  mv "$TARGET_DIR" "$BACKUP_DIR"
+fi
+
+if ! mv "$STAGE_DIR" "$TARGET_DIR"; then
+  echo "Could not install the staged Linux prebuild." >&2
+  exit 1
+fi
+COMMITTED=1
+STAGE_DIR=
 
 echo "Cleaning up..."
-docker rm $ID > /dev/null
-rm prebuilds.iid
+if ! cleanup_resources; then
+  trap - EXIT INT TERM
+  exit 1
+fi
+trap - EXIT INT TERM
 
 echo "All done!"

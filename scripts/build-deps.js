@@ -17,9 +17,9 @@
 //
 // Linux and macOS only, matching the Dockerfile/BUILDING.md-documented build.
 // Portable by default (no CPU-specific `-march`), so the end-user from-source
-// path works on any machine. Set ROCKS_LEVEL_MARCH=<arch> (e.g. znver3) to
-// tune the deps — the Docker prebuild flow does this for the shipped Linux
-// prebuild.
+// path works on any machine. Set ROCKS_LEVEL_MARCH=<arch> (e.g. znver2) to
+// tune the deps for an explicit private build. Public Linux prebuilds leave it
+// unset so they remain portable across x64 CPUs.
 //
 // The prefix carries a .stamp.json recording the exact upstream commits and
 // tuning that built it; ensure() wipes and rebuilds a prefix whose stamp
@@ -168,9 +168,8 @@ function macOsDeploymentFlags () {
 
 // Opt-in CPU tuning, off by default. The end-user from-source path leaves it
 // unset so the deps stay portable across whatever CPU runs `yarn install`.
-// The Docker prebuild-generation flow sets ROCKS_LEVEL_MARCH=znver3 so the
-// shipped Linux prebuild is tuned for the deployment servers — matching the
-// -march=znver3 the gyp files apply to rocksdb + binding.cc on linux-x64.
+// Private prebuild-generation flows can set ROCKS_LEVEL_MARCH so the native
+// dependencies match the tuning applied to rocksdb + binding.cc on linux-x64.
 function marchValue () {
   return process.env.ROCKS_LEVEL_MARCH || ''
 }

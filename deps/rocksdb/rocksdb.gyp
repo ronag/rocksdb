@@ -104,6 +104,33 @@
         [
           "OS == 'linux'",
           {
+            # GCC 10 implements the C++20 features used here except this one
+            # `using enum` form. Generate an exact patched header in gyp's
+            # shared intermediate tree, leaving the vendored submodule
+            # untouched. Keep the action Linux-only so Darwin and Windows
+            # consume the original header exactly as before.
+            "actions": [
+              {
+                "action_name": "generate_gcc10_rocksdb_header",
+                "inputs": [
+                  "<(module_root_dir)/scripts/patch-rocksdb-gcc10.js",
+                  "<(module_root_dir)/deps/rocksdb/rocksdb/include/rocksdb/db.h"
+                ],
+                "outputs": [
+                  "<(SHARED_INTERMEDIATE_DIR)/rocks-level-gcc10/include/rocksdb/db.h"
+                ],
+                "action": [
+                  "node",
+                  "<(module_root_dir)/scripts/patch-rocksdb-gcc10.js",
+                  "<(module_root_dir)/deps/rocksdb/rocksdb/include/rocksdb/db.h",
+                  "<(SHARED_INTERMEDIATE_DIR)/rocks-level-gcc10/include/rocksdb/db.h"
+                ]
+              }
+            ],
+            # binding.cc also includes rocksdb/db.h. Make this a hard
+            # dependency so its compile cannot race ahead of the generated
+            # Linux overlay under make -j.
+            "hard_dependency": 1,
             "defines": [
               "OS_LINUX=1",
               "ROCKSDB_FALLOCATE_PRESENT=1",
@@ -119,10 +146,19 @@
             # <(module_root_dir) into the command breaks on paths containing
             # spaces or quotes.
             "direct_dependent_settings": {
+              # Prepend the overlay so binding.cc sees it before the vendored
+              # include directory inherited from the target.
+              "include_dirs+": [
+                "<(SHARED_INTERMEDIATE_DIR)/rocks-level-gcc10/include/"
+              ],
               "libraries": [
                 "<!(node ../../scripts/resolve-lib.js zstd)",
               ],
             },
+            # Prepend for RocksDB's own sources as well as the dependent addon.
+            "include_dirs+": [
+              "<(SHARED_INTERMEDIATE_DIR)/rocks-level-gcc10/include/"
+            ],
             "include_dirs": [
               "<!(node ../../scripts/resolve-lib.js --prefix-include)",
               "/usr/lib/x86_64-linux-gnu/include",

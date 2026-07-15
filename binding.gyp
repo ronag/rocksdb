@@ -41,11 +41,11 @@
                         ],
                         "libraries": [
                             "<!(node scripts/resolve-lib.js re2)",
-                            "<!@(node scripts/resolve-lib.js absl)",
+                            "<!@(node scripts/resolve-lib.js --gyp-list absl)",
                         ],
                         "cflags_cc": [
                             "-flto",
-                            "-std=c++23",
+                            "-std=c++20",
                         ],
                         "cflags!": ["-fno-exceptions"],
                         "cflags_cc!": ["-fno-exceptions"],
@@ -86,7 +86,7 @@
                         # Homebrew install that a shipped prebuild can't assume.
                         "libraries": [
                             "<!(node scripts/resolve-lib.js re2)",
-                            "<!@(node scripts/resolve-lib.js absl)",
+                            "<!@(node scripts/resolve-lib.js --gyp-list absl)",
                         ],
                         "xcode_settings": {
                             "WARNING_CFLAGS": [

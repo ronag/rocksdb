@@ -2,13 +2,14 @@
 'use strict'
 
 // Prints the absolute path(s) of a static library for the .gyp files to link
-// against, at gyp-configure time (`<!(node scripts/resolve-lib.js <name>)>` /
-// `<!@(node scripts/resolve-lib.js <name>)>` for the multi-file abseil case).
+// against, at gyp-configure time. Single-value `<!()` consumers use the raw
+// default output. Multi-value `<!@()` consumers must request `--gyp-list`,
+// which shell-quotes each item for GYP's subsequent `shlex.split()` pass.
 //
-// Looks in the local from-source prefix first (populated by build-deps.js
-// when the npm/yarn install hook had no matching prebuild), then falls back
-// to the existing hardcoded system/Homebrew path that the Dockerfile/CI flow
-// still installs to. Multiple paths are printed one per line.
+// Looks in the local from-source prefix first (populated by build-deps.js when
+// the npm/yarn install hook had no matching prebuild, and by the Docker
+// prebuild flow), then falls back to pre-existing system/Homebrew archives.
+// Multiple paths are printed one per line.
 
 const fs = require('fs')
 const path = require('path')
@@ -16,11 +17,12 @@ const { prefixDir } = require('./deps-prefix.js')
 
 // Static-archive fallbacks for when the from-source prefix isn't populated —
 // i.e. a direct `node-gyp`/`prebuildify` invocation that bypassed install.js.
-// On Linux this is the /usr/local layout the Dockerfile/CI installs to.
-// Homebrew ships libre2.a but no abseil static libs, so a fully static mac
-// build genuinely requires the from-source prefix (built via `npm run
-// build-deps`); the darwin re2 fallback is best-effort for the rare local
-// build that happens to have a self-contained Homebrew re2.
+// On Linux, /usr/local remains a compatibility fallback for manually
+// provisioned build hosts; the current Docker flow populates the prefix above.
+// Homebrew ships libre2.a but no abseil static libs, so a fully static mac build
+// genuinely requires the from-source prefix (built via `npm run build-deps`);
+// the darwin re2 fallback is best-effort for the rare local build that happens
+// to have a self-contained Homebrew re2.
 const SYSTEM_FALLBACKS = {
   re2: {
     linux: ['/usr/local/lib/libre2.a'],
@@ -66,21 +68,34 @@ function resolve (name) {
   return existing(fallbackPaths)
 }
 
+function quoteGypListItem (item) {
+  const singleQuote = String.fromCodePoint(39)
+  const escapedSingleQuote = `${singleQuote}"${singleQuote}"${singleQuote}`
+  return `${singleQuote}${item.replaceAll(/'/g, escapedSingleQuote)}${singleQuote}`
+}
+
+function usageError (arg) {
+  console.error(
+    `rocks-level: unknown library or option '${arg}' — usage: resolve-lib.js ` +
+    `[--gyp-list] <${Object.keys(SYSTEM_FALLBACKS).join('|')}> | --prefix-include`
+  )
+  process.exit(1)
+}
+
 function main () {
-  const arg = process.argv[2]
+  const args = process.argv.slice(2)
+  const gypList = args[0] === '--gyp-list'
+  const arg = args[gypList ? 1 : 0]
+
+  if (args.length !== (gypList ? 2 : 1)) usageError(args.join(' '))
 
   if (arg === '--prefix-include') {
+    if (gypList) usageError(args.join(' '))
     console.log(path.join(prefixDir(), 'include'))
     return
   }
 
-  if (!Object.hasOwn(SYSTEM_FALLBACKS, arg)) {
-    console.error(
-      `rocks-level: unknown library '${arg}' — usage: resolve-lib.js ` +
-      `<${Object.keys(SYSTEM_FALLBACKS).join('|')}> | --prefix-include`
-    )
-    process.exit(1)
-  }
+  if (!Object.hasOwn(SYSTEM_FALLBACKS, arg)) usageError(arg)
 
   const found = resolve(arg)
   if (!found.length) {
@@ -93,7 +108,7 @@ function main () {
     process.exit(1)
   }
 
-  for (const p of found) console.log(p)
+  for (const p of found) console.log(gypList ? quoteGypListItem(p) : p)
 }
 
 main()
