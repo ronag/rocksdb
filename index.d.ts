@@ -887,4 +887,9 @@ export class RocksLevel<KDefault = string, VDefault = string>
   [Symbol.asyncDispose] (): Promise<void>
 }
 
+/**
+ * Whether RocksDB's default Linux filesystem has enabled its io_uring-backed
+ * async-I/O path. Returns `false` when it uses the serial fallback, or `null`
+ * on non-Linux platforms.
+ */
 export function ioUringAvailable (): boolean | null

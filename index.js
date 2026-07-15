@@ -1771,10 +1771,9 @@ exports.RocksCache = RocksCache
 exports.RocksWriteBufferManager = RocksWriteBufferManager
 exports.RocksStatistics = RocksStatistics
 
-// null on platforms where io_uring does not apply (non-Linux); boolean on
-// Linux, where `false` means RocksDB's async_io silently degrades to serial
-// reads (seccomp, kernel.io_uring_disabled, a kernel without io_uring, or a
-// binary built without an io_uring syscall number).
+// null on platforms where io_uring does not apply (non-Linux). On Linux, this
+// reports the same async-I/O capability used by RocksDB's default filesystem;
+// false means reads use the serial fallback.
 exports.ioUringAvailable = function ioUringAvailable () {
   return binding.io_uring_available()
 }
