@@ -22,6 +22,16 @@ import {
   ioUringAvailable
 } from '..'
 
+// Internal nominal brands are type implementation details, not runtime exports.
+// @ts-expect-error Internal nominal brands are not public exports
+import { columnHandleBrand } from '..'
+// @ts-expect-error Internal nominal brands are not public exports
+import { cacheHandleBrand } from '..'
+// @ts-expect-error Internal nominal brands are not public exports
+import { statisticsBrand } from '..'
+// @ts-expect-error Internal nominal brands are not public exports
+import { writeBufferManagerHandleBrand } from '..'
+
 declare function expectType<T> (value: T): void
 declare const booleanFlag: boolean
 type Equal<A, B> =

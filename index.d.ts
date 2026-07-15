@@ -48,13 +48,8 @@ export type RocksRawDecoded<E extends RocksRawEncoding> = E extends 'slice'
   ? Slice
   : RocksDecoded<Extract<E, RocksNativeEncoding>>
 
-declare const columnHandleBrand: unique symbol
-declare const cacheHandleBrand: unique symbol
-declare const statisticsBrand: unique symbol
-declare const writeBufferManagerHandleBrand: unique symbol
-
 export interface RocksColumn {
-  readonly [columnHandleBrand]: never
+  readonly __rocksColumnBrand: never
 }
 
 export interface RocksCacheOptions {
@@ -63,7 +58,7 @@ export interface RocksCacheOptions {
 
 export class RocksCache {
   constructor (optionsOrHandle?: RocksCacheOptions | bigint)
-  readonly [cacheHandleBrand]: never
+  private readonly __rocksCacheBrand: never
   get handle (): bigint
 }
 
@@ -81,7 +76,7 @@ export interface RocksWriteBufferManagerUsage {
 
 export class RocksWriteBufferManager {
   constructor (options?: RocksWriteBufferManagerOptions)
-  readonly [writeBufferManagerHandleBrand]: never
+  private readonly __rocksWriteBufferManagerBrand: never
   get handle (): bigint
   get usage (): RocksWriteBufferManagerUsage
 }
@@ -134,7 +129,7 @@ export interface RocksStatisticsSnapshot {
 
 export class RocksStatistics {
   constructor (options?: RocksStatisticsOptions)
-  readonly [statisticsBrand]: never
+  private readonly __rocksStatisticsBrand: never
   setStatisticsEnabled (enabled: boolean): true
   getStatistics (): RocksStatisticsSnapshot
 }
