@@ -696,6 +696,14 @@ rocksdb::Status Database::Close(const std::shared_ptr<DatabaseReference>& refere
   const auto finishTerminalCleanup = [&]() noexcept {
     if (!closingDb) return;
 
+    // A failure immediately after ownership transfer skips the normal flush
+    // below. Preserve the WAL before destroying handles and closing the DB;
+    // cleanup cannot report a second failure while unwinding the original one.
+    try {
+      closingDb->FlushWAL(true).PermitUncheckedError();
+    } catch (...) {
+    }
+
     while (!closingColumns.empty()) {
       const auto column = closingColumns.begin();
       try {

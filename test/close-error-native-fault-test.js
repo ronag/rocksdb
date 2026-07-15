@@ -100,6 +100,101 @@ test('resource finalizers contain CloseResources exceptions', { skip: !nativeFau
   t.end()
 })
 
+test('public updates cleanup retries one native CloseResources exception', { skip: !nativeFaults }, function (t) {
+  const packagePath = JSON.stringify(require.resolve('..'))
+  const script = `
+    'use strict'
+    const assert = require('node:assert/strict')
+    const tempy = require('tempy')
+    const { RocksLevel } = require(${packagePath})
+
+    const rejection = async (promise) => {
+      try {
+        await promise
+      } catch (err) {
+        return err
+      }
+      return null
+    }
+
+    ;(async () => {
+      const location = tempy.directory()
+      const db = await RocksLevel.open(location)
+      await db.put('key', 'value')
+
+      const updates = db.updates({ since: 0 })
+      assert.equal((await updates.next()).done, false)
+      const err = await rejection(updates.return())
+      assert.match(err?.message, /Injected updates resource close exception/)
+
+      // The public retry closes and detaches the resource even though the
+      // observed cleanup exception is still reported to the caller.
+      await db.close()
+      const reopened = await RocksLevel.open(location, { createIfMissing: false })
+      assert.equal(await reopened.get('key'), 'value')
+      await reopened.close()
+      console.log('public-updates-cleanup-retried')
+    })().catch((err) => {
+      console.error(err)
+      process.exitCode = 1
+    })
+  `
+
+  runChild(t, script, {
+    ROCKS_LEVEL_TEST_UPDATES_CLOSE_EXCEPTION_COUNTDOWN: '1'
+  }, 'public-updates-cleanup-retried')
+  t.end()
+})
+
+test('failed imported open retries a real pre-transfer cleanup exception', { skip: !nativeFaults }, function (t) {
+  const packagePath = JSON.stringify(require.resolve('..'))
+  const script = `
+    'use strict'
+    const assert = require('node:assert/strict')
+    const tempy = require('tempy')
+    const { RocksLevel } = require(${packagePath})
+
+    const rejection = async (promise) => {
+      try {
+        await promise
+      } catch (err) {
+        return err
+      }
+      return null
+    }
+
+    ;(async () => {
+      const location = tempy.directory()
+      const source = await RocksLevel.open(location)
+      await source.put('key', 'value')
+
+      const imported = new RocksLevel(source.handle, { parallelism: 0 })
+      const err = await rejection(imported.open())
+      const failure = err?.cause
+      assert.ok(failure instanceof AggregateError)
+      assert.match(failure.cause?.message, /parallelism/)
+      assert.match(failure.errors?.[1]?.message, /Injected database close exception before ownership transfer/)
+      assert.equal(imported.status, 'closed')
+      await imported.close()
+
+      assert.equal(await source.get('key'), 'value')
+      await source.close()
+      const reopened = await RocksLevel.open(location, { createIfMissing: false })
+      assert.equal(await reopened.get('key'), 'value')
+      await reopened.close()
+      console.log('failed-import-cleanup-retried')
+    })().catch((err) => {
+      console.error(err)
+      process.exitCode = 1
+    })
+  `
+
+  runChild(t, script, {
+    ROCKS_LEVEL_TEST_DB_CLOSE_EXCEPTION_BEFORE_TRANSFER_COUNTDOWN: '1'
+  }, 'failed-import-cleanup-retried')
+  t.end()
+})
+
 test('database finalizer retries a pre-transfer close exception', { skip: !nativeFaults }, function (t) {
   const bindingPath = JSON.stringify(require.resolve('../binding'))
   const script = `
@@ -275,6 +370,55 @@ test('terminal exception after ownership transfer releases the database', { skip
   runChild(t, script, {
     ROCKS_LEVEL_TEST_DB_CLOSE_EXCEPTION_AFTER_TRANSFER_COUNTDOWN: '1'
   }, 'terminal-transfer-cleaned')
+  t.end()
+})
+
+test('terminal exception classifies an imported final lease as closed', { skip: !nativeFaults }, function (t) {
+  const packagePath = JSON.stringify(require.resolve('..'))
+  const script = `
+    'use strict'
+    const assert = require('node:assert/strict')
+    const tempy = require('tempy')
+    const { RocksLevel } = require(${packagePath})
+
+    const rejection = async (promise) => {
+      try {
+        await promise
+      } catch (err) {
+        return err
+      }
+      return null
+    }
+
+    ;(async () => {
+      const location = tempy.directory()
+      const source = await RocksLevel.open(location)
+      await source.put('key', 'value')
+      const imported = new RocksLevel(source.handle)
+      await imported.open()
+
+      // This is not the final lease, so it returns before the transfer fault.
+      await source.close()
+
+      const err = await rejection(imported.close())
+      assert.equal(err?.code, 'LEVEL_DATABASE_NOT_CLOSED')
+      assert.match(err?.cause?.message, /Injected database close exception after ownership transfer/)
+      assert.equal(imported.status, 'closed')
+      await imported.close()
+
+      const reopened = await RocksLevel.open(location, { createIfMissing: false })
+      assert.equal(await reopened.get('key'), 'value')
+      await reopened.close()
+      console.log('imported-final-lease-cleaned')
+    })().catch((err) => {
+      console.error(err)
+      process.exitCode = 1
+    })
+  `
+
+  runChild(t, script, {
+    ROCKS_LEVEL_TEST_DB_CLOSE_EXCEPTION_AFTER_TRANSFER_COUNTDOWN: '1'
+  }, 'imported-final-lease-cleaned')
   t.end()
 })
 

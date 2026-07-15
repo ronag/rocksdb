@@ -132,6 +132,55 @@ test('pre-teardown close errors retain an open and retryable database', async fu
   t.end()
 })
 
+test('deferred public close bridges scheduling throws and settles once', async function (t) {
+  const db = await RocksLevel.open(tempy.directory())
+  const originalGetMany = binding.db_get_many
+  const originalClose = binding.db_close
+  const dispatchError = new Error('synthetic close dispatch throw after callback')
+  let readCallback
+  let closeCallbackCalls = 0
+
+  binding.db_get_many = (context, keys, options, callback) => {
+    readCallback = callback
+  }
+  binding.db_close = (context, callback) => {
+    callback(null)
+    throw dispatchError
+  }
+
+  try {
+    const read = db.get('key')
+    t.equal(typeof readCallback, 'function', 'the public read owns a native reference')
+
+    const callbackClose = new Promise((resolve) => {
+      db.close((err) => {
+        closeCallbackCalls++
+        resolve(err)
+      })
+    })
+    const promiseClose = rejection(db.close())
+
+    readCallback(null, [Buffer.from('value')])
+    const [value, callbackError, promiseError] = await Promise.all([
+      read,
+      callbackClose,
+      promiseClose
+    ])
+    await new Promise(setImmediate)
+
+    t.deepEqual(value, Buffer.from('value'), 'the operation drains before close dispatch')
+    t.equal(callbackError, undefined, 'the first native completion wins')
+    t.equal(promiseError, null, 'the Promise peer settles successfully')
+    t.equal(closeCallbackCalls, 1, 'the callback settles at most once')
+    t.equal(db.status, 'closed', 'the deferred public close lands')
+  } finally {
+    binding.db_get_many = originalGetMany
+    binding.db_close = originalClose
+  }
+
+  t.end()
+})
+
 test('queued reopen retains a terminal native close error', async function (t) {
   const location = tempy.directory()
   const db = await RocksLevel.open(location)
@@ -175,6 +224,36 @@ test('close groups preserve close-open-close transition ordering', async functio
   t.equal(openError && openError.code, 'LEVEL_DATABASE_NOT_OPEN', 'the superseded reopen rejects')
   t.equal(lastError, null, 'the final close request wins')
   t.equal(db.status, 'closed', 'the final public state follows request order')
+  t.end()
+})
+
+test('open option reentry retains its original ordering epoch', async function (t) {
+  const db = await RocksLevel.open(tempy.directory())
+  const openEpoch = Object.getOwnPropertySymbols(db)
+    .find(symbol => symbol.description === 'openEpoch')
+  const initialEpoch = db[openEpoch]
+  let optionReads = 0
+  let accessorClose
+
+  const opening = rejection(db.open({
+    get createIfMissing () {
+      optionReads++
+      accessorClose = rejection(db.close())
+      t.equal(db.status, 'closing', 'the option accessor starts a close transition')
+      return false
+    }
+  }))
+
+  const [openError, closeError] = await Promise.all([opening, accessorClose])
+  t.equal(openError, null, 'the accessor-triggered transition still lands the open')
+  t.equal(closeError && closeError.code, 'LEVEL_DATABASE_NOT_CLOSED',
+    'the queued open supersedes the accessor close')
+  t.equal(optionReads, 1, 'AbstractLevel materializes the accessor once')
+  t.equal(db[openEpoch], initialEpoch + 1,
+    'the internal continuation does not create a second public ordering epoch')
+  t.equal(db.status, 'open', 'the original public open remains the final request')
+
+  await db.close()
   t.end()
 })
 
@@ -241,6 +320,370 @@ test('terminal errors close only the affected shared-handle wrapper', async func
   const reopened = await RocksLevel.open(location, { createIfMissing: false })
   t.equal(await reopened.get('key'), 'value', 'the final lease still releases the directory lock')
   await reopened.close()
+  t.end()
+})
+
+test('failed imported opens preserve cleanup errors and expose retryable cleanup debt', async function (t) {
+  const location = tempy.directory()
+  const source = await RocksLevel.open(location)
+  await source.put('key', 'value')
+
+  const originalOpen = binding.db_open
+  const originalClose = binding.db_close
+  const openError = new Error('synthetic imported open failure')
+  const cleanupErrors = Array.from({ length: 4 }, (_, index) => (
+    new Error(`synthetic failed-open cleanup ${index + 1}`)
+  ))
+  let closeCalls = 0
+
+  binding.db_open = (context, options, callback) => {
+    process.nextTick(callback, openError)
+  }
+  binding.db_close = (context, callback) => {
+    closeCalls++
+    if (closeCalls <= 3) {
+      process.nextTick(callback, cleanupErrors[closeCalls - 1])
+    } else {
+      originalClose(context, (err) => callback(err || cleanupErrors[3]))
+    }
+  }
+
+  const imported = new RocksLevel(source.handle)
+  try {
+    const err = await rejection(imported.open())
+    const failure = err && err.cause
+    t.ok(failure instanceof AggregateError, 'open reports both operation and cleanup failures')
+    t.equal(failure && failure.cause, openError, 'the original open failure is the aggregate cause')
+    t.deepEqual(failure && failure.errors, [openError, ...cleanupErrors.slice(0, 3)],
+      'cleanup failures retain identity and occurrence order')
+    t.equal(imported.status, 'closed', 'AbstractLevel lands in closed state after the failed open')
+    t.equal(closeCalls, 3, 'failed-open cleanup is bounded')
+
+    const firstClose = rejection(imported.close())
+    const peerClose = rejection(imported.close())
+    const [firstError, peerError] = await Promise.all([firstClose, peerClose])
+    t.equal(firstError && firstError.code, 'LEVEL_DATABASE_NOT_CLOSED',
+      'public close reports the retained cleanup failure')
+    t.equal(firstError && firstError.cause, cleanupErrors[3],
+      'public close preserves the retry error as cause')
+    t.equal(peerError, firstError, 'concurrent cleanup-debt closes share one result')
+    t.equal(closeCalls, 4, 'concurrent closes share one cleanup attempt')
+
+    await imported.close()
+    t.equal(closeCalls, 4, 'a repeated close is idempotent after cleanup reached closed')
+  } finally {
+    binding.db_open = originalOpen
+    binding.db_close = originalClose
+  }
+
+  t.equal(await source.get('key'), 'value', 'the source handle remains usable')
+  await source.close()
+  const reopened = await RocksLevel.open(location, { createIfMissing: false })
+  t.equal(await reopened.get('key'), 'value', 'cleanup debt does not retain the directory lock')
+  await reopened.close()
+  t.end()
+})
+
+test('a public open cancels later cleanup-debt retries after native admission', async function (t) {
+  const location = tempy.directory()
+  const source = await RocksLevel.open(location)
+  await source.put('key', 'value')
+
+  const originalOpen = binding.db_open
+  const originalClose = binding.db_close
+  const openError = new Error('synthetic initial imported open failure')
+  const cleanupErrors = Array.from({ length: 4 }, (_, index) => (
+    new Error(`synthetic overlapping cleanup ${index + 1}`)
+  ))
+  let failOpen = true
+  let closeCalls = 0
+  let reopenCalls = 0
+  let heldClose
+
+  binding.db_open = (context, options, callback) => {
+    if (failOpen) {
+      failOpen = false
+      process.nextTick(callback, openError)
+    } else {
+      reopenCalls++
+      originalOpen(context, options, callback)
+    }
+  }
+  binding.db_close = (context, callback) => {
+    closeCalls++
+    if (closeCalls <= 3) process.nextTick(callback, cleanupErrors[closeCalls - 1])
+    else if (closeCalls === 4) heldClose = callback
+    else originalClose(context, callback)
+  }
+
+  const imported = new RocksLevel(source.handle)
+  try {
+    const failed = await rejection(imported.open())
+    t.ok(failed && failed.cause instanceof AggregateError, 'initial failure records exhausted cleanup')
+    t.equal(closeCalls, 3, 'initial cleanup exhausted its bounded attempts')
+
+    const closing = rejection(imported.close())
+    const opening = imported.open({ createIfMissing: false })
+    const peerOpening = imported.open({ createIfMissing: false })
+    await new Promise(setImmediate)
+
+    t.equal(reopenCalls, 0, 'native open waits for the admitted cleanup close')
+    t.equal(closeCalls, 4, 'open cancels cleanup retries that were not admitted')
+    heldClose(cleanupErrors[3])
+
+    const [closeError] = await Promise.all([closing, opening, peerOpening])
+
+    t.equal(closeError && closeError.code, 'LEVEL_DATABASE_NOT_CLOSED',
+      'the overlapping close still reports its admitted failure')
+    t.equal(closeError && closeError.cause, cleanupErrors[3],
+      'the overlapping close preserves its native cause')
+    t.equal(reopenCalls, 1, 'concurrent public opens share one native admission')
+    t.equal(closeCalls, 4, 'open admission cancels the fifth stale cleanup attempt')
+    t.equal(imported.status, 'open', 'the admitted open remains landed')
+    t.equal(await imported.get('key'), 'value', 'the reopened imported handle is usable')
+  } finally {
+    binding.db_open = originalOpen
+    binding.db_close = originalClose
+  }
+
+  await imported.close()
+  await source.close()
+  const reopened = await RocksLevel.open(location, { createIfMissing: false })
+  t.equal(await reopened.get('key'), 'value', 'serialized cleanup releases the directory lock')
+  await reopened.close()
+  t.end()
+})
+
+test('cleanup-debt open waits through synchronous close completion faults', async function (t) {
+  const location = tempy.directory()
+  const db = await RocksLevel.open(location)
+  await db.put('key', 'value')
+  await db.close()
+
+  const cleanupDebt = Object.getOwnPropertySymbols(db)
+    .find(symbol => symbol.description === 'cleanupDebt')
+  const originalOpen = binding.db_open
+  const originalClose = binding.db_close
+  let openCalls = 0
+
+  binding.db_open = (context, options, callback) => {
+    openCalls++
+    originalOpen(context, options, callback)
+  }
+
+  const cases = [
+    {
+      name: 'synchronous throw',
+      expected: new Error('synthetic cleanup dispatch throw'),
+      dispatch () {
+        throw this.expected
+      }
+    },
+    {
+      name: 'callback then throw',
+      expected: new Error('synthetic cleanup callback failure'),
+      ignored: new Error('synthetic cleanup throw after callback'),
+      dispatch (callback) {
+        callback(this.expected)
+        throw this.ignored
+      }
+    }
+  ]
+
+  try {
+    for (const entry of cases) {
+      db[cleanupDebt] = {}
+      openCalls = 0
+      let closeCallbacks = 0
+      let nativeCloseCalls = 0
+
+      binding.db_close = (context, callback) => {
+        nativeCloseCalls++
+        entry.dispatch(callback)
+      }
+
+      const closing = new Promise(resolve => {
+        db.close(err => {
+          closeCallbacks++
+          resolve(err)
+        })
+      })
+      const opening = db.open({ createIfMissing: false })
+
+      t.equal(openCalls, 0, `${entry.name}: native open waits for close settlement`)
+      const [closeError] = await Promise.all([closing, opening])
+      await new Promise(setImmediate)
+
+      t.equal(closeError && closeError.code, 'LEVEL_DATABASE_NOT_CLOSED',
+        `${entry.name}: the admitted close reports its public error`)
+      t.equal(closeError && closeError.cause, entry.expected,
+        `${entry.name}: the first completion retains error identity`)
+      t.equal(closeCallbacks, 1, `${entry.name}: the public close callback settles once`)
+      t.equal(nativeCloseCalls, 1, `${entry.name}: the admitted native close runs once`)
+      t.equal(openCalls, 1, `${entry.name}: native open dispatches after close settlement`)
+      t.equal(db.status, 'open', `${entry.name}: the later public open wins`)
+
+      binding.db_close = originalClose
+      await db.close()
+    }
+  } finally {
+    binding.db_open = originalOpen
+    binding.db_close = originalClose
+  }
+
+  const reopened = await RocksLevel.open(location, { createIfMissing: false })
+  t.equal(await reopened.get('key'), 'value', 'synchronous cleanup faults release the directory lock')
+  await reopened.close()
+  t.end()
+})
+
+test('cleanup-debt reopen contains deferred native open dispatch faults', async function (t) {
+  const location = tempy.directory()
+  const db = await RocksLevel.open(location)
+  await db.put('key', 'value')
+  await db.close()
+
+  const cleanupDebt = Object.getOwnPropertySymbols(db)
+    .find(symbol => symbol.description === 'cleanupDebt')
+  const originalOpen = binding.db_open
+  const originalClose = binding.db_close
+  const cases = [
+    {
+      name: 'synchronous throw',
+      expected: new Error('synthetic deferred open dispatch throw'),
+      dispatch () {
+        throw this.expected
+      }
+    },
+    {
+      name: 'callback then throw',
+      expected: new Error('synthetic deferred open callback failure'),
+      ignored: new Error('synthetic deferred open throw after callback'),
+      dispatch (callback) {
+        callback(this.expected)
+        throw this.ignored
+      }
+    }
+  ]
+
+  try {
+    for (const entry of cases) {
+      const closeCause = new Error(`${entry.name}: synthetic admitted cleanup failure`)
+      let heldCleanupClose
+      let nativeCloseCalls = 0
+      let nativeOpenCalls = 0
+      let openCallbackCalls = 0
+
+      db[cleanupDebt] = {}
+      binding.db_close = (context, callback) => {
+        nativeCloseCalls++
+        if (nativeCloseCalls === 1) heldCleanupClose = callback
+        else originalClose(context, callback)
+      }
+      binding.db_open = (context, options, callback) => {
+        nativeOpenCalls++
+        entry.dispatch(callback)
+      }
+
+      const closing = rejection(db.close())
+      const opening = new Promise(resolve => {
+        db.open({ createIfMissing: false }, err => {
+          openCallbackCalls++
+          resolve(err)
+        })
+      })
+      await new Promise(setImmediate)
+
+      t.equal(nativeOpenCalls, 0, `${entry.name}: deferred native open waits for cleanup`)
+      heldCleanupClose(closeCause)
+      const [closeError, openError] = await Promise.all([closing, opening])
+      await new Promise(setImmediate)
+
+      t.equal(closeError && closeError.code, 'LEVEL_DATABASE_NOT_CLOSED',
+        `${entry.name}: the admitted close retains its public error`)
+      t.equal(closeError && closeError.cause, closeCause,
+        `${entry.name}: the admitted close retains its native cause`)
+      t.equal(openError && openError.code, 'LEVEL_DATABASE_NOT_OPEN',
+        `${entry.name}: deferred dispatch failure retains its public error`)
+      t.equal(openError && openError.cause, entry.expected,
+        `${entry.name}: the first open completion retains error identity`)
+      t.equal(openCallbackCalls, 1, `${entry.name}: the public open callback settles once`)
+      t.equal(nativeOpenCalls, 1, `${entry.name}: deferred native open dispatches once`)
+      t.equal(nativeCloseCalls, 2, `${entry.name}: failed open cleanup runs once`)
+      t.equal(db[cleanupDebt], null, `${entry.name}: failed open cleanup clears its debt`)
+      t.equal(db.status, 'closed', `${entry.name}: failed deferred open lands closed`)
+
+      binding.db_open = originalOpen
+      binding.db_close = originalClose
+      await db.open({ createIfMissing: false })
+      t.equal(await db.get('key'), 'value', `${entry.name}: the same wrapper remains recoverable`)
+      await db.close()
+    }
+  } finally {
+    binding.db_open = originalOpen
+    binding.db_close = originalClose
+  }
+
+  const reopened = await RocksLevel.open(location, { createIfMissing: false })
+  t.equal(await reopened.get('key'), 'value', 'deferred open faults release the directory lock')
+  await reopened.close()
+  t.end()
+})
+
+test('updates preserve iteration and cleanup error identity and ordering', async function (t) {
+  const db = await RocksLevel.open(tempy.directory())
+  await db.put('key', 'value')
+
+  const originalNext = binding.updates_next
+  const originalClose = binding.updates_close
+  const iterationError = new Error('synthetic updates iteration failure')
+  const cleanupErrors = [
+    new Error('synthetic updates cleanup one'),
+    new Error('synthetic updates cleanup two')
+  ]
+  let closeCalls = 0
+
+  binding.updates_next = (handle, callback) => process.nextTick(callback, iterationError)
+  binding.updates_close = (handle) => {
+    closeCalls++
+    if (closeCalls <= cleanupErrors.length) throw cleanupErrors[closeCalls - 1]
+    return originalClose(handle)
+  }
+
+  try {
+    const err = await rejection(db.updates({ since: 0 }).next())
+    t.ok(err instanceof AggregateError, 'iteration and cleanup failures are aggregated')
+    t.equal(err.cause, iterationError, 'the iteration failure remains the cause')
+    t.deepEqual(err.errors, [iterationError, ...cleanupErrors],
+      'errors preserve identity and occurrence order')
+    t.equal(closeCalls, 3, 'cleanup retries until the native resource closes')
+  } finally {
+    binding.updates_next = originalNext
+    binding.updates_close = originalClose
+  }
+
+  const updates = db.updates({ since: 0 })
+  await updates.next()
+  const boundedErrors = Array.from({ length: 3 }, (_, index) => (
+    new Error(`synthetic bounded updates cleanup ${index + 1}`)
+  ))
+  closeCalls = 0
+  binding.updates_close = () => {
+    const err = boundedErrors[closeCalls++]
+    throw err
+  }
+
+  try {
+    const err = await rejection(updates.return())
+    t.ok(err instanceof AggregateError, 'multiple cleanup-only failures are aggregated')
+    t.equal(err.cause, boundedErrors[0], 'the first cleanup failure remains the cause')
+    t.deepEqual(err.errors, boundedErrors, 'all bounded cleanup attempts remain ordered')
+    t.equal(closeCalls, 3, 'cleanup stops after the bounded attempt count')
+  } finally {
+    binding.updates_close = originalClose
+  }
+
+  await db.close()
   t.end()
 })
 
