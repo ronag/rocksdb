@@ -1,10 +1,18 @@
 'use strict'
 
+const { fromCallback } = require('catering')
 const { EventEmitter } = require('node:events')
 
+const kPromise = Symbol('promise')
 const activeEvents = new WeakMap()
 const protectedClose = new WeakSet()
 const protectedChainedBatch = new WeakSet()
+const protectedIterator = new WeakSet()
+const asyncGenerator = (async function * () {})()
+const asyncGeneratorPrototype = Object.getPrototypeOf(Object.getPrototypeOf(asyncGenerator))
+const asyncGeneratorNext = asyncGeneratorPrototype.next
+const asyncGeneratorReturn = asyncGeneratorPrototype.return
+const asyncGeneratorThrow = asyncGeneratorPrototype.throw
 
 function throwError (err) {
   throw err
@@ -125,6 +133,167 @@ function rethrowingCallback (callback) {
   }
 }
 
+function combineIteratorCleanupError (operationError, cleanupError) {
+  if (!cleanupError) return operationError
+  if (!operationError || operationError === cleanupError) return cleanupError
+
+  return new AggregateError(
+    [operationError, cleanupError],
+    'Iterator operation failed and its native resources could not be released',
+    { cause: operationError }
+  )
+}
+
+function throwIteratorErrors (
+  operationCaught,
+  operationError,
+  cleanupCaught,
+  cleanupError
+) {
+  if (operationCaught && cleanupCaught) {
+    if (operationError === cleanupError) throw operationError
+    throw new AggregateError(
+      [operationError, cleanupError],
+      'Iterator operation failed and its native resources could not be released',
+      { cause: operationError }
+    )
+  }
+
+  if (operationCaught) throw operationError
+  if (cleanupCaught) throw cleanupError
+}
+
+async function * publicIteratorGenerator (iterator) {
+  let operationCaught = false
+  let operationError
+
+  try {
+    try {
+      let item
+
+      while ((item = (await iterator.next())) !== undefined) {
+        yield item
+      }
+    } catch (err) {
+      operationCaught = true
+      operationError = err
+    }
+  } finally {
+    let cleanupCaught = false
+    let cleanupError
+    try {
+      await iterator.close()
+    } catch (err) {
+      cleanupCaught = true
+      cleanupError = err
+    }
+
+    throwIteratorErrors(operationCaught, operationError, cleanupCaught, cleanupError)
+  }
+}
+
+function settleProtocolCall (promise) {
+  return promise.then(
+    value => ({ caught: false, value }),
+    error => ({ caught: true, error })
+  )
+}
+
+function unwrapProtocolCall (operation) {
+  if (operation.caught) throw operation.error
+  return operation.value
+}
+
+async function completePreStartTermination (operation, cleanup) {
+  [operation, cleanup] = await Promise.all([operation, cleanup])
+  throwIteratorErrors(operation.caught, operation.error, cleanup.caught, cleanup.error)
+  return operation.value
+}
+
+function iteratePublicIterator (iterator) {
+  const generator = publicIteratorGenerator(iterator)
+  const next = asyncGeneratorNext.bind(generator)
+  const returnIterator = asyncGeneratorReturn.bind(generator)
+  const throwIterator = asyncGeneratorThrow.bind(generator)
+  const unstarted = 0
+  const started = 1
+  const terminalizing = 2
+  const terminalized = 3
+  let state = unstarted
+  let earlyTermination = null
+
+  const gateEarlyTermination = (operation) => {
+    const transition = earlyTermination
+    // Observe a natively-queued rejection immediately, while deferring its
+    // public settlement until the earlier cleanup has landed. Delaying the
+    // rejection handler itself would produce an unhandledRejection.
+    const observed = settleProtocolCall(operation)
+    return transition
+      .then(() => observed, () => observed)
+      .then(unwrapProtocolCall)
+  }
+
+  const terminateBeforeStart = (operation) => {
+    const cleanup = settleProtocolCall(Promise.resolve().then(() => iterator.close()))
+    const transition = completePreStartTermination(settleProtocolCall(operation), cleanup)
+    earlyTermination = transition
+    transition.then(
+      () => {
+        state = terminalized
+        earlyTermination = null
+      },
+      () => {
+        state = terminalized
+        earlyTermination = null
+      }
+    )
+    return transition
+  }
+
+  return Object.defineProperties(generator, {
+    next: {
+      configurable: true,
+      writable: true,
+      value: function (value) {
+        if (state === unstarted) {
+          state = started
+          // The native generator owns serialization after its first next().
+          // Remove this one-time state branch from subsequent row delivery.
+          generator.next = next
+        }
+        const operation = next(value)
+        return state === terminalizing ? gateEarlyTermination(operation) : operation
+      }
+    },
+    return: {
+      configurable: true,
+      writable: true,
+      value: function (value) {
+        if (state === unstarted) {
+          state = terminalizing
+          return terminateBeforeStart(returnIterator(value))
+        }
+
+        const operation = returnIterator(value)
+        return state === terminalizing ? gateEarlyTermination(operation) : operation
+      }
+    },
+    throw: {
+      configurable: true,
+      writable: true,
+      value: function (error) {
+        if (state === unstarted) {
+          state = terminalizing
+          return terminateBeforeStart(throwIterator(error))
+        }
+
+        const operation = throwIterator(error)
+        return state === terminalizing ? gateEarlyTermination(operation) : operation
+      }
+    }
+  })
+}
+
 function protectPublicClose (resource) {
   if (protectedClose.has(resource)) return resource
 
@@ -138,6 +307,174 @@ function protectPublicClose (resource) {
   })
   protectedClose.add(resource)
   return resource
+}
+
+function protectPublicIterator (iterator) {
+  if (protectedIterator.has(iterator)) return iterator
+
+  const close = iterator.close
+  const all = iterator.all
+  const rawClose = iterator._close
+  let publicCleanup = 0
+  let cleanupDebt = null
+  let cleanupDebtClose = null
+  let closeLanded = false
+
+  const retryCleanupDebt = (resource, callback) => {
+    const debt = cleanupDebt
+    const active = cleanupDebtClose
+    if (active && active.debt === debt) {
+      active.callbacks.push(callback)
+      return
+    }
+
+    const group = { debt, callbacks: [callback] }
+    cleanupDebtClose = group
+
+    process.nextTick(() => {
+      let completed = false
+      const settle = (err) => {
+        if (completed) return
+        completed = true
+
+        if (cleanupDebt === debt) {
+          cleanupDebt = err ? { error: err } : null
+        }
+        if (cleanupDebtClose === group) cleanupDebtClose = null
+
+        const callbacks = group.callbacks.splice(0)
+        for (const complete of callbacks) {
+          if (err) complete(err)
+          else complete()
+        }
+      }
+
+      try {
+        // AbstractLevel has already closed and detached the outer iterator.
+        // Replaying its hook lets the nested iterator retry retained cleanup.
+        rawClose.call(resource, settle)
+      } catch (err) {
+        if (completed) rethrowAsync(err)
+        else settle(err)
+      }
+    })
+  }
+
+  Object.defineProperty(iterator, '_close', {
+    configurable: true,
+    writable: true,
+    value: function (callback) {
+      // AbstractLevel 1.x discards _close() errors while landing its public
+      // state. Bridge that lifecycle only while a public close owns this hook.
+      // A direct unsafe _close() call still owns its error and all overlap
+      // invariants; this wrapper adds no production admission checks.
+      const owned = publicCleanup > 0
+      if (!owned) return rawClose.call(this, callback)
+
+      let completed = false
+      const settle = (err) => {
+        if (completed) return
+        completed = true
+
+        if (err) {
+          cleanupDebt = { error: err }
+          callback()
+        } else {
+          callback()
+        }
+      }
+
+      try {
+        return rawClose.call(this, settle)
+      } catch (err) {
+        if (completed) rethrowAsync(err)
+        else process.nextTick(settle, err)
+      }
+    }
+  })
+
+  Object.defineProperty(iterator, 'close', {
+    configurable: true,
+    writable: true,
+    value: function (callback) {
+      if (!cleanupDebt && closeLanded) {
+        return close.call(this, rethrowingCallback(callback))
+      }
+
+      callback = fromCallback(callback, kPromise)
+      const promise = callback[kPromise]
+      callback = rethrowingCallback(callback)
+
+      if (cleanupDebt) {
+        retryCleanupDebt(this, callback)
+        return promise
+      }
+
+      const previousDebt = cleanupDebt
+      let owned = true
+      publicCleanup++
+
+      const release = () => {
+        if (!owned) return
+        owned = false
+        publicCleanup--
+      }
+
+      try {
+        close.call(this, (err) => {
+          closeLanded = true
+          release()
+          const debt = cleanupDebt
+          const cleanupError = debt !== previousDebt ? debt?.error : null
+          const failure = combineIteratorCleanupError(err, cleanupError)
+          if (failure) callback(failure)
+          else callback()
+        })
+      } catch (err) {
+        release()
+        throw err
+      }
+
+      return promise
+    }
+  })
+
+  Object.defineProperty(iterator, 'all', {
+    configurable: true,
+    writable: true,
+    value: function (options, callback) {
+      if (typeof options === 'function') {
+        callback = options
+        options = undefined
+      }
+
+      callback = fromCallback(callback, kPromise)
+      const promise = callback[kPromise]
+      callback = rethrowingCallback(callback)
+      const previousDebt = cleanupDebt
+      const complete = (err, items) => {
+        const debt = cleanupDebt
+        const cleanupError = debt !== previousDebt ? debt?.error : null
+        callback(combineIteratorCleanupError(err, cleanupError) || null, items)
+      }
+
+      if (options === undefined) all.call(this, complete)
+      else all.call(this, options, complete)
+
+      return promise
+    }
+  })
+
+  Object.defineProperty(iterator, Symbol.asyncIterator, {
+    configurable: true,
+    writable: true,
+    value: function () {
+      return iteratePublicIterator(this)
+    }
+  })
+
+  protectedIterator.add(iterator)
+  return iterator
 }
 
 function protectPublicChainedBatch (batch) {
@@ -183,9 +520,12 @@ function protectPublicChainedBatch (batch) {
 
 exports.completePublicEvent = completePublicEvent
 exports.completePublicEvents = completePublicEvents
+exports.combineIteratorCleanupError = combineIteratorCleanupError
 exports.emitPublicEvent = emitPublicEvent
 exports.guardPublicEvents = guardPublicEvents
+exports.iteratePublicIterator = iteratePublicIterator
 exports.protectPublicChainedBatch = protectPublicChainedBatch
 exports.protectPublicClose = protectPublicClose
+exports.protectPublicIterator = protectPublicIterator
 exports.rethrowErrors = rethrowErrors
 exports.rethrowingCallback = rethrowingCallback
