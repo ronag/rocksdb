@@ -51,13 +51,36 @@ function validatePrebuildPaths (paths, source) {
 // binary, and fails the release if a staged artifact contains test-only hooks.
 function validateNoNativeTestFaultHooks (root, paths = EXPECTED_PREBUILDS) {
   for (const relative of paths) {
-    const addon = fs.readFileSync(path.join(root, relative))
-    const exposed = NATIVE_TEST_FAULT_HOOKS.filter((name) => addon.includes(Buffer.from(name)))
+    const absolute = path.join(root, relative)
+    let descriptor
 
-    if (exposed.length !== 0) {
-      throw new Error(
-        `${relative} contains native test fault hooks: ${exposed.join(', ')}`
+    try {
+      descriptor = fs.openSync(
+        absolute,
+        fs.constants.O_RDONLY | fs.constants.O_NOFOLLOW | fs.constants.O_NONBLOCK
       )
+    } catch (err) {
+      if (err && err.code === 'ELOOP') {
+        throw new Error(`${relative} is not a regular file`, { cause: err })
+      }
+      throw err
+    }
+
+    try {
+      if (!fs.fstatSync(descriptor).isFile()) {
+        throw new Error(`${relative} is not a regular file`)
+      }
+
+      const addon = fs.readFileSync(descriptor)
+      const exposed = NATIVE_TEST_FAULT_HOOKS.filter((name) => addon.includes(Buffer.from(name)))
+
+      if (exposed.length !== 0) {
+        throw new Error(
+          `${relative} contains native test fault hooks: ${exposed.join(', ')}`
+        )
+      }
+    } finally {
+      fs.closeSync(descriptor)
     }
   }
 }
