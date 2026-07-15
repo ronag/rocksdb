@@ -1,0 +1,18 @@
+{
+  "compilerOptions": {
+    "lib": ["es2025"],
+    "module": "NodeNext",
+    "target": "es2025",
+    "moduleDetection": "force",
+    "strict": true,
+    "noImplicitAny": false,
+    "useUnknownInCatchVariables": false,
+    "allowJs": false,
+    "esModuleInterop": true,
+    "forceConsistentCasingInFileNames": true,
+    "skipLibCheck": true,
+    "noEmit": true,
+    "types": ["node"]
+  },
+  "include": ["src"]
+}

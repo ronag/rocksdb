@@ -1,20 +1,19 @@
-'use strict'
-
-const { fromCallback } = require('catering')
-const { AbstractLevel } = require('abstract-level')
-const { Slice } = require('@nxtedition/slice')
-const ModuleError = require('module-error')
-const binding = require('./binding')
-const { ChainedBatch } = require('./chained-batch')
-const { RocksCache } = require('./cache')
-const { RocksWriteBufferManager } = require('./write-buffer-manager')
-const { RocksStatistics, getStatisticsContext } = require('./statistics')
-const { Iterator } = require('./iterator')
-const { iteratePublicIterator } = require('./public-lifecycle')
-const fs = require('node:fs')
-const assert = require('node:assert')
-const { AsyncLocalStorage } = require('node:async_hooks')
-const combineErrors = require('maybe-combine-errors')
+import assert from 'node:assert'
+import { AsyncLocalStorage } from 'node:async_hooks'
+import fs from 'node:fs'
+import { Slice } from '@nxtedition/slice'
+import { AbstractLevel } from 'abstract-level'
+import { fromCallback } from 'catering'
+import combineErrors = require('maybe-combine-errors')
+import ModuleError = require('module-error')
+import binding = require('./binding')
+import { RocksCache } from './cache'
+import { ChainedBatch } from './chained-batch'
+import { Iterator } from './iterator'
+import { iteratePublicIterator } from './public-lifecycle'
+import { RocksStatistics, getStatisticsContext } from './statistics'
+import { getPackedMode, kRef, kUnref, setPackedResult } from './util'
+import { RocksWriteBufferManager } from './write-buffer-manager'
 
 const kContext = Symbol('context')
 const kColumns = Symbol('columns')
@@ -38,24 +37,22 @@ const kReconcileInitialReservation = Symbol('reconcileInitialReservation')
 const partialResults = new WeakMap()
 const deferredPartialResults = new WeakSet()
 const cleanupRetryIterators = new WeakSet()
-const closeContext = new AsyncLocalStorage()
-const openContext = new AsyncLocalStorage()
-const openEventContext = new AsyncLocalStorage()
-
-const { getPackedMode, kRef, kUnref, setPackedResult } = require('./util')
+const closeContext = new AsyncLocalStorage<any>()
+const openContext = new AsyncLocalStorage<any>()
+const openEventContext = new AsyncLocalStorage<any>()
 
 const kEmpty = Object.freeze({})
 const DEBUG = process.env.NODE_ENV !== 'production'
 const cleanupAttempts = 3
 
-function aggregateErrors (errors, message) {
+function aggregateErrors (errors: any[], message) {
   return errors.length === 1
     ? errors[0]
     : new AggregateError(errors, message, { cause: errors[0] })
 }
 
 function cleanupDatabaseReference (context, shouldRetry, finish) {
-  const errors = []
+  const errors: any[] = []
   let attempts = 0
 
   const complete = (closed) => finish({ closed, errors })
@@ -125,7 +122,7 @@ function initialReservationOpenError (openError, closed, cleanupErrors) {
   if (closed && cleanupErrors.length === 0) return openError
 
   const primary = openError?.cause ?? openError
-  const errors = [primary, ...cleanupErrors]
+  const errors: any[] = [primary, ...cleanupErrors]
   if (!closed && cleanupErrors.length === 0) {
     errors.push(new Error('Native database reservation remains open after cleanup'))
   }
@@ -135,8 +132,9 @@ function initialReservationOpenError (openError, closed, cleanupErrors) {
     { cause: primary }
   )
 
-  return openError instanceof Error && typeof openError.code === 'string'
-    ? new ModuleError(openError.message, { code: openError.code, cause })
+  const coded = openError as Error & { code?: unknown }
+  return openError instanceof Error && typeof coded.code === 'string'
+    ? new ModuleError(openError.message, { code: coded.code, cause })
     : new AggregateError([openError, ...errors.slice(1)], cause.message, { cause: openError })
 }
 
@@ -145,7 +143,7 @@ function dedupeDatabaseResourceError (err, group) {
   if (!(cause instanceof Error) || cause.name !== 'CombinedError' ||
       typeof cause[Symbol.iterator] !== 'function') return err
 
-  const errors = [...cause]
+  const errors = [...(cause as Error & Iterable<any>)]
   const drops = new Map()
 
   for (const [cleanupError, actual] of group.resourceCleanupErrors) {
@@ -159,7 +157,7 @@ function dedupeDatabaseResourceError (err, group) {
 
   if (drops.size === 0) return err
 
-  const deduped = []
+  const deduped: any[] = []
   for (const error of errors) {
     const remaining = drops.get(error) ?? 0
     if (remaining > 0) drops.set(error, remaining - 1)
@@ -173,7 +171,7 @@ function dedupeDatabaseResourceError (err, group) {
 }
 
 function closeUpdates (handle) {
-  const errors = []
+  const errors: any[] = []
   for (let attempt = 0; attempt < cleanupAttempts; attempt++) {
     try {
       binding.updates_close(handle)
@@ -211,7 +209,7 @@ function getDefaultPackedMode (encoding) {
   return encoding === 'buffer' || encoding === 'slice' ? 'auto' : false
 }
 
-function prepareRawGetManyOptions (options, packed) {
+function prepareRawGetManyOptions (options, packed?) {
   if ((typeof options !== 'object' || options === null) && typeof options !== 'function') {
     return {
       bindingOptions: options ?? kEmpty,
@@ -281,7 +279,9 @@ function convertRawGetManyResult (result, valueEncoding) {
   })
 }
 
-class RocksLevel extends AbstractLevel {
+class RocksLevel extends AbstractLevel<any, any, any> {
+  [key: symbol]: any
+
   constructor (locationOrHandle, { ...options } = {}) {
     // Validate and acquire native handles before AbstractLevel schedules its
     // automatic open. If native construction throws, no half-constructed DB is
@@ -305,7 +305,7 @@ class RocksLevel extends AbstractLevel {
           setStatisticsEnabled: true,
           updates: true
         }
-      }, options)
+      } as any, options)
     } catch (err) {
       // A BigInt handle reserves a native lease in db_init(). If AbstractLevel
       // rejects constructor options, release it synchronously because no JS
@@ -345,7 +345,7 @@ class RocksLevel extends AbstractLevel {
       : super.emit(event, ...args)
   }
 
-  open (options) {
+  open (options?): any {
     if (typeof options === 'object' && options !== null) {
       try {
         // Materialize once before entering the lifecycle queue. Besides matching
@@ -456,10 +456,10 @@ class RocksLevel extends AbstractLevel {
     const active = this[kCloseGroups].get(epoch)
     if (active !== undefined) return active.promise
 
-    const group = { terminalError: null, resourceCleanupErrors: new Map(), promise: null }
+    const group: any = { terminalError: null, resourceCleanupErrors: new Map(), promise: null }
     let resolveGroup
     let rejectGroup
-    group.promise = new Promise((resolve, reject) => {
+    group.promise = new Promise<void>((resolve, reject) => {
       resolveGroup = resolve
       rejectGroup = reject
     })
@@ -588,7 +588,7 @@ class RocksLevel extends AbstractLevel {
     const debt = this[kCleanupDebt] ?? {}
     this[kCleanupDebt] = debt
 
-    return new Promise((resolve) => {
+    return new Promise<{ closed: boolean, errors: any[] }>((resolve) => {
       cleanupDatabaseReference(
         this[kContext],
         () => this[kInitialReservation] && this[kCleanupDebt] === debt,
@@ -622,8 +622,8 @@ class RocksLevel extends AbstractLevel {
     const active = this[kCleanupDebtClose]
     if (active !== null && active.debt === debt) return active.promise
 
-    const group = { debt, promise: null }
-    group.promise = new Promise((resolve, reject) => {
+    const group: any = { debt, promise: null }
+    group.promise = new Promise<void>((resolve, reject) => {
       cleanupDatabaseReference(
         this[kContext],
         () => this[kCleanupDebt] === debt,
@@ -656,8 +656,9 @@ class RocksLevel extends AbstractLevel {
     return group.promise
   }
 
-  static async open (...args) {
-    const db = new this(...args)
+  static async open (...args: any[]) {
+    const Constructor: any = this
+    const db = new Constructor(...args)
     await db.open()
     return db
   }
@@ -692,7 +693,7 @@ class RocksLevel extends AbstractLevel {
 
   _open (options, callback) {
     if (callback === undefined) {
-      return openContext.run(this, () => new Promise((resolve, reject) => {
+      return openContext.run(this, () => new Promise<void>((resolve, reject) => {
         this._open(options, err => err ? reject(err) : resolve())
       }))
     }
@@ -719,7 +720,7 @@ class RocksLevel extends AbstractLevel {
         const bindingOptions = inheritColumnOptions(options)
         let nativeSettled = false
 
-        const settleNativeOpen = (err, columns) => {
+        const settleNativeOpen = (err, columns?) => {
           if (promiseHook) {
             if (nativeSettled) return
             nativeSettled = true
@@ -855,7 +856,7 @@ class RocksLevel extends AbstractLevel {
 
   _close (callback) {
     if (callback === undefined) {
-      return new Promise((resolve, reject) => {
+      return new Promise<void>((resolve, reject) => {
         this._close(err => err ? reject(err) : resolve())
       })
     }
@@ -884,7 +885,7 @@ class RocksLevel extends AbstractLevel {
     )
   }
 
-  put (key, value, options) {
+  put (key, value, options?): any {
     return this[kPublicOperation](() => super.put(key, value, options))
   }
 
@@ -969,7 +970,7 @@ class RocksLevel extends AbstractLevel {
         let completionValue
         let completionPacked
         try {
-          const indexes = []
+          const indexes: number[] = []
           const packedResult = !Array.isArray(val)
           if (packedResult) {
             for (let i = 0; i < val.statuses.length; i++) {
@@ -1017,7 +1018,7 @@ class RocksLevel extends AbstractLevel {
     return callback[kPromise]
   }
 
-  getMany (keys, options) {
+  getMany (keys, options?): any {
     const deferPartialResults = deferredPartialResults.has(options)
 
     return this[kPublicOperation](async () => {
@@ -1031,7 +1032,7 @@ class RocksLevel extends AbstractLevel {
     })
   }
 
-  get (key, options) {
+  get (key, options?): any {
     return this[kPublicOperation](async () => {
       // The unchanged raw _get() reports a missing key with its legacy
       // LEVEL_NOT_FOUND error, while abstract-level v3 implementor hooks return
@@ -1046,11 +1047,11 @@ class RocksLevel extends AbstractLevel {
       // getMany resolves encodings before validating its keys, unlike get().
       // Preserve custom subclass validation ordering before using getMany as
       // the public adapter. The base validator is left to getMany's own pass.
-      if (this._assertValidKey !== AbstractLevel.prototype._assertValidKey) {
-        this._assertValidKey(key)
+      if ((this as any)._assertValidKey !== (AbstractLevel.prototype as any)._assertValidKey) {
+        (this as any)._assertValidKey(key)
       }
 
-      const values = await super.getMany([key], options)
+      const values = await super.getMany([key], options as {})
       if (partialResults.has(values)) {
         partialResults.delete(values)
         throw new ModuleError('Multi-get stopped before the value was read', {
@@ -1062,24 +1063,24 @@ class RocksLevel extends AbstractLevel {
   }
 
   _sublevel (name, options) {
-    return wrapSublevel(super._sublevel(name, options))
+    return wrapSublevel((AbstractLevel.prototype as any)._sublevel.call(this, name, options))
   }
 
-  iterator (options) {
+  iterator (options?): any {
     options = snapshotIteratorOptions(options)
     const iterator = super.iterator(options)
     return iterator instanceof Iterator ? iterator : wrapIteratorCleanupRetry(iterator)
   }
 
-  keys (options) {
+  keys (options?): any {
     return wrapIteratorCleanupRetry(super.keys(options))
   }
 
-  values (options) {
+  values (options?): any {
     return wrapIteratorCleanupRetry(super.values(options))
   }
 
-  _getManySync (keys, options) {
+  _getManySync (keys, options?) {
     if (DEBUG) {
       assert.strictEqual(this.status, 'open', 'unsafe _getManySync() requires an open database')
     }
@@ -1112,7 +1113,7 @@ class RocksLevel extends AbstractLevel {
     )
   }
 
-  del (key, options) {
+  del (key, options?): any {
     return this[kPublicOperation](() => super.del(key, options))
   }
 
@@ -1128,7 +1129,7 @@ class RocksLevel extends AbstractLevel {
     return callback[kPromise]
   }
 
-  clear (options) {
+  clear (options?): any {
     return this[kPublicOperation](() => super.clear(options))
   }
 
@@ -1145,7 +1146,7 @@ class RocksLevel extends AbstractLevel {
     )
   }
 
-  [kBatchAsync] (operations, options, callback, columnOptions) {
+  [kBatchAsync] (operations, options, callback, columnOptions?) {
     let batch
     try {
       batch = binding.batch_init(this[kContext])
@@ -1176,7 +1177,7 @@ class RocksLevel extends AbstractLevel {
     return callback[kPromise]
   }
 
-  batch (operations, options) {
+  batch (operations?, options?): any {
     if (arguments.length === 0) {
       return super.batch()
     }
@@ -1412,7 +1413,7 @@ class RocksLevel extends AbstractLevel {
           throw new TypeError('flushWAL options must be a boolean or object')
         }
 
-        sync = options.sync ?? false
+        sync = (options as { sync?: unknown }).sync ?? false
         if (typeof sync !== 'boolean') {
           throw new TypeError('flushWAL options.sync must be a boolean')
         }
@@ -1468,7 +1469,7 @@ function countErrorIdentity (err, target) {
       typeof err[Symbol.iterator] !== 'function') return 0
 
   let count = 0
-  for (const nested of err) count += countErrorIdentity(nested, target)
+  for (const nested of err as Error & Iterable<any>) count += countErrorIdentity(nested, target)
   return count
 }
 
@@ -1476,7 +1477,7 @@ function dedupeCleanupError (err, cleanupFailure) {
   if (cleanupFailure === null || !(err instanceof Error) || err.name !== 'CombinedError' ||
       typeof err[Symbol.iterator] !== 'function') return err
 
-  const errors = [...err]
+  const errors = [...(err as Error & Iterable<any>)]
   const duplicate = errors.findLastIndex(error => error === cleanupFailure.error)
   if (duplicate === -1 || countErrorIdentity(err, cleanupFailure.error) < 2) return err
 
@@ -1490,9 +1491,9 @@ function wrapIteratorCleanupRetry (iterator) {
 
   const close = iterator.close
   const all = iterator.all
-  let activeClose = null
+  let activeClose: any = null
   let cleanupDebt = false
-  let cleanupFailure = null
+  let cleanupFailure: any = null
 
   Object.defineProperty(iterator, 'close', {
     configurable: true,
@@ -1501,7 +1502,7 @@ function wrapIteratorCleanupRetry (iterator) {
       if (activeClose !== null) return activeClose.promise
 
       const retry = cleanupDebt
-      const group = { promise: null }
+      const group: any = { promise: null }
       activeClose = group
       group.promise = (async () => {
         try {
@@ -1668,14 +1669,11 @@ function createInheritedColumns (columns, defaults) {
   })
 }
 
-exports.RocksLevel = RocksLevel
-exports.RocksCache = RocksCache
-exports.RocksWriteBufferManager = RocksWriteBufferManager
-exports.RocksStatistics = RocksStatistics
+export { RocksLevel, RocksCache, RocksWriteBufferManager, RocksStatistics }
 
 // null on platforms where io_uring does not apply (non-Linux). On Linux, this
 // reports the same async-I/O capability used by RocksDB's default filesystem;
 // false means reads use the serial fallback.
-exports.ioUringAvailable = function ioUringAvailable () {
+export function ioUringAvailable () {
   return binding.io_uring_available()
 }

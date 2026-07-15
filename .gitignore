@@ -1,6 +1,8 @@
 # When adding entries here, remember to also update `.npmignore`.
 
 node_modules/
+# Generated for publication and intentionally included in npm packages.
+lib/
 build/
 build-pre-gyp/
 Release/

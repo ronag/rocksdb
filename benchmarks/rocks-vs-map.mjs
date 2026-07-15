@@ -1,5 +1,5 @@
 import { bench, run } from 'mitata'
-import { RocksLevel } from '../index.js'
+import { RocksLevel } from '../lib/index.js'
 import { LRUCache } from 'lru-cache'
 import { mkdtemp, rm } from 'node:fs/promises'
 import { tmpdir } from 'node:os'

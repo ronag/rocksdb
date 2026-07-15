@@ -1,4 +1,4 @@
-const { RocksLevel } = require('../index')
+const { RocksLevel } = require('..')
 const test = require('tape')
 const fs = require('fs')
 const path = require('path')

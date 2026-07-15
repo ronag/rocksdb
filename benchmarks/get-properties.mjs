@@ -1,5 +1,5 @@
 import { bench, run, group } from 'mitata'
-import { RocksLevel } from '../index.js'
+import { RocksLevel } from '../lib/index.js'
 import { mkdtemp, rm } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'

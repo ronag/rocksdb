@@ -1,15 +1,12 @@
-'use strict'
-
-const { fromCallback } = require('catering')
-const { AbstractIterator } = require('abstract-level')
-const { Slice } = require('@nxtedition/slice')
-const ModuleError = require('module-error')
-const assert = require('node:assert')
-const { Buffer } = require('node:buffer')
-const { getPackedMode, setPackedResult } = require('./util')
-const { iteratePublicIterator } = require('./public-lifecycle')
-
-const binding = require('./binding')
+import assert from 'node:assert'
+import { Buffer } from 'node:buffer'
+import { Slice } from '@nxtedition/slice'
+import { AbstractIterator } from 'abstract-level'
+import { fromCallback } from 'catering'
+import ModuleError = require('module-error')
+import binding = require('./binding')
+import { iteratePublicIterator } from './public-lifecycle'
+import { getPackedMode, setPackedResult } from './util'
 
 const kPromise = Symbol('promise')
 const kContext = Symbol('context')
@@ -57,7 +54,7 @@ const kClosed = 4
 const getTypedArrayByteLength = Object.getOwnPropertyDescriptor(
   Object.getPrototypeOf(Object.getPrototypeOf(Buffer.prototype)),
   'byteLength'
-).get
+)!.get!
 const copyBytesFrom = Buffer.copyBytesFrom
 
 function normalizeSeekTarget (target) {
@@ -203,7 +200,7 @@ function convertIteratorResult (iterator, result) {
   if (!convertKey && !convertValue) return result
 
   let offsetIndex = 0
-  const rows = []
+  const rows: any[] = []
   const read = (encoding) => {
     const start = result.offsets[offsetIndex++]
     const length = result.offsets[offsetIndex] - start
@@ -226,7 +223,9 @@ function convertIteratorResult (iterator, result) {
   }
 }
 
-class Iterator extends AbstractIterator {
+class Iterator extends AbstractIterator<any, any, any> {
+  [key: symbol]: any
+
   constructor (db, context, options) {
     super(db, options)
 
@@ -403,7 +402,7 @@ class Iterator extends AbstractIterator {
     return Promise.reject(iteratorBusyError('next'))
   }
 
-  nextv (size, options) {
+  nextv (size, options?): any {
     if (DEBUG) assert(!this[kUnsafeBusy], 'public nextv() must not overlap an unsafe operation')
     if (!this[kBusy] || this[kCloseRequested]) {
       const previous = this[kPublicFirstUse]
@@ -425,7 +424,7 @@ class Iterator extends AbstractIterator {
     return Promise.reject(err)
   }
 
-  all (options) {
+  all (options?): any {
     if (DEBUG) assert(!this[kUnsafeBusy], 'public all() must not overlap an unsafe operation')
     if (!this[kBusy] || this[kCloseRequested]) {
       const previous = this[kPublicFirstUse]
@@ -444,7 +443,7 @@ class Iterator extends AbstractIterator {
     return Promise.reject(iteratorBusyError('all'))
   }
 
-  seek (target, options) {
+  seek (target, options?) {
     if (DEBUG) assert(!this[kUnsafeBusy], 'public seek() must not overlap an unsafe operation')
     if (this[kCloseRequested]) return super.seek(target, options)
     if (this[kBusy]) throw iteratorBusyError('seek')
@@ -498,8 +497,8 @@ class Iterator extends AbstractIterator {
     const active = this[kCleanupDebtClose]
     if (active !== null && active.debt === debt) return active.promise
 
-    const group = { debt, promise: null }
-    group.promise = new Promise((resolve, reject) => {
+    const group: any = { debt, promise: null }
+    group.promise = new Promise<void>((resolve, reject) => {
       process.nextTick(() => {
         let err
         try {
@@ -556,9 +555,9 @@ class Iterator extends AbstractIterator {
     this._seekSync(target)
   }
 
-  _close (callback) {
+  _close (callback?) {
     if (callback === undefined) {
-      return new Promise((resolve, reject) => {
+      return new Promise<void>((resolve, reject) => {
         this._close(err => err ? reject(err) : resolve())
       })
     }
@@ -699,13 +698,13 @@ class Iterator extends AbstractIterator {
     const combineInitialization = publicFirstUse === true ||
       (typeof publicFirstUse === 'object' && publicFirstUse !== null && publicFirstUse !== options)
 
-    const done = (err, val) => {
+    const done = (err, val?) => {
       if (err) {
         callback(err)
       } else {
         const { rows, finished, limited } = val
 
-        const entries = []
+        const entries: any[][] = []
         for (let n = 0; n < rows.length; n += 2) {
           entries.push([rows[n + 0], rows[n + 1]])
         }
@@ -988,7 +987,7 @@ class Iterator extends AbstractIterator {
     callback(null, result, packedResult)
   }
 
-  _deferNextResult (callback, err, result, packed, unsafe) {
+  _deferNextResult (callback, err, result?, packed?, unsafe?) {
     process.nextTick(() => {
       if (unsafe) this[kUnsafeBusy] = false
       if (err) {
@@ -1044,5 +1043,4 @@ class Iterator extends AbstractIterator {
   }
 }
 
-exports.Iterator = Iterator
-exports.noFieldsNextOptions = noFieldsNextOptions
+export { Iterator, noFieldsNextOptions }
