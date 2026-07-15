@@ -61,6 +61,11 @@ export ROCKS_LEVEL_MARCH=
 # persistent deps/.prefix/darwin-arm64 populated below.
 unset ROCKS_LEVEL_DEPS_PREFIX
 
+# GYP_DEFINES is a generic caller escape hatch. Public builds accept their
+# audited project variables and explicit ROCKS_LEVEL_* inputs only; in
+# particular, a caller must not be able to re-enable native test fault hooks.
+unset GYP_DEFINES
+
 echo "Building linux prebuilds (docker)..."
 # build.sh still supports explicit tuned builds outside the release flow.
 ./build.sh

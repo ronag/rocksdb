@@ -6,7 +6,9 @@ const path = require('node:path')
 const test = require('tape')
 const {
   EXPECTED_PREBUILDS,
+  NATIVE_TEST_FAULT_HOOKS,
   listEntries,
+  validateNoNativeTestFaultHooks,
   validatePrebuildPaths
 } = require('../scripts/check-release-prebuilds.js')
 
@@ -51,5 +53,49 @@ test('release prebuild manifest enumerates files and non-directory entries', fun
     fs.rmSync(root, { recursive: true, force: true })
   }
 
+  t.end()
+})
+
+test('release prebuild validation rejects native test fault hooks', function (t) {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), 'rocks-level-prebuild-hooks-'))
+
+  try {
+    for (const file of EXPECTED_PREBUILDS) {
+      const absolute = path.join(root, file)
+      fs.mkdirSync(path.dirname(absolute), { recursive: true })
+      fs.writeFileSync(absolute, 'production addon')
+    }
+
+    t.doesNotThrow(() => validateNoNativeTestFaultHooks(root), 'production addons pass')
+
+    const linux = path.join(root, EXPECTED_PREBUILDS[1])
+    fs.appendFileSync(linux, `\0${NATIVE_TEST_FAULT_HOOKS[2]}\0`)
+    t.throws(
+      () => validateNoNativeTestFaultHooks(root),
+      /linux-x64.*test_complete_exception/,
+      'a compiled test capability aborts release validation'
+    )
+  } finally {
+    fs.rmSync(root, { recursive: true, force: true })
+  }
+
+  t.end()
+})
+
+test('release prebuild validation covers every native test export', function (t) {
+  const binding = fs.readFileSync(path.join(__dirname, '..', 'binding.cc'), 'utf8')
+  const guardedBlocks = [...binding.matchAll(
+    /#if defined\(ROCKS_LEVEL_TEST_FAULTS\)([\s\S]*?)#endif/g
+  )]
+  const exports = guardedBlocks.flatMap((block) =>
+    [...block[1].matchAll(/NAPI_EXPORT_FUNCTION\(([a-z0-9_]+)\)/g)]
+      .map((match) => match[1])
+  )
+
+  t.deepEqual(
+    [...new Set(exports)].toSorted(),
+    NATIVE_TEST_FAULT_HOOKS.toSorted(),
+    'adding a native test export also extends the release artifact scanner'
+  )
   t.end()
 })

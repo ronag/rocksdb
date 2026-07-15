@@ -10,6 +10,13 @@ const EXPECTED_PREBUILDS = [
   'prebuilds/linux-x64/@nxtedition+rocksdb.node'
 ]
 
+const NATIVE_TEST_FAULT_HOOKS = [
+  'test_faults_enabled',
+  'test_method_exception',
+  'test_complete_exception',
+  'test_fail_batch_iterator_once'
+]
+
 function listEntries (root, directory = 'prebuilds') {
   const absolute = path.join(root, directory)
   if (!fs.existsSync(absolute)) return []
@@ -39,6 +46,22 @@ function validatePrebuildPaths (paths, source) {
   }
 }
 
+// NAPI_EXPORT_FUNCTION embeds each exported property name as a literal in the
+// addon. This works for both Mach-O and ELF without executing a foreign-platform
+// binary, and fails the release if a staged artifact contains test-only hooks.
+function validateNoNativeTestFaultHooks (root, paths = EXPECTED_PREBUILDS) {
+  for (const relative of paths) {
+    const addon = fs.readFileSync(path.join(root, relative))
+    const exposed = NATIVE_TEST_FAULT_HOOKS.filter((name) => addon.includes(Buffer.from(name)))
+
+    if (exposed.length !== 0) {
+      throw new Error(
+        `${relative} contains native test fault hooks: ${exposed.join(', ')}`
+      )
+    }
+  }
+}
+
 function packPrebuildPaths (root) {
   const output = execFileSync('npm', ['pack', '--dry-run', '--json', '--ignore-scripts'], {
     cwd: root,
@@ -59,6 +82,7 @@ function packPrebuildPaths (root) {
 function main () {
   const root = path.join(__dirname, '..')
   validatePrebuildPaths(listEntries(root), 'working tree')
+  validateNoNativeTestFaultHooks(root)
   validatePrebuildPaths(packPrebuildPaths(root), 'npm pack')
   console.log(`Checked release prebuild manifest: ${EXPECTED_PREBUILDS.join(', ')}`)
 }
@@ -74,6 +98,8 @@ if (require.main === module) {
 
 module.exports = {
   EXPECTED_PREBUILDS,
+  NATIVE_TEST_FAULT_HOOKS,
   listEntries,
+  validateNoNativeTestFaultHooks,
   validatePrebuildPaths
 }

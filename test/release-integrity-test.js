@@ -274,3 +274,32 @@ test('release clears private dependency prefix overrides before public builds', 
   )
   t.end()
 })
+
+test('public prebuild generation cannot inherit caller GYP definitions', function (t) {
+  const bindingGyp = fs.readFileSync(path.join(__dirname, '..', 'binding.gyp'), 'utf8')
+  const release = fs.readFileSync(path.join(__dirname, '..', 'release.sh'), 'utf8')
+  const helper = fs.readFileSync(path.join(__dirname, '..', 'scripts', 'build-darwin-prebuild.sh'), 'utf8')
+  const prebuildify = fs.readFileSync(path.join(__dirname, '..', 'scripts', 'prebuildify.js'), 'utf8')
+  const clearGyp = release.indexOf('unset GYP_DEFINES')
+  const linuxBuild = release.indexOf('./build.sh', clearGyp)
+  const darwinBuild = release.indexOf(
+    'JOBS=16 ./scripts/build-darwin-prebuild.sh "$NODE_TARGET"',
+    linuxBuild
+  )
+
+  t.match(
+    bindingGyp,
+    /"rocks_level_test_faults":\s*"<!\(node/,
+    'the fault variable is assigned rather than defined as an overridable default'
+  )
+  t.notOk(
+    /"rocks_level_test_faults%"/.test(bindingGyp),
+    'GYP_DEFINES cannot override the intended fault-test environment switch'
+  )
+  t.ok(clearGyp >= 0, 'the release clears caller GYP definitions')
+  t.ok(linuxBuild > clearGyp, 'the Linux public build follows the reset')
+  t.ok(darwinBuild > linuxBuild, 'the Darwin public build follows the reset')
+  t.match(helper, /GYP_DEFINES= ROCKS_LEVEL_DEPS_PREFIX=/, 'the Darwin helper also sanitizes GYP')
+  t.match(prebuildify, /GYP_DEFINES: ''/, 'the general prebuild helper also sanitizes GYP')
+  t.end()
+})

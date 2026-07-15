@@ -94,7 +94,7 @@ CANDIDATE_DIR="$OUT_DIR/prebuilds/$PLATFORM"
 # below prebuilds ensures the candidate and destination live on one filesystem.
 # Pin the matching persistent dependency prefix just like scripts/prebuildify.js
 # so a caller's temporary ROCKS_LEVEL_DEPS_PREFIX cannot contaminate a release.
-ROCKS_LEVEL_DEPS_PREFIX="$DEPS_PREFIX" JOBS="${JOBS:-16}" \
+GYP_DEFINES= ROCKS_LEVEL_DEPS_PREFIX="$DEPS_PREFIX" JOBS="${JOBS:-16}" \
   npx prebuildify -t "$1" --napi --strip --arch arm64 --out "$OUT_DIR"
 
 EXPECTED_PREBUILD="$CANDIDATE_DIR/$ADDON"
