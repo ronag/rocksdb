@@ -27,37 +27,72 @@ native addon boundary.
 
 ## Unsafe low-level methods
 
-Every method whose name starts with `_` is an unsafe low-level API. These
-methods bypass the lifecycle, serialization and argument checks provided by the
-corresponding public API. They are intended for callers that already enforce
-the following invariants:
+Any direct call to an underscore-prefixed method is unsafe. Only underscore
+methods declared in [`index.d.ts`](./index.d.ts) are supported low-level
+extensions. Other underscore methods are abstract-level implementation hooks or
+internal helpers and may change without notice. The caller, rather than the
+public API, owns admission, serialization, error handling and cleanup.
 
-- The database, iterator or batch is open and remains open until the operation
-  returns or its callback or promise settles.
-- No other operation or close overlaps on the same iterator or batch.
-- Arguments satisfy the TypeScript declarations. Getters and proxies do not
-  reenter the same resource, and any explicitly borrowed memory remains valid
-  for the duration required by its option.
+### Caller contract
 
-Production builds intentionally avoid adding checks for those invariants to
-the `_` methods. Development builds may assert them to catch integration bugs.
-Use the non-prefixed methods when the caller cannot guarantee this contract.
-This also applies when an underscore method is an implementation hook such as
-`_get()`, `_put()`, `_clear()`, `_batch()`, `_next()`, `_seek()`, `_write()` or
-`_close()`: public methods may establish temporary ownership before dispatching
-through the same hook, while direct calls deliberately do not.
+- The database must already be open. For non-close operations, keep it and every
+  resource involved open until a synchronous call returns or an asynchronous
+  callback or promise settles. Database-level raw reads may overlap one another,
+  but must never overlap database close. Raw close releases its target during
+  the call and is terminal.
+- Serialize every public and unsafe operation on the same iterator or chained
+  batch. This includes lazy initialization, reads, seeks, mutations,
+  `toArray()`, writes, clear and close.
+- Pass already-encoded inputs and options that satisfy the TypeScript
+  declarations. Getters and proxies must not reenter the resource or mutate an
+  input while the call is synchronously admitting it to native code.
+- Observe every asynchronous error. Synchronous methods and construction throw;
+  admitted asynchronous methods reject or report the error to their callback.
+  In development, a pre-admission invariant assertion may throw synchronously.
+- Direct unsafe calls bypass public status and operation queues, public and
+  custom key/value codecs, sublevel prefixing, hooks and events,
+  abstract-level iterator count/end bookkeeping, cleanup retry ownership and
+  public resource state. Native iterator ranges and limits, and the declared
+  raw result encodings, still apply.
 
-### Raw chained-batch clear
+Production builds intentionally do not enforce these JavaScript-level
+invariants. Development builds may assert them. Native type, bounds, database
+generation and resource-safety checks remain in every build. Use the public
+methods whenever the caller cannot guarantee the complete contract.
 
-The chained batch's unsafe `_clear()` implementation remains unchanged: it
-clears only the native RocksDB batch. Abstract-level v3 keeps the queued
-operations, write-event data and prewrite data used by public `put()` and
-`del()` private, so calling `_clear()` directly cannot reset that bookkeeping.
-It is valid only for batches managed exclusively through the unsafe raw API.
+Async get-many keys and seek targets are copied by native admission before the
+method returns. Chained-batch mutation inputs are also copied synchronously, and
+raw read results own their backing bytes. The undeclared lazy `_seek()`
+implementation hook is an exception: a direct call can retain its target until
+first initialization and is not a supported low-level extension.
 
-After any public `put()` or `del()`, and for every batch that mixes public and
-raw operations, use public `clear()` instead. It clears both the native batch
-and abstract-level's private bookkeeping.
+### Raw resource close
+
+Successful raw iterator and batch close methods release native state and detach
+the resource from the database, but deliberately do not update abstract-level's
+private public status. Raw close is terminal: do not call any public or unsafe
+method on that wrapper afterward. A failed raw close remains attached so the
+caller can retry cleanup; the caller owns and must observe the original error.
+
+### Raw chained batches
+
+Raw mutators can be followed by public mutators and public terminal methods. If
+any public mutation or prewrite bookkeeping exists, use public `write()`,
+`clear()` or `close()` so abstract-level can reconcile its private state.
+
+Direct `_clear()`, `_writeSync()`, `_writeAsync()` and raw close are valid only
+when native/raw state is the complete batch state. `_clear()` clears only the
+native RocksDB batch. Raw writes submit the current native operations but do not
+consume, clear or close them; another raw write replays those operations. The
+caller must explicitly clear or close the raw-managed batch after writing.
+
+### Blocking behavior
+
+Unsafe synchronous methods can perform RocksDB I/O and block the JavaScript
+event loop. In particular this includes `_getManySync()`, `_refreshSync()`,
+`_seekSync()`, `_nextvSync()`, `_writeSync()` and `_closeSync()`.
+Iterator `_closeAsync()` also performs native cleanup synchronously and defers
+only its completion notification.
 
 ## Deferred iterator `all()` options
 
@@ -118,9 +153,12 @@ shapes, with their enabled fields converted to strings in JavaScript. The
 `packed` discriminator still reports the native representation selected before
 that conversion.
 
-Both `packed: true` and `packed: 'auto'` require `buffer`, `slice`, `utf8` or
-`utf-8` for every enabled raw field. Other encodings throw. Buffer-encoded
-packed reads preserve the arena result described above.
+The declared contract permits `packed: true` and `packed: 'auto'` only with
+`buffer`, `slice`, `utf8` or `utf-8` for every enabled raw field. Development
+builds diagnose incompatible combinations. Production raw calls assume that
+invariant and do not guarantee a JavaScript validation error for malformed
+combinations. Buffer-encoded packed reads preserve the arena result described
+above.
 
 ### Choosing a packed mode
 

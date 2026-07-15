@@ -303,9 +303,10 @@ test('production raw methods do not claim admission or close ownership', functio
           db._getManyAsync([Buffer.from('key')], { packed: false }, undefined, false, false),
           db._getManyAsync([Buffer.from('key')], { packed: false }, undefined, false, false),
           db._getMany([Buffer.from('key')], { packed: false }),
-          db._get(Buffer.from('key'), { packed: false })
+          db._get(Buffer.from('key'), { packed: false }),
+          db.get('key', { valueEncoding: 'buffer' })
         ]
-        assert.equal(reads.length, 4, 'overlapping raw reads must all reach native code')
+        assert.equal(reads.length, 5, 'overlapping raw and public reads must all reach native code')
         assert.deepEqual(
           db._getManySync([Buffer.from('key')], { packed: false }),
           [Buffer.from('value')],
@@ -314,8 +315,8 @@ test('production raw methods do not claim admission or close ownership', functio
 
         let rawCloseSettled = false
         db._close(() => { rawCloseSettled = true })
-        assert.equal(rawDbCloses, 1, 'raw reads must not lease the database')
-        assert.equal(rawCloseSettled, true, 'raw close must not wait for raw reads')
+        assert.equal(rawDbCloses, 1, 'raw close must bypass public database ownership')
+        assert.equal(rawCloseSettled, true, 'raw close must not wait for public or raw reads')
 
         for (const complete of reads) complete(null, [Buffer.from('value')])
         await Promise.all(reading)
@@ -412,6 +413,40 @@ test('production raw methods do not claim admission or close ownership', functio
         await iterator.close()
       }
 
+      const reentrantIterator = db.iterator()
+      const originalReentrantIteratorClose = binding.iterator_close_sync
+      let reentrantIteratorCloses = 0
+      let rawIteratorClose
+      binding.iterator_close_sync = function (...args) {
+        reentrantIteratorCloses++
+        return originalReentrantIteratorClose(...args)
+      }
+      try {
+        let seekError
+        try {
+          reentrantIterator.seek('key', {
+            keyEncoding: {
+              name: 'raw-close-reentry',
+              format: 'buffer',
+              encode (value) {
+                rawIteratorClose = reentrantIterator._close()
+                assert.equal(reentrantIteratorCloses, 1,
+                  'raw iterator close must bypass public seek ownership')
+                return Buffer.from(value)
+              },
+              decode (value) { return value.toString() }
+            }
+          })
+        } catch (err) {
+          seekError = err
+        }
+        assert(seekError, 'the public seek observes the terminal raw close')
+        await rawIteratorClose
+      } finally {
+        binding.iterator_close_sync = originalReentrantIteratorClose
+        if (!rawIteratorClose) await reentrantIterator.close()
+      }
+
       const ownedIterator = db.iterator()
       await ownedIterator._seekAsync(Buffer.from('key'))
       const originalOwnedNextv = binding.iterator_nextv
@@ -429,7 +464,33 @@ test('production raw methods do not claim admission or close ownership', functio
         await reading
       } finally {
         binding.iterator_nextv = originalOwnedNextv
-        await ownedIterator.close()
+      }
+
+      const reentrantBatch = db._chainedBatch()
+      reentrantBatch._put('key', 'value')
+      const originalReentrantBatchClear = binding.batch_clear
+      const originalReentrantBatchIterate = binding.batch_iterate
+      let reentrantBatchClears = 0
+      let rawBatchClose
+      binding.batch_clear = function (...args) {
+        reentrantBatchClears++
+        return originalReentrantBatchClear(...args)
+      }
+      binding.batch_iterate = function () { return [] }
+      try {
+        assert.deepEqual(reentrantBatch.toArray({
+          get keys () {
+            rawBatchClose = reentrantBatch._close()
+            assert.equal(reentrantBatchClears, 1,
+              'raw batch close must bypass public toArray ownership')
+            return true
+          }
+        }), [])
+        await rawBatchClose
+      } finally {
+        binding.batch_clear = originalReentrantBatchClear
+        binding.batch_iterate = originalReentrantBatchIterate
+        if (!rawBatchClose) await reentrantBatch.close()
       }
 
       const batch = db.batch()
@@ -718,6 +779,11 @@ test('development assertions diagnose overlapping unsafe operations', async func
       () => initializingIterator._seekSync(Buffer.from('key')),
       /must not overlap iterator initialization/,
       'iterator initialization overlap is asserted in development'
+    )
+    t.throws(
+      () => initializingIterator._closeSync(),
+      /must not overlap iterator initialization/,
+      'iterator close during initialization is asserted in development'
     )
     completeInitNextv(null, {
       rows: [Buffer.from('key'), Buffer.from('value')],

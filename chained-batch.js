@@ -49,12 +49,10 @@ function batchNotOpenError (method) {
 }
 
 function assertBatchIdle (batch) {
-  if (DEBUG) {
-    assert(batch[kBatchContext], 'unsafe batch method requires an open batch')
-    assert(!batch[kBusy], 'unsafe batch methods must not overlap')
-    assert(!batch[kPublicWriting], 'unsafe batch methods must not overlap a public write')
-    assert(!batch[kUnsafeBusy], 'unsafe batch methods must not overlap')
-  }
+  assert(batch[kBatchContext], 'unsafe batch method requires an open batch')
+  assert(!batch[kBusy], 'unsafe batch methods must not overlap')
+  assert(!batch[kPublicWriting], 'unsafe batch methods must not overlap a public write')
+  assert(!batch[kUnsafeBusy], 'unsafe batch methods must not overlap')
 }
 
 function combineCleanupError (operationError, cleanupError) {
@@ -349,8 +347,8 @@ class ChainedBatch extends AbstractChainedBatch {
   }
 
   _put (key, value, options) {
-    assertBatchIdle(this)
     if (DEBUG) {
+      assertBatchIdle(this)
       assert(key !== null && key !== undefined, 'unsafe _put() requires a key')
       assert(value !== null && value !== undefined, 'unsafe _put() requires a value')
     }
@@ -363,8 +361,8 @@ class ChainedBatch extends AbstractChainedBatch {
   }
 
   _putParts (key, value, options) {
-    assertBatchIdle(this)
     if (DEBUG) {
+      assertBatchIdle(this)
       assert(key !== null && key !== undefined, 'unsafe _putParts() requires a key')
       assert(value !== null && value !== undefined, 'unsafe _putParts() requires a value')
     }
@@ -374,8 +372,10 @@ class ChainedBatch extends AbstractChainedBatch {
   }
 
   _putLogData (blob) {
-    assertBatchIdle(this)
-    if (DEBUG) assert(blob !== null && blob !== undefined, 'unsafe _putLogData() requires data')
+    if (DEBUG) {
+      assertBatchIdle(this)
+      assert(blob !== null && blob !== undefined, 'unsafe _putLogData() requires data')
+    }
 
     blob = typeof blob === 'string' ? Buffer.from(blob) : blob
 
@@ -383,8 +383,10 @@ class ChainedBatch extends AbstractChainedBatch {
   }
 
   _del (key, options) {
-    assertBatchIdle(this)
-    if (DEBUG) assert(key !== null && key !== undefined, 'unsafe _del() requires a key')
+    if (DEBUG) {
+      assertBatchIdle(this)
+      assert(key !== null && key !== undefined, 'unsafe _del() requires a key')
+    }
 
     key = typeof key === 'string' ? Buffer.from(key) : key
 
@@ -397,7 +399,7 @@ class ChainedBatch extends AbstractChainedBatch {
   // metadata. After public put()/del(), use clear(), which clears both layers.
   // Keep the raw implementation below unchanged for unsafe native-only callers.
   _clear () {
-    assertBatchIdle(this)
+    if (DEBUG) assertBatchIdle(this)
 
     binding.batch_clear(this[kBatchContext])
     this[kLength] = 0
@@ -410,7 +412,7 @@ class ChainedBatch extends AbstractChainedBatch {
       })
     }
 
-    assertBatchIdle(this)
+    if (DEBUG) assertBatchIdle(this)
     const owned = this[kPublicWriteToken] === true
     if (owned) this[kPublicWriteToken] = false
     if (owned) this[kPublicWriting] = true
@@ -423,7 +425,7 @@ class ChainedBatch extends AbstractChainedBatch {
   }
 
   _writeSync (options) {
-    assertBatchIdle(this)
+    if (DEBUG) assertBatchIdle(this)
     if (!DEBUG) {
       binding.batch_write_sync(this[kDbContext], this[kBatchContext], options ?? EMPTY)
       return
@@ -438,7 +440,7 @@ class ChainedBatch extends AbstractChainedBatch {
   }
 
   _writeAsync (options, callback) {
-    assertBatchIdle(this)
+    if (DEBUG) assertBatchIdle(this)
     callback = fromCallback(callback, kPromise)
     if (DEBUG) {
       this[kUnsafeBusy] = true
@@ -468,18 +470,22 @@ class ChainedBatch extends AbstractChainedBatch {
         this._close(err => err ? reject(err) : resolve())
       })
     }
+    const publicCleanup = this[kPublicCleanup] > 0
     if (DEBUG) {
-      assert(this[kBatchContext], 'unsafe _close() requires an open batch')
+      if (!publicCleanup) {
+        assert(this[kBatchContext], 'unsafe _close() requires an open batch')
+        assert(!this[kBusy], 'unsafe _close() must not overlap a public operation')
+        assert(!this[kPublicWriting], 'unsafe _close() must not overlap a public write')
+      }
       assert(!this[kUnsafeBusy], 'unsafe _close() must not overlap an unsafe operation')
     }
 
-    if (this[kBusy]) {
+    if (publicCleanup && this[kBusy]) {
       if (DEBUG) assert(!this[kPendingClose])
       this[kPendingClose] = callback
       return
     }
 
-    const publicCleanup = this[kPublicCleanup] > 0
     const complete = (err) => {
       if (err && publicCleanup) {
         this[kCleanupDebt] = { error: err }
@@ -506,15 +512,16 @@ class ChainedBatch extends AbstractChainedBatch {
   }
 
   _closeSync () {
-    assertBatchIdle(this)
+    if (DEBUG) assertBatchIdle(this)
 
     binding.batch_clear(this[kBatchContext])
     this[kBatchContext] = null
+    this.db.detachResource(this)
   }
 
   _merge (key, value, options) {
-    assertBatchIdle(this)
     if (DEBUG) {
+      assertBatchIdle(this)
       assert(key !== null && key !== undefined, 'unsafe _merge() requires a key')
       assert(value !== null && value !== undefined, 'unsafe _merge() requires a value')
     }
@@ -527,8 +534,8 @@ class ChainedBatch extends AbstractChainedBatch {
   }
 
   _mergeParts (key, value, options) {
-    assertBatchIdle(this)
     if (DEBUG) {
+      assertBatchIdle(this)
       assert(key !== null && key !== undefined, 'unsafe _mergeParts() requires a key')
       assert(value !== null && value !== undefined, 'unsafe _mergeParts() requires a value')
     }

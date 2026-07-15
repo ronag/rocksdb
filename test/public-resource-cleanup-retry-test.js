@@ -520,6 +520,122 @@ test('unsafe raw close hooks remain caller-owned', async function (t) {
   t.end()
 })
 
+test('successful unsafe raw closes detach immediately and are not replayed by database close', async function (t) {
+  const db = testCommon.factory()
+  await db.open()
+  const iterator = db._iterator()
+  const batch = db._chainedBatch()
+  const originalDetach = db.detachResource
+  const originalIteratorClose = binding.iterator_close_sync
+  const originalBatchClear = binding.batch_clear
+  const detached = []
+  let iteratorCloseCalls = 0
+  let batchClearCalls = 0
+
+  db.detachResource = function (resource) {
+    detached.push(resource)
+    return originalDetach.call(this, resource)
+  }
+  binding.iterator_close_sync = function (...args) {
+    iteratorCloseCalls++
+    return originalIteratorClose(...args)
+  }
+  binding.batch_clear = function (...args) {
+    batchClearCalls++
+    return originalBatchClear(...args)
+  }
+
+  try {
+    iterator._closeSync()
+    t.deepEqual(detached, [iterator], 'raw iterator close detaches before returning')
+    t.equal(iteratorCloseCalls, 1, 'raw iterator close performs one native cleanup')
+
+    batch._closeSync()
+    t.deepEqual(detached, [iterator, batch], 'raw batch close detaches before returning')
+    t.equal(batchClearCalls, 1, 'raw batch close performs one native cleanup')
+
+    await db.close()
+    t.equal(iteratorCloseCalls, 1, 'database close does not replay iterator cleanup')
+    t.equal(batchClearCalls, 1, 'database close does not replay batch cleanup')
+  } finally {
+    binding.iterator_close_sync = originalIteratorClose
+    binding.batch_clear = originalBatchClear
+    db.detachResource = originalDetach
+    if (db.status !== 'closed') await db.close()
+  }
+
+  t.end()
+})
+
+test('failed unsafe raw closes stay attached and can be retried by their caller', async function (t) {
+  const db = testCommon.factory()
+  await db.open()
+  const iterator = db._iterator()
+  const batch = db._chainedBatch()
+  const originalDetach = db.detachResource
+  const originalIteratorClose = binding.iterator_close_sync
+  const originalBatchClear = binding.batch_clear
+  const iteratorError = new Error('raw iterator close failed')
+  const batchError = new Error('raw batch close failed')
+  const detached = []
+  let iteratorCloseCalls = 0
+  let batchClearCalls = 0
+  let iteratorClosed = false
+  let batchClosed = false
+
+  db.detachResource = function (resource) {
+    detached.push(resource)
+    return originalDetach.call(this, resource)
+  }
+  binding.iterator_close_sync = function () {
+    iteratorCloseCalls++
+    throw iteratorError
+  }
+  binding.batch_clear = function () {
+    batchClearCalls++
+    throw batchError
+  }
+
+  try {
+    t.throws(() => iterator._closeSync(), err => err === iteratorError,
+      'raw iterator close reports its native cleanup error')
+    t.throws(() => batch._closeSync(), err => err === batchError,
+      'raw batch close reports its native cleanup error')
+    t.deepEqual(detached, [], 'failed raw closes retain database ownership')
+
+    binding.iterator_close_sync = function (...args) {
+      iteratorCloseCalls++
+      return originalIteratorClose(...args)
+    }
+    binding.batch_clear = function (...args) {
+      batchClearCalls++
+      return originalBatchClear(...args)
+    }
+
+    iterator._closeSync()
+    iteratorClosed = true
+    batch._closeSync()
+    batchClosed = true
+
+    t.equal(iteratorCloseCalls, 2, 'caller can retry raw iterator cleanup')
+    t.equal(batchClearCalls, 2, 'caller can retry raw batch cleanup')
+    t.deepEqual(detached, [iterator, batch], 'successful retries release database ownership')
+
+    await db.close()
+    t.equal(iteratorCloseCalls, 2, 'database close does not replay retried iterator cleanup')
+    t.equal(batchClearCalls, 2, 'database close does not replay retried batch cleanup')
+  } finally {
+    binding.iterator_close_sync = originalIteratorClose
+    binding.batch_clear = originalBatchClear
+    db.detachResource = originalDetach
+    if (!iteratorClosed) iterator._closeSync()
+    if (!batchClosed) batch._closeSync()
+    if (db.status !== 'closed') await db.close()
+  }
+
+  t.end()
+})
+
 test('cleanup debt does not prevent resource finalization fallback', function (t) {
   const script = String.raw`
     const assert = require('node:assert/strict')

@@ -114,19 +114,17 @@ function iteratorNotOpenError () {
 }
 
 function assertIteratorIdle (iterator, operation) {
-  if (DEBUG) {
-    assert(
-      iterator[kContext] || iterator[kInitState] === kFailed,
-      `unsafe ${operation}() requires an open iterator`
-    )
-    assert(
-      iterator[kInitState] !== kInitializing,
-      `unsafe ${operation}() must not overlap iterator initialization`
-    )
-    assert(!iterator[kCloseRequested], `unsafe ${operation}() must not overlap close()`)
-    assert(!iterator[kBusy], `unsafe ${operation}() must not overlap another operation`)
-    assert(!iterator[kUnsafeBusy], `unsafe ${operation}() must not overlap another unsafe operation`)
-  }
+  assert(
+    iterator[kContext] || iterator[kInitState] === kFailed,
+    `unsafe ${operation}() requires an open iterator`
+  )
+  assert(
+    iterator[kInitState] !== kInitializing,
+    `unsafe ${operation}() must not overlap iterator initialization`
+  )
+  assert(!iterator[kCloseRequested], `unsafe ${operation}() must not overlap close()`)
+  assert(!iterator[kBusy], `unsafe ${operation}() must not overlap another operation`)
+  assert(!iterator[kUnsafeBusy], `unsafe ${operation}() must not overlap another unsafe operation`)
 }
 
 function packedCacheError () {
@@ -538,7 +536,13 @@ class Iterator extends AbstractIterator {
   _seek (target) {
     if (this[kPublicSeek] && this[kCloseRequested]) return
     if (this[kInitState] === kUninitialized) {
-      const initialTarget = snapshotSeekTarget(target)
+      if (DEBUG && !this[kPublicSeek]) assertIteratorIdle(this, '_seek')
+      let initialTarget
+      if (this[kPublicSeek]) {
+        initialTarget = snapshotSeekTarget(target)
+      } else {
+        initialTarget = DEBUG ? normalizeSeekTarget(target) : target
+      }
       if (this[kPublicSeek] && this[kCloseRequested]) return
 
       this[kInitialTarget] = initialTarget
@@ -563,6 +567,7 @@ class Iterator extends AbstractIterator {
     // needed for synchronous public seek accessors that reenter close(). Raw
     // methods deliberately do not acquire cleanup debt or close ownership.
     const publicCleanup = this[kPublicCleanup] > 0
+    if (DEBUG && !publicCleanup) assertIteratorIdle(this, '_close')
     const complete = (err) => {
       if (err && publicCleanup) {
         this[kCleanupDebt] = { error: err }
@@ -572,7 +577,7 @@ class Iterator extends AbstractIterator {
       }
     }
 
-    if (this[kBusy]) {
+    if (publicCleanup && this[kBusy]) {
       this[kPendingClose] = complete
     } else {
       this._closeAsync(complete)
@@ -737,7 +742,7 @@ class Iterator extends AbstractIterator {
   // nxt API
 
   _refreshSync () {
-    assertIteratorIdle(this, '_refreshSync')
+    if (DEBUG) assertIteratorIdle(this, '_refreshSync')
     this._initializeSync()
     if (DEBUG) assert(this[kContext])
 
@@ -750,7 +755,7 @@ class Iterator extends AbstractIterator {
   }
 
   _seekSync (target) {
-    assertIteratorIdle(this, '_seekSync')
+    if (DEBUG) assertIteratorIdle(this, '_seekSync')
     if (!DEBUG) return this[kSeekSync](target, false)
 
     this[kUnsafeBusy] = true
@@ -762,7 +767,7 @@ class Iterator extends AbstractIterator {
   }
 
   [kSeekSync] (target, owned) {
-    target = normalizeSeekTarget(target)
+    if (owned || DEBUG) target = normalizeSeekTarget(target)
     if (owned && this[kCloseRequested]) return
 
     const discardedCount = (this[kCache].length - this[kPosition]) / 2
@@ -772,7 +777,7 @@ class Iterator extends AbstractIterator {
     this[kPosition] = 0
 
     if (this[kInitState] === kUninitialized) {
-      const initialTarget = snapshotSeekTarget(target)
+      const initialTarget = owned ? snapshotSeekTarget(target) : target
       if (owned && this[kCloseRequested]) return
       this._initializeSync(initialTarget)
     } else {
@@ -782,16 +787,15 @@ class Iterator extends AbstractIterator {
   }
 
   _seekAsync (target, callback) {
-    assertIteratorIdle(this, '_seekAsync')
+    if (DEBUG) assertIteratorIdle(this, '_seekAsync')
     callback = fromCallback(callback, kPromise)
     if (DEBUG) this[kUnsafeBusy] = true
     try {
-      target = normalizeSeekTarget(target)
+      if (DEBUG) target = normalizeSeekTarget(target)
 
       const discardedCount = (this[kCache].length - this[kPosition]) / 2
       if (this[kInitState] === kUninitialized) {
-        const initialTarget = snapshotSeekTarget(target)
-        this[kInitialTarget] = initialTarget
+        this[kInitialTarget] = target
         this[kFirst] = true
         this[kCache] = kEmpty
         this[kFinished] = false
@@ -841,7 +845,7 @@ class Iterator extends AbstractIterator {
   }
 
   _nextvSync (size, options) {
-    assertIteratorIdle(this, '_nextvSync')
+    if (DEBUG) assertIteratorIdle(this, '_nextvSync')
     if (!DEBUG) return this[kNextvSync](size, options)
 
     this[kUnsafeBusy] = true
@@ -856,7 +860,7 @@ class Iterator extends AbstractIterator {
     this._initializeSync()
     if (DEBUG) assert(this[kContext])
     const packed = getPackedMode(options, getDefaultPackedMode(this))
-    validatePackedEncodings(this, packed)
+    if (DEBUG) validatePackedEncodings(this, packed)
 
     if (this[kPosition] < this[kCache].length) {
       if (packed === true) throw packedCacheError()
@@ -881,7 +885,7 @@ class Iterator extends AbstractIterator {
   }
 
   _nextvAsync (size, options, callback, packed) {
-    assertIteratorIdle(this, '_nextvAsync')
+    if (DEBUG) assertIteratorIdle(this, '_nextvAsync')
     callback = fromCallback(callback, kPromise)
     if (DEBUG) this[kUnsafeBusy] = true
     return this[kNextvAsync](size, options, callback, packed, DEBUG, false)
@@ -908,7 +912,7 @@ class Iterator extends AbstractIterator {
 
     try {
       if (packed == null) packed = getPackedMode(options, getDefaultPackedMode(this))
-      validatePackedEncodings(this, packed)
+      if (DEBUG) validatePackedEncodings(this, packed)
 
       if (this[kPosition] < this[kCache].length) {
         if (packed === true) throw packedCacheError()
@@ -1004,6 +1008,10 @@ class Iterator extends AbstractIterator {
 
   _closeSync () {
     if (DEBUG) {
+      assert(
+        this[kInitState] !== kInitializing,
+        'unsafe _closeSync() must not overlap iterator initialization'
+      )
       assert(!this[kBusy], 'unsafe _closeSync() must not overlap a public operation')
       assert(!this[kUnsafeBusy], 'unsafe _closeSync() must not overlap an unsafe operation')
     }
@@ -1019,6 +1027,7 @@ class Iterator extends AbstractIterator {
     this[kInitCallbacks] = []
     this[kInitError] = null
     this[kInitialTarget] = null
+    this.db.detachResource(this)
   }
 
   _closeAsync (callback) {

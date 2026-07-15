@@ -157,6 +157,10 @@ expectType<RocksRawGetManyResult<'utf8', boolean>>(
 )
 // @ts-expect-error Packed getMany does not support view output
 db._getManySync([slice], { packed: true, valueEncoding: 'view' })
+// @ts-expect-error Raw keys cannot be null
+db._getManySync([null])
+// @ts-expect-error Raw packed mode is a closed literal union
+db._getManySync([slice], { packed: 'sometimes' })
 
 const boundedValues = db.getMany(['key'], { highWaterMarkBytes: 0 })
 expectTrue<Equal<
@@ -225,6 +229,13 @@ iterator._nextvAsync(10, { packed: 'auto' }, (err, result, packed) => {
   if (result?.packed) expectType<RocksPackedIteratorResult>(result)
 })
 expectType<Promise<void>>(iterator[Symbol.asyncDispose]())
+expectType<RocksPackedIteratorResult | RocksRawIteratorResult<Buffer, Buffer>>(
+  db._iterator()._nextvSync(1)
+)
+// @ts-expect-error Raw seek targets must already be encoded
+iterator._seekSync({})
+// @ts-expect-error Raw packed mode is a closed literal union
+iterator._nextvSync(1, { packed: 'sometimes' })
 
 const sliceIterator = db._iterator({ keyEncoding: 'slice', valueEncoding: 'slice' })
 expectType<RocksRawIteratorResult<Slice, Slice, true, true, boolean>>(
@@ -382,6 +393,10 @@ batch._merge(slice, slice)
 batch._mergeParts([slice], batchParts)
 batch._putLogData(slice)
 batch._writeSync({ sync: true })
+// @ts-expect-error Raw batch values cannot be null
+batch._put(slice, null)
+// @ts-expect-error Raw batch parts must be Buffer or SliceLike values
+batch._putParts([Buffer.from('key'), 'not-encoded'], batchParts)
 expectType<Array<string | Buffer | null>>(
   batch.toArray({ keyEncoding: 'utf8', valueEncoding: 'buffer' })
 )
