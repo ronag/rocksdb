@@ -1,7 +1,7 @@
 'use strict'
 
 const test = require('tape')
-const tempy = require('tempy')
+const temporaryDirectory = require('./temporary-directory')
 const { spawnSync } = require('node:child_process')
 const binding = require('../binding')
 const { RocksLevel, RocksCache, RocksWriteBufferManager, RocksStatistics } = require('..')
@@ -40,7 +40,7 @@ test('invalid native resource handles reject instead of dereferencing pointers',
 })
 
 test('exported native handles have a process-wide type-safe namespace', async function (t) {
-  const db = await RocksLevel.open(tempy.directory())
+  const db = await RocksLevel.open(temporaryDirectory())
   const cache = new RocksCache({ capacity: 1024 })
   const manager = new RocksWriteBufferManager({ bufferSize: 1024, cache })
 
@@ -55,7 +55,7 @@ test('exported native handles have a process-wide type-safe namespace', async fu
 })
 
 test('an imported handle reserves the database until its wrapper opens', async function (t) {
-  const location = tempy.directory()
+  const location = temporaryDirectory()
   const first = await RocksLevel.open(location)
   await first.put('key', 'value')
   const second = new RocksLevel(first.handle)
@@ -72,7 +72,7 @@ test('an imported handle reserves the database until its wrapper opens', async f
 })
 
 test('an imported handle preserves its shared statistics resource', async function (t) {
-  const location = tempy.directory()
+  const location = temporaryDirectory()
   const statistics = new RocksStatistics({ enabled: true })
   const first = await RocksLevel.open(location, { statistics })
   const second = new RocksLevel(first.handle, { statistics })
@@ -90,7 +90,7 @@ test('an imported handle preserves its shared statistics resource', async functi
 })
 
 test('invalid statistics resources release imported handle reservations', async function (t) {
-  const location = tempy.directory()
+  const location = temporaryDirectory()
   const first = await RocksLevel.open(location)
   const invalid = Object.create(RocksStatistics.prototype)
   const second = new RocksLevel(first.handle, { statistics: invalid })
@@ -107,7 +107,7 @@ test('invalid statistics resources release imported handle reservations', async 
 })
 
 test('failed imported opens release reservations and reject column mismatches', async function (t) {
-  const location = tempy.directory()
+  const location = temporaryDirectory()
   const first = await RocksLevel.open(location, {
     columns: { default: {}, first: {} }
   })
@@ -128,7 +128,7 @@ test('failed imported opens release reservations and reject column mismatches', 
 })
 
 test('disposing the final raw reservation releases the database lock', async function (t) {
-  const location = tempy.directory()
+  const location = temporaryDirectory()
   const source = await RocksLevel.open(location)
   const reserved = binding.db_init(source.handle)
 
@@ -142,7 +142,7 @@ test('disposing the final raw reservation releases the database lock', async fun
 })
 
 test('constructor option failures release imported handle reservations', async function (t) {
-  const location = tempy.directory()
+  const location = temporaryDirectory()
   const first = await RocksLevel.open(location)
   t.throws(() => new RocksLevel(first.handle, { keyEncoding: 'not-an-encoding' }))
   await first.close()
@@ -154,7 +154,7 @@ test('constructor option failures release imported handle reservations', async f
 })
 
 test('stale native batches reject every mutation after reopen', async function (t) {
-  const context = binding.db_init(tempy.directory())
+  const context = binding.db_init(temporaryDirectory())
   await nativeOpen(context)
   const batch = binding.batch_init(context)
 
@@ -176,7 +176,7 @@ test('stale native batches reject every mutation after reopen', async function (
 })
 
 test('stale column handles and closed native iterators fail safely', async function (t) {
-  const location = tempy.directory()
+  const location = temporaryDirectory()
   const db = await RocksLevel.open(location, { columns: { default: {}, records: {} } })
   const stale = db.columns.records
   await db.close()
@@ -186,7 +186,7 @@ test('stale column handles and closed native iterators fail safely', async funct
   t.equal(err && err.code, 'LEVEL_INVALID_COLUMN')
   await db.close()
 
-  const context = binding.db_init(tempy.directory())
+  const context = binding.db_init(temporaryDirectory())
   await nativeOpen(context)
   const iterator = binding.iterator_create(context, {})
   binding.iterator_close_sync(iterator)
@@ -199,7 +199,7 @@ test('stale column handles and closed native iterators fail safely', async funct
 })
 
 test('native iterator seek clamps discarded-row credit without bypassing its limit', async function (t) {
-  const context = binding.db_init(tempy.directory())
+  const context = binding.db_init(temporaryDirectory())
   await nativeOpen(context)
   const batch = binding.batch_init(context)
   for (let i = 0; i < 5; i++) {
@@ -236,7 +236,7 @@ test('column names are defined safely and preserve embedded NUL bytes', async fu
   })
   columns['nul\0column'] = {}
 
-  const db = await RocksLevel.open(tempy.directory(), { columns })
+  const db = await RocksLevel.open(temporaryDirectory(), { columns })
   t.ok(Object.hasOwn(db.columns, '__proto__'))
   t.ok(Object.hasOwn(db.columns, 'nul\0column'))
   await db.close()
@@ -244,7 +244,7 @@ test('column names are defined safely and preserve embedded NUL bytes', async fu
 })
 
 test('native async reads hold an operation lease across immediate close', async function (t) {
-  const context = binding.db_init(tempy.directory())
+  const context = binding.db_init(temporaryDirectory())
   await nativeOpen(context)
   const batch = binding.batch_init(context)
   for (let i = 0; i < 200; i++) {
@@ -266,7 +266,7 @@ test('native async reads hold an operation lease across immediate close', async 
 })
 
 test('native synchronous reads cannot race database teardown', async function (t) {
-  const context = binding.db_init(tempy.directory())
+  const context = binding.db_init(temporaryDirectory())
   await nativeOpen(context)
 
   for (let i = 0; i < 50; i++) {
@@ -286,7 +286,7 @@ test('native synchronous reads cannot race database teardown', async function (t
 })
 
 test('native SliceLike byte ranges require finite integers', async function (t) {
-  const context = binding.db_init(tempy.directory())
+  const context = binding.db_init(temporaryDirectory())
   await nativeOpen(context)
   const buffer = Buffer.from('key')
 
@@ -316,7 +316,7 @@ test('native SliceLike byte ranges require finite integers', async function (t) 
 })
 
 test('GC cannot deadlock a raw native operation finalizer', function (t) {
-  const location = tempy.directory()
+  const location = temporaryDirectory()
   const bindingPath = JSON.stringify(require.resolve('../binding'))
   const script = `
     'use strict'

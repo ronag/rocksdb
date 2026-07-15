@@ -1,7 +1,7 @@
 'use strict'
 
 const test = require('tape')
-const tempy = require('tempy')
+const temporaryDirectory = require('./temporary-directory')
 const binding = require('../binding')
 
 const available = typeof binding.test_complete_exception === 'function' &&
@@ -155,7 +155,7 @@ test('native completion catches converter exceptions', { skip: !available }, asy
 })
 
 test('failed update conversion cannot contaminate the next WAL batch', { skip: !available }, async function (t) {
-  const context = binding.db_init(tempy.directory())
+  const context = binding.db_init(temporaryDirectory())
   let updates
 
   try {

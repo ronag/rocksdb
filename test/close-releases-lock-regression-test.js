@@ -1,7 +1,7 @@
 'use strict'
 
 const test = require('tape')
-const tempy = require('tempy')
+const temporaryDirectory = require('./temporary-directory')
 const { RocksLevel } = require('..')
 
 // Regression: close() must perform the native db_close — releasing the RocksDB
@@ -20,7 +20,7 @@ async function reopen (location) {
 }
 
 test('close() releases the directory lock on the direct (no in-flight op) path', async function (t) {
-  const location = tempy.directory()
+  const location = temporaryDirectory()
   const db = new RocksLevel(location)
   await db.open()
   await db.put('x', '1')
@@ -42,7 +42,7 @@ test('close() releases the directory lock when deferred by an in-flight op', asy
   const closed = []
 
   for (const [name, startOp] of Object.entries(ops)) {
-    const location = tempy.directory()
+    const location = temporaryDirectory()
     const db = new RocksLevel(location)
     closed.push(db)
     await db.open()

@@ -1,10 +1,11 @@
 'use strict'
 
 const test = require('tape')
-const tempy = require('tempy')
+const temporaryDirectory = require('./temporary-directory')
 const { spawnSync } = require('node:child_process')
 const binding = require('../binding')
 const { RocksLevel } = require('..')
+const temporaryDirectoryPath = JSON.stringify(require.resolve('./temporary-directory'))
 const nativeFaults = typeof binding.test_faults_enabled === 'function' &&
   binding.test_faults_enabled() === true
 
@@ -18,7 +19,7 @@ async function rejection (promise) {
 }
 
 test('terminal native close errors leave public and native state closed', async function (t) {
-  const location = tempy.directory()
+  const location = temporaryDirectory()
   const db = await RocksLevel.open(location)
   await db.put('key', 'value')
   const iterator = db.iterator()
@@ -77,7 +78,7 @@ test('terminal native close errors leave public and native state closed', async 
 })
 
 test('pre-teardown close errors retain an open and retryable database', async function (t) {
-  const location = tempy.directory()
+  const location = temporaryDirectory()
   const db = await RocksLevel.open(location)
   await db.put('key', 'value')
 
@@ -133,7 +134,7 @@ test('pre-teardown close errors retain an open and retryable database', async fu
 })
 
 test('deferred public close bridges scheduling throws and settles once', async function (t) {
-  const db = await RocksLevel.open(tempy.directory())
+  const db = await RocksLevel.open(temporaryDirectory())
   const originalGetMany = binding.db_get_many
   const originalClose = binding.db_close
   const dispatchError = new Error('synthetic close dispatch throw after callback')
@@ -182,7 +183,7 @@ test('deferred public close bridges scheduling throws and settles once', async f
 })
 
 test('queued reopen retains a terminal native close error', async function (t) {
-  const location = tempy.directory()
+  const location = temporaryDirectory()
   const db = await RocksLevel.open(location)
   await db.put('key', 'value')
 
@@ -213,7 +214,7 @@ test('queued reopen retains a terminal native close error', async function (t) {
 })
 
 test('close groups preserve close-open-close transition ordering', async function (t) {
-  const db = await RocksLevel.open(tempy.directory())
+  const db = await RocksLevel.open(temporaryDirectory())
 
   const firstClose = rejection(db.close())
   const reopen = rejection(db.open({ createIfMissing: false }))
@@ -228,7 +229,7 @@ test('close groups preserve close-open-close transition ordering', async functio
 })
 
 test('open option reentry retains its original ordering epoch', async function (t) {
-  const db = await RocksLevel.open(tempy.directory())
+  const db = await RocksLevel.open(temporaryDirectory())
   const openEpoch = Object.getOwnPropertySymbols(db)
     .find(symbol => symbol.description === 'openEpoch')
   const initialEpoch = db[openEpoch]
@@ -258,7 +259,7 @@ test('open option reentry retains its original ordering epoch', async function (
 })
 
 test('separate close groups do not recurse after a retryable failure', async function (t) {
-  const db = await RocksLevel.open(tempy.directory())
+  const db = await RocksLevel.open(temporaryDirectory())
   const originalClose = binding.db_close
   const injected = new Error('synthetic first close failure')
   let nativeCloseCalls = 0
@@ -291,7 +292,7 @@ test('separate close groups do not recurse after a retryable failure', async fun
 })
 
 test('terminal errors close only the affected shared-handle wrapper', async function (t) {
-  const location = tempy.directory()
+  const location = temporaryDirectory()
   const first = await RocksLevel.open(location)
   await first.put('key', 'value')
   const second = await RocksLevel.open(first.handle)
@@ -324,7 +325,7 @@ test('terminal errors close only the affected shared-handle wrapper', async func
 })
 
 test('failed imported opens preserve cleanup errors and expose retryable cleanup debt', async function (t) {
-  const location = tempy.directory()
+  const location = temporaryDirectory()
   const source = await RocksLevel.open(location)
   await source.put('key', 'value')
 
@@ -385,7 +386,7 @@ test('failed imported opens preserve cleanup errors and expose retryable cleanup
 })
 
 test('a public open cancels later cleanup-debt retries after native admission', async function (t) {
-  const location = tempy.directory()
+  const location = temporaryDirectory()
   const source = await RocksLevel.open(location)
   await source.put('key', 'value')
 
@@ -455,7 +456,7 @@ test('a public open cancels later cleanup-debt retries after native admission', 
 })
 
 test('cleanup-debt open waits through synchronous close completion faults', async function (t) {
-  const location = tempy.directory()
+  const location = temporaryDirectory()
   const db = await RocksLevel.open(location)
   await db.put('key', 'value')
   await db.close()
@@ -538,7 +539,7 @@ test('cleanup-debt open waits through synchronous close completion faults', asyn
 })
 
 test('cleanup-debt reopen contains deferred native open dispatch faults', async function (t) {
-  const location = tempy.directory()
+  const location = temporaryDirectory()
   const db = await RocksLevel.open(location)
   await db.put('key', 'value')
   await db.close()
@@ -631,7 +632,7 @@ test('cleanup-debt reopen contains deferred native open dispatch faults', async 
 })
 
 test('updates preserve iteration and cleanup error identity and ordering', async function (t) {
-  const db = await RocksLevel.open(tempy.directory())
+  const db = await RocksLevel.open(temporaryDirectory())
   await db.put('key', 'value')
 
   const originalNext = binding.updates_next
@@ -692,7 +693,7 @@ test('partial native resource close exceptions remain retryable and GC-safe', { 
   const script = `
     'use strict'
     const assert = require('node:assert/strict')
-    const tempy = require('tempy')
+    const temporaryDirectory = require(${temporaryDirectoryPath})
     const { RocksLevel } = require(${packagePath})
 
     const rejection = async (promise) => {
@@ -705,7 +706,7 @@ test('partial native resource close exceptions remain retryable and GC-safe', { 
     }
 
     ;(async () => {
-      const location = tempy.directory()
+      const location = temporaryDirectory()
       const db = await RocksLevel.open(location)
       await db.put('key', 'value')
 
@@ -769,7 +770,7 @@ test('single native resource close exceptions keep the resource attached', { ski
   const script = `
     'use strict'
     const assert = require('node:assert/strict')
-    const tempy = require('tempy')
+    const temporaryDirectory = require(${temporaryDirectoryPath})
     const binding = require(${bindingPath})
 
     const open = (context, createIfMissing) => new Promise((resolve, reject) => {
@@ -790,7 +791,7 @@ test('single native resource close exceptions keep the resource attached', { ski
     })
 
     ;(async () => {
-      const location = tempy.directory()
+      const location = temporaryDirectory()
       let context = binding.db_init(location)
       await open(context, true)
       let batch = binding.batch_init(context)
@@ -845,7 +846,7 @@ test('single native resource close exceptions keep the resource attached', { ski
 })
 
 test('close during automatic open still settles', async function (t) {
-  const db = new RocksLevel(tempy.directory())
+  const db = new RocksLevel(temporaryDirectory())
   const timeout = new Promise((resolve, reject) => {
     const timer = setTimeout(() => reject(new Error('close timed out')), 5000)
     timer.unref()
