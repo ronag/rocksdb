@@ -153,6 +153,35 @@ try {
     return median(latencies)
   })
 
+  await measure('first-use', 'first nextv(1) sequential p50', 'us/op', async () => {
+    const latencies = []
+    for (let index = 0; index < firstUseCount; index++) {
+      const iterator = db.iterator(options)
+      const start = process.hrtime.bigint()
+      const entries = await iterator.nextv(1)
+      assert.equal(entries.length, 1)
+      latencies.push(elapsedNs(start) / 1000)
+      await iterator.close()
+    }
+    return median(latencies)
+  })
+
+  // all() auto-closes after consuming the iterator. Limit it to one row so
+  // this metric captures lazy first use and auto-close rather than scan size.
+  const limitOneOptions = { ...options, limit: 1 }
+  await measure('first-use', 'first all(limit=1) sequential p50', 'us/op', async () => {
+    const latencies = []
+    for (let index = 0; index < firstUseCount; index++) {
+      const iterator = db.iterator(limitOneOptions)
+      const start = process.hrtime.bigint()
+      const entries = await iterator.all()
+      assert.equal(entries.length, 1)
+      latencies.push(elapsedNs(start) / 1000)
+      await iterator.close()
+    }
+    return median(latencies)
+  })
+
   for (const [name, iteratorOptions] of [
     ['construct + first next default p50', options],
     ['construct + first next bounded + filter p50', filteredOptions]
