@@ -265,9 +265,9 @@ test('public close callback exceptions do not abort close fan-out', function (t)
       await reopened.close()
     }
 
-    async function iteratorClose (name, create) {
+    async function iteratorClose (name, create, deferred = false) {
       const db = testCommon.factory()
-      await db.open()
+      if (!deferred) await db.open()
       const location = db.location
       const iterator = create(db)
       const expected = new Error(name + ' close callback failed')
@@ -398,8 +398,11 @@ test('public close callback exceptions do not abort close fan-out', function (t)
       await databaseClose()
       await mutationCallback()
       await iteratorClose('iterator', db => db.iterator())
+      await iteratorClose('deferred iterator', db => db.iterator(), true)
       await iteratorClose('key iterator', db => db.keys())
+      await iteratorClose('deferred key iterator', db => db.keys(), true)
       await iteratorClose('value iterator', db => db.values())
+      await iteratorClose('deferred value iterator', db => db.values(), true)
       await batchClose()
       await batchWriteClose()
     })().catch(err => {
@@ -408,7 +411,13 @@ test('public close callback exceptions do not abort close fan-out', function (t)
     })
   `
 
-  const result = runChild(script)
-  t.equal(result.status, 0, childMessage(result, 'close fan-out child passed'))
+  for (const nodeEnv of [undefined, 'production']) {
+    const env = { ...process.env }
+    if (nodeEnv === undefined) delete env.NODE_ENV
+    else env.NODE_ENV = nodeEnv
+    const result = runChild(script, env)
+    t.equal(result.status, 0, childMessage(result,
+      `${nodeEnv || 'development'} close fan-out child passed`))
+  }
   t.end()
 })

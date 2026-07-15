@@ -1121,7 +1121,8 @@ class RocksLevel extends AbstractLevel {
     options = snapshotIteratorOptions(options)
     const noFields = hasNoFields(options)
     const iterator = super.iterator(options)
-    return wrapNoFieldsIterator(iterator, noFields)
+    const wrapped = wrapNoFieldsIterator(iterator, noFields)
+    return iterator instanceof Iterator ? wrapped : protectPublicClose(wrapped)
   }
 
   keys (options) {
