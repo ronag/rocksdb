@@ -738,8 +738,15 @@ class Iterator extends AbstractIterator<any, any, any> {
     return callback[kPromise]
   }
 
-  // nxt API
+  // Supported unsafe user-space extensions. These methods deliberately bypass
+  // AbstractLevel admission, iterator bookkeeping and cleanup ownership. The
+  // caller must keep the database and iterator open, serialize every public
+  // and unsafe operation on this wrapper, pass already-encoded inputs and
+  // observe every asynchronous failure. Development assertions diagnose those
+  // invariants; production calls assume them to keep the raw path lightweight.
+  // Keep this boundary aligned with RocksIteratorNative in index.d.ts.
 
+  // Reset prefetched JavaScript rows and synchronously refresh native state.
   _refreshSync () {
     if (DEBUG) assertIteratorIdle(this, '_refreshSync')
     this._initializeSync()
@@ -753,6 +760,8 @@ class Iterator extends AbstractIterator<any, any, any> {
     binding.iterator_refresh_sync(this[kContext])
   }
 
+  // Seek to an encoded target, discarding prefetched rows. Native admission
+  // consumes the target during this call; the wrapper does not retain it.
   _seekSync (target) {
     if (DEBUG) assertIteratorIdle(this, '_seekSync')
     if (!DEBUG) return this[kSeekSync](target, false)
@@ -785,6 +794,8 @@ class Iterator extends AbstractIterator<any, any, any> {
     }
   }
 
+  // Seek to an encoded target without blocking for RocksDB I/O. Native
+  // admission copies the target bytes before this method returns.
   _seekAsync (target, callback) {
     if (DEBUG) assertIteratorIdle(this, '_seekAsync')
     callback = fromCallback(callback, kPromise)
@@ -843,6 +854,9 @@ class Iterator extends AbstractIterator<any, any, any> {
     return { rows, finished, limited }
   }
 
+  // Read already-encoded rows without public count/end bookkeeping. Returned
+  // buffers and packed arenas own their backing bytes independently of the
+  // iterator, but this call may block the JavaScript event loop.
   _nextvSync (size, options) {
     if (DEBUG) assertIteratorIdle(this, '_nextvSync')
     if (!DEBUG) return this[kNextvSync](size, options)
@@ -883,6 +897,8 @@ class Iterator extends AbstractIterator<any, any, any> {
     return setPackedResult(convertIteratorResult(this, result), packedResult)
   }
 
+  // Read already-encoded rows without public count/end bookkeeping. No other
+  // operation may start on this wrapper until the callback or promise settles.
   _nextvAsync (size, options, callback, packed) {
     if (DEBUG) assertIteratorIdle(this, '_nextvAsync')
     callback = fromCallback(callback, kPromise)
@@ -1005,6 +1021,9 @@ class Iterator extends AbstractIterator<any, any, any> {
     })
   }
 
+  // Terminal raw close. It intentionally leaves AbstractLevel's private
+  // public status untouched; a native failure leaves the resource attached so
+  // the caller can retry cleanup.
   _closeSync () {
     if (DEBUG) {
       assert(
@@ -1029,6 +1048,8 @@ class Iterator extends AbstractIterator<any, any, any> {
     this.db.detachResource(this)
   }
 
+  // Native cleanup is synchronous; only callback/promise notification is
+  // deferred. The same terminal and retry invariants as _closeSync() apply.
   _closeAsync (callback) {
     callback = fromCallback(callback, kPromise)
 

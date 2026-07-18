@@ -33,6 +33,13 @@ extensions. Other underscore methods are abstract-level implementation hooks or
 internal helpers and may change without notice. The caller, rather than the
 public API, owns admission, serialization, error handling and cleanup.
 
+These extensions exist for callers that already own encoded RocksDB data and
+resource scheduling. They expose packed reads, synchronous I/O, raw merge and
+log-data operations, and allocation-sensitive paths that the AbstractLevel API
+does not model. The underscore is therefore a safety boundary, not a general
+invitation to call implementation hooks: use only the declarations explicitly
+documented as supported unsafe extensions.
+
 ### Caller contract
 
 - The database must already be open. For non-close operations, keep it and every

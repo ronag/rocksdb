@@ -923,6 +923,12 @@ class RocksLevel extends AbstractLevel<any, any, any> {
     return callback[kPromise]
   }
 
+  // Supported unsafe user-space read. The database must already be open and
+  // must not close until settlement. This path deliberately bypasses public
+  // admission, codecs, sublevel prefixing, hooks and events; callers pass
+  // encoded keys and own option reentrancy and error observation. Raw database
+  // reads may overlap one another. Native admission copies key bytes and this
+  // wrapper snapshots result-conversion options before returning.
   _getManyAsync (keys, options, callback, allowPartial, packed, exposePacked = true) {
     if (DEBUG) {
       assert.strictEqual(this.status, 'open', 'unsafe _getManyAsync() requires an open database')
@@ -1080,6 +1086,9 @@ class RocksLevel extends AbstractLevel<any, any, any> {
     return wrapIteratorCleanupRetry(super.values(options))
   }
 
+  // Synchronous counterpart to _getManyAsync(). It has the same open-database,
+  // encoded-input and no-close invariants and may block the JavaScript event
+  // loop. Returned values and packed arenas own their backing bytes.
   _getManySync (keys, options?) {
     if (DEBUG) {
       assert.strictEqual(this.status, 'open', 'unsafe _getManySync() requires an open database')
@@ -1133,6 +1142,9 @@ class RocksLevel extends AbstractLevel<any, any, any> {
     return this[kPublicOperation](() => super.clear(options))
   }
 
+  // Construct a caller-owned raw batch. The database must already be open and
+  // outlive the batch; the raw/public state and serialization contract is
+  // documented on the supported methods in chained-batch.ts and index.d.ts.
   _chainedBatch () {
     return new ChainedBatch(this, this[kContext])
   }
@@ -1185,6 +1197,10 @@ class RocksLevel extends AbstractLevel<any, any, any> {
     return this[kPublicOperation](() => super.batch(operations, options))
   }
 
+  // Construct a caller-owned raw iterator. Options are synchronously consumed
+  // and native admission copies range bounds before return. The open database
+  // must outlive the iterator, and all operations on the wrapper must be
+  // serialized until terminal cleanup.
   _iterator (options) {
     return new Iterator(this, this[kContext], options ?? kEmpty)
   }

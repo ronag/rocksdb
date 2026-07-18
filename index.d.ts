@@ -445,7 +445,10 @@ export type RocksGetManyReadResult<
 /**
  * Supported unsafe iterator extensions. The caller must keep the database and
  * iterator open and serialize every public and unsafe operation until it
- * settles. These methods bypass public accounting, state and cleanup retries.
+ * settles. Inputs are already encoded. These methods bypass public accounting,
+ * state, codecs, hooks and cleanup retries; development builds may assert the
+ * contract, while production builds assume it. Returned buffers and packed
+ * arenas own their backing bytes and remain valid after iterator close.
  */
 export interface RocksIteratorNative<
   KRaw,
@@ -458,14 +461,27 @@ export interface RocksIteratorNative<
   /** @internal Test-only count of decoded entries currently cached in JavaScript. */
   readonly cached: number
   [Symbol.asyncDispose] (): Promise<void>
-  /** Refresh the native iterator. May lazily initialize and block on RocksDB I/O. */
+  /**
+   * Reset prefetched rows and refresh the native iterator. Requires an idle,
+   * open iterator and may lazily initialize and block on RocksDB I/O.
+   */
   _refreshSync (): void
-  /** Seek to an encoded target. May lazily initialize and block on RocksDB I/O. */
+  /**
+   * Seek to an encoded target and discard prefetched rows. Requires an idle,
+   * open iterator and may lazily initialize and block on RocksDB I/O.
+   */
   _seekSync (target: RocksSlice): void
-  /** Seek asynchronously. The encoded target is copied before this method returns. */
+  /**
+   * Seek asynchronously to an encoded target, which is copied before return.
+   * Do not start another public or unsafe operation until this call settles.
+   */
   _seekAsync (target: RocksSlice): Promise<void>
+  /** Callback overload with the same open, idle and serialization contract. */
   _seekAsync (target: RocksSlice, callback: RocksNodeCallback<void>): void
-  /** Read encoded rows synchronously. May lazily initialize and block on RocksDB I/O. */
+  /**
+   * Read encoded rows without public count/end bookkeeping. Requires an idle,
+   * open iterator and may lazily initialize and block on RocksDB I/O.
+   */
   _nextvSync<Packed extends RocksPackedReadMode = RocksDefaultIteratorPackedMode<
     KEncoding,
     VEncoding,
@@ -475,7 +491,10 @@ export interface RocksIteratorNative<
     size: number,
     options?: RocksRawIteratorReadOptions<Packed>
   ): RocksIteratorReadResult<KRaw, VRaw, Keys, Values, Packed>
-  /** Read encoded rows asynchronously. Do not start another operation until it settles. */
+  /**
+   * Read encoded rows without public count/end bookkeeping. Do not start
+   * another public or unsafe operation until this call settles.
+   */
   _nextvAsync<Packed extends RocksPackedReadMode = RocksDefaultIteratorPackedMode<
     KEncoding,
     VEncoding,
@@ -485,6 +504,7 @@ export interface RocksIteratorNative<
     size: number,
     options?: RocksRawIteratorReadOptions<Packed>
   ): Promise<RocksIteratorReadResult<KRaw, VRaw, Keys, Values, Packed>>
+  /** Callback overload with the same open, idle and serialization contract. */
   _nextvAsync<Packed extends RocksPackedReadMode = RocksDefaultIteratorPackedMode<
     KEncoding,
     VEncoding,
@@ -497,14 +517,17 @@ export interface RocksIteratorNative<
   ): void
   /**
    * Release and detach this raw resource synchronously. This is terminal and
-   * does not update abstract-level's private public status.
+   * does not update abstract-level's private public status. A failed native
+   * close remains attached so caller-owned cleanup can be retried.
    */
   _closeSync (): void
   /**
    * Release and detach this raw resource. Native cleanup is synchronous; only
-   * completion notification is deferred. This is terminal.
+   * completion notification is deferred. This is terminal on success; a failed
+   * native close remains attached for caller-owned retry.
    */
   _closeAsync (): Promise<void>
+  /** Callback overload with the same terminal and caller-owned retry contract. */
   _closeAsync (callback: RocksNodeCallback<void>): void
 }
 
@@ -562,7 +585,10 @@ export interface RocksBatchToArrayOptions<
 
 /**
  * A chained batch with supported unsafe extensions. The caller owns lifecycle,
- * serialization, errors and terminal cleanup for direct raw operations.
+ * serialization, errors and terminal cleanup for direct raw operations. Inputs
+ * are already encoded and copied by native admission. These methods bypass
+ * public codecs, prefixes, hooks, events and operation queues. Development
+ * builds may assert this contract; production builds assume it.
  */
 export interface RocksChainedBatch<TDatabase, KDefault, VDefault>
   extends AbstractChainedBatch<TDatabase, KDefault, VDefault> {
@@ -574,28 +600,48 @@ export interface RocksChainedBatch<TDatabase, KDefault, VDefault>
   del<K = KDefault> (key: K, options: RocksChainedBatchDelOptions<TDatabase, K>): this
   write (): Promise<void>
   write (options: RocksChainedBatchWriteOptions): Promise<void>
-  /** Append an encoded put; native code copies both inputs before return. */
+  /** Append an encoded put to an idle, open batch; native code copies both inputs. */
   _put (key: RocksSlice, value: RocksSlice, options?: RocksColumnOperationOptions): void
-  /** Append an encoded put from byte parts copied before return. */
+  /**
+   * Append an encoded put from byte parts to an idle, open batch; all parts are
+   * copied before return.
+   */
   _putParts (key: RocksBatchSlice, value: RocksBatchSlice, options?: RocksColumnOperationOptions): void
-  /** Append encoded RocksDB log data copied before return. */
+  /** Append encoded RocksDB log data to an idle, open batch; the data is copied. */
   _putLogData (blob: RocksSlice): void
-  /** Append an encoded delete; native code copies the key before return. */
+  /** Append an encoded delete to an idle, open batch; native code copies the key. */
   _del (key: RocksSlice, options?: RocksColumnOperationOptions): void
-  /** Append an encoded merge; native code copies both inputs before return. */
+  /** Append an encoded merge to an idle, open batch; native code copies both inputs. */
   _merge (key: RocksSlice, value: RocksSlice, options?: RocksColumnOperationOptions): void
-  /** Append an encoded merge from byte parts copied before return. */
+  /**
+   * Append an encoded merge from byte parts to an idle, open batch; all parts
+   * are copied before return.
+   */
   _mergeParts (key: RocksBatchSlice, value: RocksBatchSlice, options?: RocksColumnOperationOptions): void
-  /** Clear native/raw state only. Do not use after public mutation or prewrite state exists. */
+  /**
+   * Clear native/raw state only. Requires an idle, open batch. Do not use after
+   * public mutation or prewrite state exists because that private state remains.
+   */
   _clear (): void
-  /** Write native/raw state synchronously without consuming, clearing or closing it. */
+  /**
+   * Write raw-managed native state synchronously without consuming, clearing or
+   * closing it. Requires the database and batch to remain open and may block.
+   */
   _writeSync (options?: RocksChainedBatchWriteOptions): void
-  /** Write native/raw state without consuming, clearing or closing it. */
+  /**
+   * Write raw-managed native state without consuming, clearing or closing it.
+   * Keep the database and batch open and idle until this call settles.
+   */
   _writeAsync (options?: RocksChainedBatchWriteOptions): Promise<void>
-  _writeAsync (options: RocksChainedBatchWriteOptions | undefined, callback: RocksNodeCallback<void>): void
+  /** Callback overload with the same raw-state and serialization contract. */
+  _writeAsync (
+    options: RocksChainedBatchWriteOptions | undefined,
+    callback: RocksNodeCallback<void>
+  ): void
   /**
    * Clear native state and detach the resource. This is terminal, valid only
-   * for a raw-managed batch, and does not update abstract-level's public status.
+   * for an idle raw-managed batch, and does not update abstract-level's public
+   * status. A native failure remains caller-owned and retryable.
    */
   _closeSync (): void
   toArray<
@@ -752,7 +798,10 @@ export class RocksLevel<KDefault = string, VDefault = string>
 
   /**
    * Read encoded keys asynchronously. Keys are copied before this method
-   * returns, but the database must remain open until the result settles.
+   * returns, but the database must already be open and remain open until the
+   * result settles. Raw reads may overlap one another, but never database close.
+   * This bypasses public codecs, prefixes, hooks, events and operation queues;
+   * the returned values or arena own their backing bytes.
    */
   _getManyAsync<
     E extends RocksRawEncoding = 'buffer',
@@ -761,6 +810,10 @@ export class RocksLevel<KDefault = string, VDefault = string>
     keys: readonly RocksSlice[],
     options?: RocksRawGetManyOptions<E, Packed>
   ): Promise<RocksGetManyReadResult<E, Packed>>
+  /**
+   * Promise overload with explicit incomplete-result handling; all other
+   * invariants apply.
+   */
   _getManyAsync<
     E extends RocksRawEncoding = 'buffer',
     Packed extends RocksPackedReadMode = RocksDefaultPackedMode<E>
@@ -770,6 +823,7 @@ export class RocksLevel<KDefault = string, VDefault = string>
     callback: undefined,
     allowPartial?: boolean
   ): Promise<RocksGetManyReadResult<E, Packed>>
+  /** Callback overload with the same encoded-input and open-database contract. */
   _getManyAsync<
     E extends RocksRawEncoding = 'buffer',
     Packed extends RocksPackedReadMode = RocksDefaultPackedMode<E>
@@ -779,7 +833,12 @@ export class RocksLevel<KDefault = string, VDefault = string>
     callback: RocksPackedReadCallback<RocksGetManyReadResult<E, Packed>>,
     allowPartial?: boolean
   ): void
-  /** Read encoded keys synchronously. This can perform I/O and block the event loop. */
+  /**
+   * Read encoded keys synchronously from an open database. Raw reads may
+   * overlap one another, but never database close. This bypasses public codecs,
+   * prefixes, hooks, events and queues, and can block the event loop. Returned
+   * values or arenas own their backing bytes.
+   */
   _getManySync<
     E extends RocksRawEncoding = 'buffer',
     Packed extends RocksPackedReadMode = RocksDefaultPackedMode<E>
@@ -789,7 +848,9 @@ export class RocksLevel<KDefault = string, VDefault = string>
   ): RocksGetManyReadResult<E, Packed>
   /**
    * Construct a caller-owned raw iterator. Options are consumed before return;
-   * the database must already be open and outlive the iterator.
+   * range bytes are copied by native admission. The database must already be
+   * open and outlive the iterator, whose public and unsafe operations must be
+   * serialized until terminal cleanup.
    */
   _iterator<
     KEncoding extends RocksRawEncoding = 'buffer',
@@ -807,7 +868,10 @@ export class RocksLevel<KDefault = string, VDefault = string>
     KEncoding,
     VEncoding
   >
-  /** Construct a caller-owned raw batch. The database must already be open. */
+  /**
+   * Construct a caller-owned raw batch. The database must already be open and
+   * outlive the batch; serialize all public and unsafe batch operations.
+   */
   _chainedBatch (): RocksChainedBatch<this, KDefault, VDefault>
 
   getProperty (property: string, options?: RocksColumnOperationOptions): string
