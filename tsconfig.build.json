@@ -5,6 +5,7 @@
     "outDir": "./lib",
     "noEmit": false,
     "noEmitOnError": true,
+    "rewriteRelativeImportExtensions": true,
     "sourceMap": true,
     "inlineSources": true
   }
