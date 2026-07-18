@@ -1,16 +1,17 @@
 {
   "compilerOptions": {
-    "lib": ["es2025"],
+    "lib": ["esnext"],
     "module": "NodeNext",
-    "target": "es2025",
-    "moduleDetection": "force",
+    "target": "esnext",
     "strict": true,
     "noImplicitAny": false,
     "useUnknownInCatchVariables": false,
     "allowJs": false,
     "esModuleInterop": true,
-    "forceConsistentCasingInFileNames": true,
     "skipLibCheck": true,
+    "forceConsistentCasingInFileNames": true,
+    "resolveJsonModule": true,
+    "allowImportingTsExtensions": true,
     "noEmit": true,
     "types": ["node"]
   },
