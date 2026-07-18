@@ -138,6 +138,8 @@ function runBuild (context, extraEnv = {}) {
     encoding: 'utf8',
     env: {
       ...process.env,
+      // Keep the helper's default deterministic; individual tests can override it.
+      JOBS: '',
       ...extraEnv,
       FAKE_NPX_LOG: context.log,
       FAKE_NPM_LOG: context.npmLog,
@@ -193,6 +195,7 @@ test('Darwin prebuild generation pins its persistent dependency prefix', functio
   try {
     const result = runBuild(context, {
       GYP_DEFINES: 'rocks_level_test_faults=1',
+      JOBS: '8',
       ROCKS_LEVEL_DEPS_PREFIX: '/tmp/rogue'
     })
     const log = fs.readFileSync(context.log, 'utf8')
@@ -200,7 +203,7 @@ test('Darwin prebuild generation pins its persistent dependency prefix', functio
     t.equal(result.status, 0, result.stderr || 'Darwin prebuild generation succeeds')
     t.match(
       log,
-      /^JOBS=16 ROCKS_LEVEL_DEPS_PREFIX=.*\/deps\/\.prefix\/darwin-arm64 GYP_DEFINES= prebuildify /,
+      /^JOBS=8 ROCKS_LEVEL_DEPS_PREFIX=.*\/deps\/\.prefix\/darwin-arm64 GYP_DEFINES= prebuildify /,
       'prebuildify uses the freshly built persistent prefix'
     )
     t.notOk(/\/tmp\/rogue/.test(log), 'the caller dependency prefix is not forwarded')
