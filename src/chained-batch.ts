@@ -345,6 +345,16 @@ class ChainedBatch extends AbstractChainedBatch<any, any, any> {
     return group.promise
   }
 
+  // Supported unsafe user-space extensions. Direct calls bypass AbstractLevel
+  // codecs, prefixes, hooks, events, operation queues and cleanup ownership.
+  // The caller must keep the database and batch open, serialize every public
+  // and unsafe operation, pass already-encoded inputs, and observe async write
+  // failures. Raw terminal methods additionally require native state to be the
+  // complete batch state. Development assertions diagnose these invariants;
+  // production calls assume them. Keep this boundary aligned with
+  // RocksChainedBatch in index.d.ts.
+
+  // Append an encoded put. RocksDB copies key and value before return.
   _put (key, value, options) {
     if (DEBUG) {
       assertBatchIdle(this)
@@ -359,6 +369,8 @@ class ChainedBatch extends AbstractChainedBatch<any, any, any> {
     this[kLength]++
   }
 
+  // Append an encoded put assembled from byte parts. RocksDB copies every part
+  // before return.
   _putParts (key, value, options) {
     if (DEBUG) {
       assertBatchIdle(this)
@@ -370,6 +382,7 @@ class ChainedBatch extends AbstractChainedBatch<any, any, any> {
     this[kLength]++
   }
 
+  // Append encoded log data. RocksDB copies the bytes before return.
   _putLogData (blob) {
     if (DEBUG) {
       assertBatchIdle(this)
@@ -381,6 +394,7 @@ class ChainedBatch extends AbstractChainedBatch<any, any, any> {
     binding.batch_put_log_data(this[kBatchContext], blob)
   }
 
+  // Append an encoded delete. RocksDB copies the key before return.
   _del (key, options) {
     if (DEBUG) {
       assertBatchIdle(this)
@@ -423,6 +437,8 @@ class ChainedBatch extends AbstractChainedBatch<any, any, any> {
     })
   }
 
+  // Submit the current native operations synchronously. This does not consume,
+  // clear or close the batch, so another raw write replays the same operations.
   _writeSync (options) {
     if (DEBUG) assertBatchIdle(this)
     if (!DEBUG) {
@@ -438,6 +454,9 @@ class ChainedBatch extends AbstractChainedBatch<any, any, any> {
     }
   }
 
+  // Submit the current native operations without consuming, clearing or
+  // closing them. The batch and database must remain open and idle until the
+  // callback or promise settles.
   _writeAsync (options, callback) {
     if (DEBUG) assertBatchIdle(this)
     callback = fromCallback(callback, kPromise)
@@ -510,6 +529,9 @@ class ChainedBatch extends AbstractChainedBatch<any, any, any> {
     }
   }
 
+  // Terminal raw close for a raw-managed batch. It intentionally leaves
+  // AbstractLevel's private public status untouched; a native failure leaves
+  // the resource attached so the caller can retry cleanup.
   _closeSync () {
     if (DEBUG) assertBatchIdle(this)
 
@@ -518,6 +540,8 @@ class ChainedBatch extends AbstractChainedBatch<any, any, any> {
     this.db.detachResource(this)
   }
 
+  // Append an encoded RocksDB merge. RocksDB copies key and value before
+  // return; merge semantics come from the configured column family operator.
   _merge (key, value, options) {
     if (DEBUG) {
       assertBatchIdle(this)
@@ -532,6 +556,8 @@ class ChainedBatch extends AbstractChainedBatch<any, any, any> {
     this[kLength]++
   }
 
+  // Append an encoded merge assembled from byte parts. RocksDB copies every
+  // part before return.
   _mergeParts (key, value, options) {
     if (DEBUG) {
       assertBatchIdle(this)
