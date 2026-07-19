@@ -555,6 +555,11 @@ batch._clear()
 expectType<AsyncGenerator<RocksUpdate<string, Buffer>, void, unknown>>(
   db.updates({ keyEncoding: 'utf8', valueEncoding: 'buffer' })
 )
+declare const update: RocksUpdate<string, Buffer>
+expectType<number>(update.seq)
+expectType<number>(update.nextSeq)
+// @ts-expect-error Update cursors are readonly
+update.nextSeq = 0
 
 const sliceEncoding = {
   name: 'slice',
