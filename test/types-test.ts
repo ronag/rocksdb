@@ -279,6 +279,17 @@ unexposedSliceValues.then((values) => {
   // @ts-expect-error exposePacked false omits the packed discriminator
   void values.packed
 })
+// @ts-expect-error Unexposed values require an explicit JavaScript encoding
+db._getManyAsync([slice], { packed: 'auto' }, undefined, false, undefined, false)
+db._getManyAsync(
+  [slice],
+  // @ts-expect-error Buffer encoding cannot guarantee a plain value array
+  { packed: 'auto', valueEncoding: 'buffer' },
+  undefined,
+  false,
+  undefined,
+  false
+)
 db._getManyAsync([slice], { packed: 'auto' }, (err, result, packed) => {
   expectType<Error | null | undefined>(err)
   expectTrue<Equal<

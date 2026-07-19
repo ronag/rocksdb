@@ -910,7 +910,7 @@ export class RocksLevel<KDefault = string, VDefault = string>
     AllowPartial extends boolean = boolean
   > (
     keys: readonly RocksSlice[],
-    options: RocksRawGetManyOptions<E, Packed> | undefined,
+    options: RocksRawGetManyOptions<E, Packed> & { valueEncoding: E },
     callback: undefined,
     allowPartial: AllowPartial,
     packed: undefined,
@@ -963,7 +963,7 @@ export class RocksLevel<KDefault = string, VDefault = string>
     AllowPartial extends boolean = boolean
   > (
     keys: readonly RocksSlice[],
-    options: RocksRawGetManyOptions<E, Packed> | undefined,
+    options: RocksRawGetManyOptions<E, Packed> & { valueEncoding: E },
     callback: RocksPackedReadCallback<RocksRawGetManyValues<E, AllowPartial>, Packed>,
     allowPartial: AllowPartial,
     packed: undefined,
