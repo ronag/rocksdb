@@ -171,11 +171,7 @@ test('slice getMany converts unpacked and packed native values to Slice objects'
 
   const unexposed = await db._getManyAsync(
     ['a', 'missing', 'empty'],
-    { packed: 'auto', valueEncoding: 'slice' },
-    undefined,
-    false,
-    undefined,
-    false
+    { packed: 'auto', valueEncoding: 'slice', allowPartial: false, exposePacked: false }
   )
   t.equal(Object.hasOwn(unexposed, 'packed'), false, 'async can omit the packed discriminator')
   t.ok(unexposed[0] instanceof Slice, 'unexposed packed values remain Slice objects')

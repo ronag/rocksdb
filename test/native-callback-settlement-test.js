@@ -86,10 +86,8 @@ test('getMany settles once when native callback completes before dispatch throws
     const callbackResult = await observeCallback(callback => {
       db._getManyAsync(
         [Buffer.from('key')],
-        { valueEncoding: 'buffer' },
-        callback,
-        false,
-        false
+        { valueEncoding: 'buffer', allowPartial: false, packed: false },
+        callback
       )
     })
 
