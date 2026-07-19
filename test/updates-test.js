@@ -37,7 +37,7 @@ make('updates with since option skips earlier updates', async function (db, t, d
     sinceUpdates.push(update)
   }
 
-  t.equal(sinceUpdates.length, 1, 'has exactly one update since last seq')
+  t.equal(sinceUpdates.length, 1, 'has exactly one update from the exclusive next seq')
   t.equal(sinceUpdates[0].seq, last.nextSeq, 'seq starts at the exclusive next sequence')
 
   const rows = sinceUpdates[0].rows
