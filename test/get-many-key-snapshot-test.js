@@ -69,7 +69,7 @@ test('async getMany always snapshots Buffer and SliceLike keys before queueing',
       const packed = await pending
       assert.equal(packed.statuses[0], 0)
       assert.equal(
-        packed.buffer.subarray(packed.offsets[0], packed.offsets[1]).toString(),
+        packed.buffer.subarray(packed.offsets[0], packed.offsets[0] + packed.offsets[1]).toString(),
         'value-a'
       )
       await blocker

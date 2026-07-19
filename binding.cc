@@ -3334,7 +3334,7 @@ enum class PackedGetManyStatus : uint8_t {
 
 struct PackedGetManyResult {
   rocksdb::PinnableSlice data;
-  std::vector<uint32_t> offsets;
+  std::vector<int32_t> offsets;
   std::vector<uint8_t> statuses;
 };
 
@@ -3356,26 +3356,30 @@ static bool ShouldAutoPackGetMany(const std::vector<rocksdb::Status>& statuses,
 static rocksdb::Status PackGetManyResult(const std::vector<rocksdb::Status>& statuses,
                                          const std::vector<rocksdb::PinnableSlice>& values,
                                          PackedGetManyResult& result) {
-  result.offsets.reserve(statuses.size() + 1);
+  result.offsets.reserve(statuses.size() * 2);
   result.statuses.reserve(statuses.size());
-  result.offsets.push_back(0);
 
   auto* data = result.data.GetSelf();
   for (size_t n = 0; n < statuses.size(); n++) {
     const auto& status = statuses[n];
     if (status.IsNotFound()) {
       result.statuses.push_back(static_cast<uint8_t>(PackedGetManyStatus::NotFound));
+      result.offsets.push_back(-1);
+      result.offsets.push_back(0);
     } else if (status.IsAborted() || status.IsTimedOut()) {
       result.statuses.push_back(static_cast<uint8_t>(PackedGetManyStatus::Incomplete));
+      result.offsets.push_back(-1);
+      result.offsets.push_back(-1);
     } else {
       ROCKS_STATUS_RETURN(status);
-      if (values[n].size() > std::numeric_limits<uint32_t>::max() - data->size()) {
-        return rocksdb::Status::InvalidArgument("Packed getMany result exceeds 4 GiB");
+      if (values[n].size() > std::numeric_limits<int32_t>::max() - data->size()) {
+        return rocksdb::Status::InvalidArgument("Packed getMany result exceeds 2 GiB");
       }
+      result.offsets.push_back(static_cast<int32_t>(data->size()));
+      result.offsets.push_back(static_cast<int32_t>(values[n].size()));
       data->append(values[n].data(), values[n].size());
       result.statuses.push_back(static_cast<uint8_t>(PackedGetManyStatus::Value));
     }
-    result.offsets.push_back(static_cast<uint32_t>(data->size()));
   }
 
   return rocksdb::Status::OK();
@@ -3390,12 +3394,12 @@ static napi_status ConvertPackedGetManyResult(napi_env env, PackedGetManyResult&
   void* offsetsData = nullptr;
   napi_value offsetsBuffer;
   NAPI_STATUS_RETURN(
-      napi_create_arraybuffer(env, state.offsets.size() * sizeof(uint32_t), &offsetsData, &offsetsBuffer));
-  std::copy(state.offsets.begin(), state.offsets.end(), static_cast<uint32_t*>(offsetsData));
+      napi_create_arraybuffer(env, state.offsets.size() * sizeof(int32_t), &offsetsData, &offsetsBuffer));
+  std::copy(state.offsets.begin(), state.offsets.end(), static_cast<int32_t*>(offsetsData));
 
   napi_value offsets;
   NAPI_STATUS_RETURN(
-      napi_create_typedarray(env, napi_uint32_array, state.offsets.size(), offsetsBuffer, 0, &offsets));
+      napi_create_typedarray(env, napi_int32_array, state.offsets.size(), offsetsBuffer, 0, &offsets));
 
   void* statusesData = nullptr;
   napi_value statusesBuffer;

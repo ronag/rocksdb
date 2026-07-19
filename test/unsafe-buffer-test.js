@@ -127,7 +127,7 @@ test('packed getMany arena survives database close and forced GC', async functio
   }
 
   t.same(result.statuses, new Uint8Array([0]), 'retained one packed value')
-  t.ok(result.buffer.subarray(result.offsets[0], result.offsets[1]).equals(expected),
+  t.ok(result.buffer.subarray(result.offsets[0], result.offsets[0] + result.offsets[1]).equals(expected),
     'external packed getMany arena remains valid after close and GC')
   t.end()
 })

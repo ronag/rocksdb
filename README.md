@@ -147,7 +147,8 @@ db._getManyAsync(keys, { valueEncoding: 'buffer' }, (err, result, packed) => {
 Packed `getMany` results contain:
 
 - `buffer`: concatenated value bytes
-- `offsets`: cumulative value boundaries
+- `offsets`: interleaved signed byte offsets and byte lengths; missing values
+  use `[-1, 0]` and incomplete values use `[-1, -1]`
 - `statuses`: one status per key (`0` value, `1` not found, `2` incomplete)
 - `count`: number of requested keys
 
