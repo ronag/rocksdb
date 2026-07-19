@@ -241,6 +241,82 @@ test('public batch reads avoid the native mutex during write', async function (t
   t.end()
 })
 
+test('production chained batch rejects reentrant public admission', function (t) {
+  const script = String.raw`
+    const assert = require('node:assert/strict')
+    const testCommon = require('./test/common')
+
+    ;(async () => {
+      const db = testCommon.factory({ keyEncoding: 'utf8', valueEncoding: 'utf8' })
+      await db.open()
+
+      const batch = db.batch().put('before', '1')
+      const nestedErrors = {}
+      let nestedWrite
+      let entered = false
+      const options = {}
+      Object.defineProperty(options, 'column', {
+        enumerable: true,
+        get () {
+          if (!entered) {
+            entered = true
+            nestedWrite = batch.write()
+            for (const [name, operation] of [
+              ['put', () => batch.put('nested', 'value')],
+              ['clear', () => batch.clear()],
+              ['toArray', () => batch.toArray()]
+            ]) {
+              try {
+                operation()
+              } catch (err) {
+                nestedErrors[name] = err
+              }
+            }
+          }
+          return undefined
+        }
+      })
+
+      assert.equal(batch.put('during', '2', options), batch)
+      assert.equal((await nestedWrite.then(() => null, err => err)).code, 'LEVEL_BATCH_BUSY')
+      for (const name of ['put', 'clear', 'toArray']) {
+        assert.equal(nestedErrors[name]?.code, 'LEVEL_BATCH_BUSY', name)
+      }
+
+      await batch.write()
+      assert.equal(await db.get('before'), '1')
+      assert.equal(await db.get('during'), '2')
+      assert.equal(await db.get('nested'), undefined)
+
+      const closingBatch = db.batch().put('closing', 'value')
+      let closing
+      const rows = closingBatch.toArray({
+        get keys () {
+          closing = closingBatch.close()
+          return true
+        }
+      })
+      assert.equal(rows.length, 4)
+      await closing
+
+      await db.close()
+    })().catch(err => {
+      console.error(err)
+      process.exitCode = 1
+    })
+  `
+
+  const result = spawnSync(process.execPath, ['-e', script], {
+    cwd: path.join(__dirname, '..'),
+    encoding: 'utf8',
+    env: { ...process.env, NODE_ENV: 'production' },
+    timeout: 60_000
+  })
+
+  t.equal(result.status, 0, childMessage(result, 'production admission child passed'))
+  t.end()
+})
+
 test('production raw methods do not claim admission or close ownership', function (t) {
   const script = String.raw`
     const assert = require('node:assert/strict')

@@ -2013,6 +2013,14 @@ class Iterator final : public BaseIterator, public std::enable_shared_from_this<
               break;
             }
 
+            // RocksDB requires Next()/Prev() to be called only while Valid().
+            // Natural or range exhaustion leaves the native iterator invalid;
+            // make repeated raw reads idempotent instead of advancing it again.
+            if (!first_ && !Valid()) {
+              state.finished = true;
+              break;
+            }
+
             if (!first_) {
               Next();
             } else {
@@ -2239,6 +2247,14 @@ class Iterator final : public BaseIterator, public std::enable_shared_from_this<
 
       if (deadline > 0 && database_->db->GetEnv()->NowMicros() > deadline) {
         // Timed out: neither finished nor limited; the caller may retry.
+        break;
+      }
+
+      // RocksDB requires Next()/Prev() to be called only while Valid().
+      // Natural or range exhaustion leaves the native iterator invalid;
+      // make repeated raw reads idempotent instead of advancing it again.
+      if (!first_ && !Valid()) {
+        NAPI_STATUS_THROWS(napi_get_boolean(env, true, &finished));
         break;
       }
 

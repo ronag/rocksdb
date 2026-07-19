@@ -1064,4 +1064,33 @@ class Iterator extends AbstractIterator<any, any, any> {
   }
 }
 
-export { Iterator, noFieldsNextOptions }
+class ProjectedIterator extends Iterator {
+  #projection
+
+  constructor (db, context, options, projection) {
+    super(db, context, options)
+    this.#projection = projection
+  }
+
+  async next () {
+    const entry = await super.next()
+    return entry === undefined ? undefined : entry[this.#projection]
+  }
+
+  async nextv (size, options?) {
+    const entries = await super.nextv(size, options)
+    return this.project(entries)
+  }
+
+  async all (options?) {
+    const entries = await super.all(options)
+    return this.project(entries)
+  }
+
+  private project (entries) {
+    for (let i = 0; i < entries.length; i++) entries[i] = entries[i][this.#projection]
+    return entries
+  }
+}
+
+export { Iterator, ProjectedIterator, noFieldsNextOptions }

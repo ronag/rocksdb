@@ -9,7 +9,7 @@ import ModuleError = require('module-error')
 import binding = require('./binding')
 import { RocksCache } from './cache'
 import { ChainedBatch } from './chained-batch'
-import { Iterator } from './iterator'
+import { Iterator, ProjectedIterator } from './iterator'
 import { iteratePublicIterator } from './public-lifecycle'
 import { RocksStatistics, getStatisticsContext } from './statistics'
 import { getPackedMode, kRef, kUnref, setPackedResult } from './util'
@@ -1079,11 +1079,13 @@ class RocksLevel extends AbstractLevel<any, any, any> {
   }
 
   keys (options?): any {
-    return wrapIteratorCleanupRetry(super.keys(options))
+    const iterator = super.keys(options)
+    return iterator instanceof Iterator ? iterator : wrapIteratorCleanupRetry(iterator)
   }
 
   values (options?): any {
-    return wrapIteratorCleanupRetry(super.values(options))
+    const iterator = super.values(options)
+    return iterator instanceof Iterator ? iterator : wrapIteratorCleanupRetry(iterator)
   }
 
   // Synchronous counterpart to _getManyAsync(). It has the same open-database,
@@ -1203,6 +1205,22 @@ class RocksLevel extends AbstractLevel<any, any, any> {
   // serialized until terminal cleanup.
   _iterator (options) {
     return new Iterator(this, this[kContext], options ?? kEmpty)
+  }
+
+  _keys (options) {
+    return new ProjectedIterator(this, this[kContext], {
+      ...options,
+      keys: true,
+      values: false
+    }, 0)
+  }
+
+  _values (options) {
+    return new ProjectedIterator(this, this[kContext], {
+      ...options,
+      keys: false,
+      values: true
+    }, 1)
   }
 
   get identity () {

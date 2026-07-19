@@ -8,11 +8,9 @@ import binding = require('./binding')
 const kPromise = Symbol('promise')
 const kBatchContext = Symbol('batchContext')
 const kDbContext = Symbol('dbContext')
-const kBusy = Symbol('busy')
 const kLength = Symbol('length')
 const kAbstractLength = Symbol('abstractLength')
 const kRawWrite = Symbol('rawWrite')
-const kPendingClose = Symbol('pendingClose')
 const kScheduleWrite = Symbol('scheduleWrite')
 const kUnsafeBusy = Symbol('unsafeBusy')
 const kPublicWriting = Symbol('publicWriting')
@@ -24,16 +22,17 @@ const kCleanupDebtClose = Symbol('cleanupDebtClose')
 const kCloseCleanupDebt = Symbol('closeCleanupDebt')
 const kPublicClose = Symbol('publicClose')
 const kWriteRawBatch = Symbol('writeRawBatch')
-const kPublicMutations = Symbol('publicMutations')
+const kPublicAdmissionDepth = Symbol('publicAdmissionDepth')
+const kRunPublicAdmission = Symbol('runPublicAdmission')
 const kPendingPublicClose = Symbol('pendingPublicClose')
 const kFlushPendingPublicClose = Symbol('flushPendingPublicClose')
 
 const EMPTY = {}
 const DEBUG = process.env.NODE_ENV !== 'production'
 
-function batchBusyError () {
+function batchBusyError (operation) {
   return new ModuleError(
-    'Batch is busy: cannot call toArray() while write() or another toArray() is in progress',
+    `Batch is busy: cannot call ${operation}() while another operation is being admitted`,
     { code: 'LEVEL_BATCH_BUSY' }
   )
 }
@@ -47,7 +46,6 @@ function batchNotOpenError (method) {
 
 function assertBatchIdle (batch) {
   assert(batch[kBatchContext], 'unsafe batch method requires an open batch')
-  assert(!batch[kBusy], 'unsafe batch methods must not overlap')
   assert(!batch[kPublicWriting], 'unsafe batch methods must not overlap a public write')
   assert(!batch[kUnsafeBusy], 'unsafe batch methods must not overlap')
 }
@@ -70,11 +68,9 @@ class ChainedBatch extends AbstractChainedBatch<any, any, any> {
       db.detachResource(this)
       throw err
     }
-    this[kBusy] = false
     this[kLength] = 0
     this[kAbstractLength] = 0
     this[kRawWrite] = null
-    this[kPendingClose] = null
     this[kPublicWriting] = false
     this[kPublicWriteToken] = null
     this[kPublicCleanup] = 0
@@ -82,7 +78,7 @@ class ChainedBatch extends AbstractChainedBatch<any, any, any> {
     this[kCleanupDebt] = null
     this[kCleanupDebtClose] = null
     this[kPublicClose] = null
-    this[kPublicMutations] = 0
+    this[kPublicAdmissionDepth] = 0
     this[kPendingPublicClose] = null
     if (DEBUG) this[kUnsafeBusy] = false
   }
@@ -103,15 +99,11 @@ class ChainedBatch extends AbstractChainedBatch<any, any, any> {
       throw batchNotOpenError('put')
     }
 
-    this[kPublicMutations]++
-    try {
+    return this[kRunPublicAdmission]('put', () => {
       const result = super.put(key, value, options)
       this[kAbstractLength]++
       return result
-    } finally {
-      this[kPublicMutations]--
-      this[kFlushPendingPublicClose]()
-    }
+    })
   }
 
   del (key, options?) {
@@ -119,15 +111,11 @@ class ChainedBatch extends AbstractChainedBatch<any, any, any> {
       throw batchNotOpenError('del')
     }
 
-    this[kPublicMutations]++
-    try {
+    return this[kRunPublicAdmission]('del', () => {
       const result = super.del(key, options)
       this[kAbstractLength]++
       return result
-    } finally {
-      this[kPublicMutations]--
-      this[kFlushPendingPublicClose]()
-    }
+    })
   }
 
   clear () {
@@ -135,9 +123,11 @@ class ChainedBatch extends AbstractChainedBatch<any, any, any> {
       throw batchNotOpenError('clear')
     }
 
-    const result = super.clear()
-    this[kAbstractLength] = 0
-    return result
+    return this[kRunPublicAdmission]('clear', () => {
+      const result = super.clear()
+      this[kAbstractLength] = 0
+      return result
+    })
   }
 
   write (options?): any {
@@ -148,51 +138,63 @@ class ChainedBatch extends AbstractChainedBatch<any, any, any> {
     }
     const previousDebt = this[kCleanupDebt]
     const previousClose = this[kPublicCloseStarted]
-    this[kPublicCleanup]++
-    const previous = this[kPublicWriteToken]
-    this[kPublicWriteToken] = true
-
     let promise
     let rawGroup: any = null
+
     try {
-      // Custom unsafe operations (for example _merge()) are intentionally not
-      // reflected in AbstractChainedBatch's private length. Bridge only the
-      // write decision here, leaving those unsafe operation methods untouched.
-      if (this.length === 0) {
-        promise = super.close()
-      } else if (super.length === 0) {
-        let resolveClose
-        let rejectClose
-        const closeResult = new Promise<void>((resolve, reject) => {
-          resolveClose = resolve
-          rejectClose = reject
-        })
-        rawGroup = {
-          closeResult,
-          rejectClose,
-          resolveClose,
-          settled: false
+      this[kRunPublicAdmission]('write', () => {
+        this[kPublicCleanup]++
+        const previous = this[kPublicWriteToken]
+        this[kPublicWriteToken] = true
+
+        try {
+          // Custom unsafe operations (for example _merge()) are intentionally not
+          // reflected in AbstractChainedBatch's private length. Bridge only the
+          // write decision here, leaving those unsafe operation methods untouched.
+          if (this.length === 0) {
+            promise = super.close()
+          } else if (super.length === 0) {
+            let resolveClose
+            let rejectClose
+            const closeResult = new Promise<void>((resolve, reject) => {
+              resolveClose = resolve
+              rejectClose = reject
+            })
+            rawGroup = {
+              closeResult,
+              rejectClose,
+              resolveClose,
+              settled: false
+            }
+            closeResult.catch(() => {})
+            this[kRawWrite] = rawGroup
+            promise = this[kWriteRawBatch](options)
+          } else {
+            // abstract-level materializes queued prewrite operations synchronously
+            // before super.write() returns its promise. Count those as overlap too.
+            const before = this[kLength]
+            promise = super.write(options)
+            this[kAbstractLength] += this[kLength] - before
+          }
+        } catch (err) {
+          this[kPublicCleanup]--
+          throw err
+        } finally {
+          this[kPublicWriteToken] = previous
         }
-        closeResult.catch(() => {})
-        this[kRawWrite] = rawGroup
-        promise = this[kWriteRawBatch](options)
-      } else {
-        // abstract-level materializes queued prewrite operations synchronously
-        // before super.write() returns its promise. Count those as overlap too.
-        const before = this[kLength]
-        promise = super.write(options)
-        this[kAbstractLength] += this[kLength] - before
-      }
-    } finally {
-      this[kPublicWriteToken] = previous
+      })
+    } catch (err) {
+      return Promise.reject(err)
     }
 
     return (async () => {
       let operationError
+      let operationFailed = false
       let value
       try {
         value = await promise
       } catch (err) {
+        operationFailed = true
         operationError = err
       }
 
@@ -200,7 +202,7 @@ class ChainedBatch extends AbstractChainedBatch<any, any, any> {
         // A write listener can throw after abstract-level has initiated close,
         // but before our callback-based cleanup has recorded any cleanup debt.
         // Join that close so both errors are visible to this write caller.
-        if (operationError && this[kPublicCloseStarted] !== previousClose) {
+        if (operationFailed && this[kPublicCloseStarted] !== previousClose) {
           await super.close()
         }
       } finally {
@@ -222,7 +224,7 @@ class ChainedBatch extends AbstractChainedBatch<any, any, any> {
         operationError,
         cleanupError
       )
-      if (error) throw error
+      if (operationFailed || cleanupError) throw error
       return value
     })()
   }
@@ -247,7 +249,7 @@ class ChainedBatch extends AbstractChainedBatch<any, any, any> {
   }
 
   close () {
-    if (this[kPublicMutations] > 0) {
+    if (this[kPublicAdmissionDepth] > 0) {
       if (this[kPendingPublicClose] !== null) return this[kPendingPublicClose].promise
 
       let landResolve
@@ -296,7 +298,7 @@ class ChainedBatch extends AbstractChainedBatch<any, any, any> {
 
   [kFlushPendingPublicClose] () {
     const pending = this[kPendingPublicClose]
-    if (this[kPublicMutations] !== 0 || pending === null) return
+    if (this[kPublicAdmissionDepth] !== 0 || pending === null) return
 
     this[kPendingPublicClose] = null
     let closing
@@ -307,6 +309,18 @@ class ChainedBatch extends AbstractChainedBatch<any, any, any> {
       return
     }
     Promise.resolve(closing).then(pending.resolve, pending.reject)
+  }
+
+  [kRunPublicAdmission] (operation, fn) {
+    if (this[kPublicAdmissionDepth] !== 0) throw batchBusyError(operation)
+
+    this[kPublicAdmissionDepth]++
+    try {
+      return fn()
+    } finally {
+      this[kPublicAdmissionDepth]--
+      this[kFlushPendingPublicClose]()
+    }
   }
 
   [kCloseCleanupDebt] () {
@@ -492,16 +506,11 @@ class ChainedBatch extends AbstractChainedBatch<any, any, any> {
     if (DEBUG) {
       if (!publicCleanup) {
         assert(this[kBatchContext], 'unsafe _close() requires an open batch')
-        assert(!this[kBusy], 'unsafe _close() must not overlap a public operation')
+        assert(this[kPublicAdmissionDepth] === 0,
+          'unsafe _close() must not overlap a public operation')
         assert(!this[kPublicWriting], 'unsafe _close() must not overlap a public write')
       }
       assert(!this[kUnsafeBusy], 'unsafe _close() must not overlap an unsafe operation')
-    }
-
-    if (publicCleanup && this[kBusy]) {
-      if (DEBUG) assert(!this[kPendingClose])
-      this[kPendingClose] = callback
-      return
     }
 
     const complete = (err) => {
@@ -582,24 +591,20 @@ class ChainedBatch extends AbstractChainedBatch<any, any, any> {
 
   toArray (options?) {
     if (DEBUG) assert(!this[kUnsafeBusy], 'public toArray() must not overlap an unsafe operation')
-    if (this[kBusy] || this[kPublicWriting]) throw batchBusyError()
+    if (this[kPublicWriting]) throw batchBusyError('toArray')
 
     if (!this[kBatchContext]) {
       return []
     }
 
-    this[kBusy] = true
-    try {
+    return this[kRunPublicAdmission]('toArray', () => {
       return binding.batch_iterate(this[kDbContext], this[kBatchContext], {
         keys: true,
         values: true,
         data: true,
         ...options
       })
-    } finally {
-      this[kBusy] = false
-      this._flushPendingClose()
-    }
+    })
   }
 }
 

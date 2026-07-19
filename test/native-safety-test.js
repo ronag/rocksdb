@@ -225,6 +225,38 @@ test('native iterator seek clamps discarded-row credit without bypassing its lim
   t.end()
 })
 
+test('native iterator reads stay finished after natural exhaustion', async function (t) {
+  const context = binding.db_init(temporaryDirectory())
+  await nativeOpen(context)
+
+  const batch = binding.batch_init(context)
+  binding.batch_put(batch, Buffer.from('key'), Buffer.from('value'), {})
+  binding.batch_write_sync(context, batch, {})
+
+  const syncIterator = binding.iterator_create(context, {})
+  const syncFirst = binding.iterator_nextv_sync(syncIterator, 10, {})
+  const syncSecond = binding.iterator_nextv_sync(syncIterator, 10, {})
+  t.equal(syncFirst.finished, true, 'sync read reaches natural exhaustion')
+  t.equal(syncSecond.finished, true, 'repeated sync read remains finished')
+  t.deepEqual(syncSecond.rows, [], 'repeated sync read returns no rows')
+  binding.iterator_close_sync(syncIterator)
+
+  const asyncIterator = binding.iterator_create(context, {})
+  const next = () => new Promise((resolve, reject) => {
+    binding.iterator_nextv(asyncIterator, 10, {}, (err, result) => err ? reject(err) : resolve(result))
+  })
+  const asyncFirst = await next()
+  const asyncSecond = await next()
+  t.equal(asyncFirst.finished, true, 'async read reaches natural exhaustion')
+  t.equal(asyncSecond.finished, true, 'repeated async read remains finished')
+  t.deepEqual(asyncSecond.rows, [], 'repeated async read returns no rows')
+  binding.iterator_close_sync(asyncIterator)
+
+  binding.batch_clear(batch)
+  await nativeClose(context)
+  t.end()
+})
+
 test('column names are defined safely and preserve embedded NUL bytes', async function (t) {
   const columns = Object.create(null)
   columns.default = {}

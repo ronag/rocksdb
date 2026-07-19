@@ -229,6 +229,31 @@ test('chained batch length remains readable after write and close', async functi
   t.end()
 })
 
+test('chained batch write preserves falsy listener errors', async function (t) {
+  const db = testCommon.factory()
+  await db.open()
+
+  for (const expected of [0, false, null, undefined]) {
+    db.once('write', () => { throw expected })
+    const outcome = await db.batch().put('key', 'value').write().then(
+      value => ({ fulfilled: true, value }),
+      reason => ({ fulfilled: false, reason })
+    )
+    t.equal(outcome.fulfilled, false, `write rejects after throwing ${String(expected)}`)
+    t.equal(outcome.reason, expected, 'the exact rejection reason is preserved')
+  }
+
+  const success = await db.batch().put('key', 'value').write().then(
+    value => ({ fulfilled: true, value }),
+    reason => ({ fulfilled: false, reason })
+  )
+  t.equal(success.fulfilled, true, 'an ordinary undefined result still fulfills')
+  t.equal(success.value, undefined, 'the successful result remains undefined')
+
+  await db.close()
+  t.end()
+})
+
 test('public chained mutations defer reentrant database close', async function (t) {
   for (const [name, mutate] of [
     ['put', (batch, options) => batch.put('key', 'value', options)],
