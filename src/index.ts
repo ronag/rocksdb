@@ -15,7 +15,7 @@ import {
   kRegisterCleanupResource,
   kUnref,
   kUnregisterCleanupResource,
-  setPackedResult
+  setPackedResult,
 } from './util'
 import { RocksWriteBufferManager } from './write-buffer-manager'
 
@@ -34,7 +34,7 @@ const kEmpty = Object.freeze({})
 const DEBUG = process.env.NODE_ENV !== 'production'
 const cleanupAttempts = 3
 
-function once (callback) {
+function once(callback) {
   let called = false
   return (...args) => {
     if (called) return
@@ -43,19 +43,15 @@ function once (callback) {
   }
 }
 
-function aggregateErrors (errors: any[], message) {
-  return errors.length === 1
-    ? errors[0]
-    : new AggregateError(errors, message, { cause: errors[0] })
+function aggregateErrors(errors: any[], message) {
+  return errors.length === 1 ? errors[0] : new AggregateError(errors, message, { cause: errors[0] })
 }
 
-async function drainCleanupResources (resources: Set<any>) {
+async function drainCleanupResources(resources: Set<any>) {
   const pending = Array.from(resources)
   if (pending.length === 0) return
 
-  const results = await Promise.allSettled(
-    pending.map(resource => resource.close())
-  )
+  const results = await Promise.allSettled(pending.map((resource) => resource.close()))
   const errors: any[] = []
 
   for (const result of results) {
@@ -67,7 +63,7 @@ async function drainCleanupResources (resources: Set<any>) {
   }
 }
 
-function cleanupDatabaseReference (context) {
+function cleanupDatabaseReference(context) {
   return new Promise<void>((resolve, reject) => {
     const errors: any[] = []
     let attempts = 0
@@ -76,13 +72,16 @@ function cleanupDatabaseReference (context) {
       if (closed) {
         resolve()
       } else {
-        const cause = errors.length === 0
-          ? new Error('Native database reference remains open after cleanup')
-          : aggregateErrors(errors, 'Database reference cleanup failed')
-        reject(new ModuleError('Database is not closed', {
-          code: 'LEVEL_DATABASE_NOT_CLOSED',
-          cause
-        }))
+        const cause =
+          errors.length === 0
+            ? new Error('Native database reference remains open after cleanup')
+            : aggregateErrors(errors, 'Database reference cleanup failed')
+        reject(
+          new ModuleError('Database is not closed', {
+            code: 'LEVEL_DATABASE_NOT_CLOSED',
+            cause,
+          })
+        )
       }
     }
 
@@ -131,7 +130,7 @@ function cleanupDatabaseReference (context) {
   })
 }
 
-async function cleanupProvisionalDatabaseReference (context) {
+async function cleanupProvisionalDatabaseReference(context) {
   try {
     await cleanupDatabaseReference(context)
     return
@@ -151,26 +150,26 @@ async function cleanupProvisionalDatabaseReference (context) {
   }
 }
 
-function attachReferenceResource (db, context) {
+function attachReferenceResource(db, context) {
   const resource = {
     active: true,
-    async close () {
+    async close() {
       if (!this.active) return
       await cleanupProvisionalDatabaseReference(context)
       this.active = false
     },
-    release () {
+    release() {
       if (!this.active) return
       this.active = false
       db.detachResource(resource)
-    }
+    },
   }
 
   db.attachResource(resource)
   return resource
 }
 
-function closeUpdates (handle) {
+function closeUpdates(handle) {
   const errors: any[] = []
   for (let attempt = 0; attempt < cleanupAttempts; attempt++) {
     try {
@@ -183,7 +182,7 @@ function closeUpdates (handle) {
   return errors
 }
 
-function clearNativeBatch (batch, operationError) {
+function clearNativeBatch(batch, operationError) {
   try {
     binding.batch_clear(batch)
     return operationError
@@ -197,24 +196,24 @@ function clearNativeBatch (batch, operationError) {
   }
 }
 
-function isUtf8Encoding (encoding) {
+function isUtf8Encoding(encoding) {
   return encoding === 'utf8' || encoding === 'utf-8'
 }
 
-function isJavaScriptEncoding (encoding) {
+function isJavaScriptEncoding(encoding) {
   return encoding === 'slice' || isUtf8Encoding(encoding)
 }
 
-function getDefaultPackedMode (encoding) {
+function getDefaultPackedMode(encoding) {
   return encoding === 'buffer' || encoding === 'slice' ? 'auto' : false
 }
 
-function prepareRawGetManyOptions (options, packed?) {
+function prepareRawGetManyOptions(options, packed?) {
   if ((typeof options !== 'object' || options === null) && typeof options !== 'function') {
     return {
       bindingOptions: options ?? kEmpty,
       packed: packed ?? getPackedMode(options, 'auto'),
-      valueEncoding: 'buffer'
+      valueEncoding: 'buffer',
     }
   }
 
@@ -241,34 +240,35 @@ function prepareRawGetManyOptions (options, packed?) {
   // to reject them. An object target would accidentally make them valid.
   const target = typeof options === 'function' ? function () {} : {}
   const bindingOptions = new Proxy(target, {
-    get (target, property) {
+    get(target, property) {
       if (property === 'valueEncoding') {
         const encoding = readValueEncoding()
         return encoding === 'slice' ? 'buffer' : encoding
       }
       return Reflect.get(options, property, options)
-    }
+    },
   })
 
   return {
     bindingOptions,
     packed,
-    get valueEncoding () {
+    get valueEncoding() {
       return readValueEncoding()
-    }
+    },
   }
 }
 
-function convertRawGetManyResult (result, valueEncoding) {
+function convertRawGetManyResult(result, valueEncoding) {
   if (!isJavaScriptEncoding(valueEncoding)) return result
 
-  const convert = (buffer, start = 0, end = buffer.byteLength) => valueEncoding === 'slice'
-    ? new Slice(buffer, start, end - start)
-    : buffer.toString('utf8', start, end)
+  const convert = (buffer, start = 0, end = buffer.byteLength) =>
+    valueEncoding === 'slice'
+      ? new Slice(buffer, start, end - start)
+      : buffer.toString('utf8', start, end)
 
   if (Array.isArray(result)) {
     if (valueEncoding !== 'slice') return result
-    return result.map(value => Buffer.isBuffer(value) ? convert(value) : value)
+    return result.map((value) => (Buffer.isBuffer(value) ? convert(value) : value))
   }
 
   return Array.from(result.statuses, (status, index) => {
@@ -282,7 +282,7 @@ function convertRawGetManyResult (result, valueEncoding) {
 class RocksLevel extends AbstractLevel<any, any, any> {
   [key: symbol]: any
 
-  constructor (locationOrHandle, { ...options } = {}) {
+  constructor(locationOrHandle, { ...options } = {}) {
     // Validate and acquire native handles before AbstractLevel schedules its
     // automatic open. If native construction throws, no half-constructed DB is
     // left behind to auto-open with an undefined context on the next tick.
@@ -290,22 +290,25 @@ class RocksLevel extends AbstractLevel<any, any, any> {
     try {
       context = binding.db_init(locationOrHandle)
 
-      super({
-        encodings: {
-          buffer: true,
-          utf8: true
-        },
-        createIfMissing: true,
-        errorIfExists: true,
-        implicitSnapshots: false,
-        seek: true,
-        additionalMethods: {
-          getStatistics: true,
-          query: true,
-          setStatisticsEnabled: true,
-          updates: true
-        }
-      } as any, options)
+      super(
+        {
+          encodings: {
+            buffer: true,
+            utf8: true,
+          },
+          createIfMissing: true,
+          errorIfExists: true,
+          implicitSnapshots: false,
+          seek: true,
+          additionalMethods: {
+            getStatistics: true,
+            query: true,
+            setStatisticsEnabled: true,
+            updates: true,
+          },
+        } as any,
+        options
+      )
     } catch (err) {
       // A BigInt handle reserves a native lease in db_init(). If AbstractLevel
       // rejects constructor options, release it synchronously because no JS
@@ -330,42 +333,42 @@ class RocksLevel extends AbstractLevel<any, any, any> {
     this[kReferenceResource] = attachReferenceResource(this, context)
   }
 
-  static async open (...args: any[]) {
+  static async open(...args: any[]) {
     const Constructor: any = this
     const db = new Constructor(...args)
     await db.open()
     return db
   }
 
-  get sequence () {
+  get sequence() {
     if (this.status !== 'open') {
       throw new ModuleError('Database is not open', {
-        code: 'LEVEL_DATABASE_NOT_OPEN'
+        code: 'LEVEL_DATABASE_NOT_OPEN',
       })
     }
 
     return binding.db_get_latest_sequence(this[kContext])
   }
 
-  get columns () {
+  get columns() {
     return this[kColumns]
   }
 
-  get handle () {
+  get handle() {
     if (this.status !== 'open') {
       throw new ModuleError('Database is not open', {
-        code: 'LEVEL_DATABASE_NOT_OPEN'
+        code: 'LEVEL_DATABASE_NOT_OPEN',
       })
     }
 
     return binding.db_get_handle(this[kContext])
   }
 
-  get location () {
+  get location() {
     return binding.db_get_location(this[kContext])
   }
 
-  async _open (options) {
+  async _open(options) {
     if (!this[kReferenceResource].active) {
       this[kReferenceResource] = attachReferenceResource(this, this[kContext])
     }
@@ -395,11 +398,11 @@ class RocksLevel extends AbstractLevel<any, any, any> {
     this[kReferenceResource].release()
   }
 
-  [kRef] () {
+  [kRef]() {
     this[kRefs]++
   }
 
-  [kUnref] () {
+  [kUnref]() {
     this[kRefs]--
     if (this[kRefs] === 0 && this[kPendingClose] !== null) {
       const pending = this[kPendingClose]
@@ -408,17 +411,17 @@ class RocksLevel extends AbstractLevel<any, any, any> {
     }
   }
 
-  [kRegisterCleanupResource] (resource) {
+  [kRegisterCleanupResource](resource) {
     this.attachResource(resource)
     this[kCleanupResources].add(resource)
   }
 
-  [kUnregisterCleanupResource] (resource) {
+  [kUnregisterCleanupResource](resource) {
     this[kCleanupResources].delete(resource)
     this.detachResource(resource)
   }
 
-  async [kWithRef] (operation) {
+  async [kWithRef](operation) {
     this[kRef]()
     try {
       return await operation()
@@ -427,11 +430,13 @@ class RocksLevel extends AbstractLevel<any, any, any> {
     }
   }
 
-  async _close () {
+  async _close() {
     if (this[kRefs] !== 0) {
       if (this[kPendingClose] === null) {
         let resolve
-        const promise = new Promise<void>(land => { resolve = land })
+        const promise = new Promise<void>((land) => {
+          resolve = land
+        })
         this[kPendingClose] = { promise, resolve }
       }
       await this[kPendingClose].promise
@@ -447,36 +452,21 @@ class RocksLevel extends AbstractLevel<any, any, any> {
     this[kColumns] = {}
   }
 
-  _put (key, value, options) {
-    return this[kWithRef](() => this[kBatchAsync](
-      [{ type: 'put', key, value }],
-      options ?? kEmpty,
-      undefined,
-      options
-    ))
+  _put(key, value, options) {
+    return this[kWithRef](() =>
+      this[kBatchAsync]([{ type: 'put', key, value }], options ?? kEmpty, undefined, options)
+    )
   }
 
-  async _get (key, options) {
-    const values = await this[kWithRef](() => this._getManyAsync(
-      [key],
-      options ?? kEmpty,
-      undefined,
-      false,
-      false,
-      false
-    ))
+  async _get(key, options) {
+    const values = await this[kWithRef](() =>
+      this._getManyAsync([key], options ?? kEmpty, undefined, false, false, false)
+    )
     return values[0]
   }
 
-  _getMany (keys, options) {
-    return this[kWithRef](() => this._getManyAsync(
-      keys,
-      options,
-      undefined,
-      false,
-      false,
-      false
-    ))
+  _getMany(keys, options) {
+    return this[kWithRef](() => this._getManyAsync(keys, options, undefined, false, false, false))
   }
 
   // Supported unsafe user-space read. The database must already be open and
@@ -485,7 +475,7 @@ class RocksLevel extends AbstractLevel<any, any, any> {
   // encoded keys and own option reentrancy and error observation. Raw database
   // reads may overlap one another. Native admission copies key bytes and this
   // wrapper snapshots result-conversion options before returning.
-  _getManyAsync (keys, options, callback, allowPartial, packed, exposePacked = true) {
+  _getManyAsync(keys, options, callback, allowPartial, packed, exposePacked = true) {
     if (DEBUG) {
       assert.strictEqual(this.status, 'open', 'unsafe _getManyAsync() requires an open database')
     }
@@ -494,7 +484,7 @@ class RocksLevel extends AbstractLevel<any, any, any> {
     return this[kGetManyAsync](keys, options, callback, allowPartial, packed, exposePacked)
   }
 
-  [kGetManyAsync] (keys, options, callback, allowPartial, packed, exposePacked) {
+  [kGetManyAsync](keys, options, callback, allowPartial, packed, exposePacked) {
     const promise = callback[kPromise]
     let bindingOptions = options
     let complete
@@ -504,7 +494,7 @@ class RocksLevel extends AbstractLevel<any, any, any> {
         allowPartial = false
         if ((typeof options === 'object' && options !== null) || typeof options === 'function') {
           bindingOptions = new Proxy(options, {
-            get (target, property) {
+            get(target, property) {
               const value = Reflect.get(target, property, target)
               if (property === 'timeout' && typeof value === 'number' && value > 0) {
                 allowPartial = true
@@ -512,18 +502,19 @@ class RocksLevel extends AbstractLevel<any, any, any> {
                 allowPartial = true
               }
               return value
-            }
+            },
           })
         }
       }
       const prepared = prepareRawGetManyOptions(bindingOptions, packed)
       packed = prepared.packed
       bindingOptions = prepared.bindingOptions
-      const getMany = packed === true
-        ? binding.db_get_many_packed
-        : packed === 'auto'
-          ? binding.db_get_many_auto
-          : binding.db_get_many
+      const getMany =
+        packed === true
+          ? binding.db_get_many_packed
+          : packed === 'auto'
+            ? binding.db_get_many_auto
+            : binding.db_get_many
       complete = once((err, val) => {
         if (err) {
           callback(err)
@@ -553,11 +544,12 @@ class RocksLevel extends AbstractLevel<any, any, any> {
             completionValue = val
             completionPacked = packedResult
           } else if (!allowPartial) {
-            const message = keys.length === 1
-              ? 'Multi-get stopped before the value was read'
-              : 'Multi-get stopped before every value was read'
+            const message =
+              keys.length === 1
+                ? 'Multi-get stopped before the value was read'
+                : 'Multi-get stopped before every value was read'
             completionError = new ModuleError(message, {
-              code: 'LEVEL_ABORTED'
+              code: 'LEVEL_ABORTED',
             })
           } else if (packedResult) {
             if (exposePacked) setPackedResult(val, true)
@@ -585,66 +577,63 @@ class RocksLevel extends AbstractLevel<any, any, any> {
   // Synchronous counterpart to _getManyAsync(). It has the same open-database,
   // encoded-input and no-close invariants and may block the JavaScript event
   // loop. Returned values and packed arenas own their backing bytes.
-  _getManySync (keys, options?) {
+  _getManySync(keys, options?) {
     if (DEBUG) {
       assert.strictEqual(this.status, 'open', 'unsafe _getManySync() requires an open database')
     }
 
-    if (keys.some(key => typeof key === 'string')) {
-      keys = keys.map(key => typeof key === 'string' ? Buffer.from(key) : key)
+    if (keys.some((key) => typeof key === 'string')) {
+      keys = keys.map((key) => (typeof key === 'string' ? Buffer.from(key) : key))
     }
 
     const prepared = prepareRawGetManyOptions(options)
     const packed = prepared.packed
-    const getMany = packed === true
-      ? binding.db_get_many_packed_sync
-      : packed === 'auto'
-        ? binding.db_get_many_auto_sync
-        : binding.db_get_many_sync
+    const getMany =
+      packed === true
+        ? binding.db_get_many_packed_sync
+        : packed === 'auto'
+          ? binding.db_get_many_auto_sync
+          : binding.db_get_many_sync
     const nativeResult = getMany(this[kContext], keys, prepared.bindingOptions)
     const packedResult = !Array.isArray(nativeResult)
     const result = convertRawGetManyResult(nativeResult, prepared.valueEncoding)
     return setPackedResult(result, packedResult)
   }
 
-  _del (key, options) {
-    return this[kWithRef](() => this[kBatchAsync](
-      [{ type: 'del', key }],
-      options ?? kEmpty,
-      undefined,
-      options
-    ))
+  _del(key, options) {
+    return this[kWithRef](() =>
+      this[kBatchAsync]([{ type: 'del', key }], options ?? kEmpty, undefined, options)
+    )
   }
 
-  _clear (options) {
-    return this[kWithRef](() => new Promise<void>((resolve, reject) => {
-      try {
-        binding.db_clear(this[kContext], options ?? kEmpty, (err) => {
-          if (err) reject(err)
-          else resolve()
+  _clear(options) {
+    return this[kWithRef](
+      () =>
+        new Promise<void>((resolve, reject) => {
+          try {
+            binding.db_clear(this[kContext], options ?? kEmpty, (err) => {
+              if (err) reject(err)
+              else resolve()
+            })
+          } catch (err) {
+            reject(err)
+          }
         })
-      } catch (err) {
-        reject(err)
-      }
-    }))
+    )
   }
 
   // Construct a caller-owned raw batch. The database must already be open and
   // outlive the batch; the raw/public state and serialization contract is
   // documented on the supported methods in chained-batch.ts and index.d.ts.
-  _chainedBatch () {
+  _chainedBatch() {
     return new ChainedBatch(this, this[kContext])
   }
 
-  _batch (operations, options) {
-    return this[kWithRef](() => this[kBatchAsync](
-      operations,
-      options,
-      undefined
-    ))
+  _batch(operations, options) {
+    return this[kWithRef](() => this[kBatchAsync](operations, options, undefined))
   }
 
-  [kBatchAsync] (operations, options, callback, columnOptions?) {
+  [kBatchAsync](operations, options, callback, columnOptions?) {
     callback = fromCallback(callback, kPromise)
     const promise = callback[kPromise]
     let batch
@@ -687,29 +676,29 @@ class RocksLevel extends AbstractLevel<any, any, any> {
   // and native admission copies range bounds before return. The open database
   // must outlive the iterator, and all operations on the wrapper must be
   // serialized until terminal cleanup.
-  _iterator (options) {
+  _iterator(options) {
     return new Iterator(this, this[kContext], options ?? kEmpty)
   }
 
-  _keys (options) {
+  _keys(options) {
     return new KeyIterator(this, this[kContext], options ?? kEmpty)
   }
 
-  _values (options) {
+  _values(options) {
     return new ValueIterator(this, this[kContext], options ?? kEmpty)
   }
 
-  get identity () {
+  get identity() {
     if (this.status !== 'open') {
       throw new ModuleError('Database is not open', {
-        code: 'LEVEL_DATABASE_NOT_OPEN'
+        code: 'LEVEL_DATABASE_NOT_OPEN',
       })
     }
 
     return binding.db_get_identity(this[kContext])
   }
 
-  getProperty (property, options) {
+  getProperty(property, options) {
     if (typeof property !== 'string') {
       throw new TypeError("The first argument 'property' must be a string")
     }
@@ -717,7 +706,7 @@ class RocksLevel extends AbstractLevel<any, any, any> {
     // Is synchronous, so can't be deferred
     if (this.status !== 'open') {
       throw new ModuleError('Database is not open', {
-        code: 'LEVEL_DATABASE_NOT_OPEN'
+        code: 'LEVEL_DATABASE_NOT_OPEN',
       })
     }
 
@@ -728,7 +717,7 @@ class RocksLevel extends AbstractLevel<any, any, any> {
   // single native call. Returns a plain object mapping each property name to its
   // (string) value; a missing property maps to '' (same as getProperty). This
   // avoids one JS<->native transition per property when sampling many at once.
-  getProperties (properties, options) {
+  getProperties(properties, options) {
     if (!Array.isArray(properties)) {
       throw new TypeError("The first argument 'properties' must be an array")
     }
@@ -741,7 +730,7 @@ class RocksLevel extends AbstractLevel<any, any, any> {
     // Is synchronous, so can't be deferred
     if (this.status !== 'open') {
       throw new ModuleError('Database is not open', {
-        code: 'LEVEL_DATABASE_NOT_OPEN'
+        code: 'LEVEL_DATABASE_NOT_OPEN',
       })
     }
 
@@ -751,10 +740,10 @@ class RocksLevel extends AbstractLevel<any, any, any> {
   // Toggle ticker collection at runtime. Returns true when a collector is
   // attached and false otherwise. On a RocksStatistics resource this changes
   // collection globally for every DB sharing that resource.
-  setStatisticsEnabled (enabled) {
+  setStatisticsEnabled(enabled) {
     if (this.status !== 'open') {
       throw new ModuleError('Database is not open', {
-        code: 'LEVEL_DATABASE_NOT_OPEN'
+        code: 'LEVEL_DATABASE_NOT_OPEN',
       })
     }
 
@@ -768,17 +757,17 @@ class RocksLevel extends AbstractLevel<any, any, any> {
   // Curated cumulative ticker counts, or null without `statistics: true` or a
   // RocksStatistics resource. Shared snapshots cover all attached DBs. Values
   // above Number.MAX_SAFE_INTEGER may lose integer precision.
-  getStatistics () {
+  getStatistics() {
     if (this.status !== 'open') {
       throw new ModuleError('Database is not open', {
-        code: 'LEVEL_DATABASE_NOT_OPEN'
+        code: 'LEVEL_DATABASE_NOT_OPEN',
       })
     }
 
     return binding.db_get_statistics(this[kContext])
   }
 
-  query (options, callback) {
+  query(options, callback) {
     if (typeof options === 'function') {
       callback = options
       options = kEmpty
@@ -786,9 +775,12 @@ class RocksLevel extends AbstractLevel<any, any, any> {
     callback = fromCallback(callback, kPromise)
 
     if (this.status !== 'open') {
-      process.nextTick(callback, new ModuleError('Database is not open', {
-        code: 'LEVEL_DATABASE_NOT_OPEN'
-      }))
+      process.nextTick(
+        callback,
+        new ModuleError('Database is not open', {
+          code: 'LEVEL_DATABASE_NOT_OPEN',
+        })
+      )
       return callback[kPromise]
     }
 
@@ -808,20 +800,20 @@ class RocksLevel extends AbstractLevel<any, any, any> {
     return promise
   }
 
-  querySync (options) {
+  querySync(options) {
     if (this.status !== 'open') {
       throw new ModuleError('Database is not open', {
-        code: 'LEVEL_DATABASE_NOT_OPEN'
+        code: 'LEVEL_DATABASE_NOT_OPEN',
       })
     }
 
     return binding.db_query_sync(this[kContext], options ?? kEmpty)
   }
 
-  async * updates (options) {
+  async *updates(options) {
     if (this.status !== 'open') {
       throw new ModuleError('Database is not open', {
-        code: 'LEVEL_DATABASE_NOT_OPEN'
+        code: 'LEVEL_DATABASE_NOT_OPEN',
       })
     }
 
@@ -838,7 +830,7 @@ class RocksLevel extends AbstractLevel<any, any, any> {
         let value
         try {
           value = await new Promise((resolve, reject) => {
-            binding.updates_next(handle, (err, val) => err ? reject(err) : resolve(val))
+            binding.updates_next(handle, (err, val) => (err ? reject(err) : resolve(val)))
           })
         } finally {
           this[kUnref]()
@@ -873,7 +865,7 @@ class RocksLevel extends AbstractLevel<any, any, any> {
     }
   }
 
-  compactRange (options = {}, callback) {
+  compactRange(options = {}, callback) {
     if (typeof options === 'function') {
       callback = options
       options = kEmpty
@@ -881,9 +873,12 @@ class RocksLevel extends AbstractLevel<any, any, any> {
     callback = fromCallback(callback, kPromise)
 
     if (this.status !== 'open') {
-      process.nextTick(callback, new ModuleError('Database is not open', {
-        code: 'LEVEL_DATABASE_NOT_OPEN'
-      }))
+      process.nextTick(
+        callback,
+        new ModuleError('Database is not open', {
+          code: 'LEVEL_DATABASE_NOT_OPEN',
+        })
+      )
       return callback[kPromise]
     }
 
@@ -903,7 +898,7 @@ class RocksLevel extends AbstractLevel<any, any, any> {
     return promise
   }
 
-  flushWAL (options = {}, callback) {
+  flushWAL(options = {}, callback) {
     if (typeof options === 'function') {
       callback = options
       options = kEmpty
@@ -911,9 +906,12 @@ class RocksLevel extends AbstractLevel<any, any, any> {
     callback = fromCallback(callback, kPromise)
 
     if (this.status !== 'open') {
-      process.nextTick(callback, new ModuleError('Database is not open', {
-        code: 'LEVEL_DATABASE_NOT_OPEN'
-      }))
+      process.nextTick(
+        callback,
+        new ModuleError('Database is not open', {
+          code: 'LEVEL_DATABASE_NOT_OPEN',
+        })
+      )
       return callback[kPromise]
     }
 
@@ -948,15 +946,17 @@ class RocksLevel extends AbstractLevel<any, any, any> {
   }
 }
 
-function inheritColumnOptions (options) {
+function inheritColumnOptions(options) {
   let source
   let inherited
 
   return new Proxy(Object.create(options), {
-    get (target, property) {
+    get(target, property) {
       const value = Reflect.get(options, property, options)
-      if (property !== 'columns' ||
-          ((typeof value !== 'object' || value === null) && typeof value !== 'function')) {
+      if (
+        property !== 'columns' ||
+        ((typeof value !== 'object' || value === null) && typeof value !== 'function')
+      ) {
         return value
       }
 
@@ -965,32 +965,32 @@ function inheritColumnOptions (options) {
         inherited = createInheritedColumns(value, options)
       }
       return inherited
-    }
+    },
   })
 }
 
-function createInheritedColumns (columns, defaults) {
+function createInheritedColumns(columns, defaults) {
   const inherited = new WeakMap()
 
   return new Proxy(Object.create(columns), {
-    get (target, property) {
+    get(target, property) {
       const column = Reflect.get(columns, property, columns)
       if (typeof column !== 'object' || column === null) return column
 
       let result = inherited.get(column)
       if (result === undefined) {
         result = new Proxy(Object.create(column), {
-          get (target, property) {
+          get(target, property) {
             const value = Reflect.get(column, property, column)
             return value !== undefined || Reflect.has(column, property)
               ? value
               : Reflect.get(defaults, property, defaults)
-          }
+          },
         })
         inherited.set(column, result)
       }
       return result
-    }
+    },
   })
 }
 
@@ -999,6 +999,6 @@ export { RocksLevel, RocksCache, RocksWriteBufferManager, RocksStatistics }
 // null on platforms where io_uring does not apply (non-Linux). On Linux, this
 // reports the same async-I/O capability used by RocksDB's default filesystem;
 // false means reads use the serial fallback.
-export function ioUringAvailable () {
+export function ioUringAvailable() {
   return binding.io_uring_available()
 }

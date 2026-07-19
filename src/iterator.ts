@@ -9,7 +9,7 @@ import {
   getPackedMode,
   kRegisterCleanupResource,
   kUnregisterCleanupResource,
-  setPackedResult
+  setPackedResult,
 } from './util'
 
 const kPromise = Symbol('promise')
@@ -53,9 +53,9 @@ const kReady = 2
 const kFailed = 3
 const kClosed = 4
 
-const identity = value => value
+const identity = (value) => value
 
-function once (callback) {
+function once(callback) {
   let called = false
   return (...args) => {
     if (called) return
@@ -70,7 +70,7 @@ const getTypedArrayByteLength = Object.getOwnPropertyDescriptor(
 )!.get!
 const copyBytesFrom = Buffer.copyBytesFrom
 
-function normalizeSeekTarget (target) {
+function normalizeSeekTarget(target) {
   if (typeof target === 'string') {
     if (target.length === 0) throw new Error('cannot seek() to an empty target')
     return target
@@ -94,9 +94,14 @@ function normalizeSeekTarget (target) {
     throw new TypeError('SliceLike.buffer must be a Buffer')
   }
   const bufferByteLength = getTypedArrayByteLength.call(buffer)
-  if (!Number.isSafeInteger(byteOffset) || !Number.isSafeInteger(byteLength) ||
-      byteOffset < 0 || byteLength < 0 || byteOffset > bufferByteLength ||
-      byteLength > bufferByteLength - byteOffset) {
+  if (
+    !Number.isSafeInteger(byteOffset) ||
+    !Number.isSafeInteger(byteLength) ||
+    byteOffset < 0 ||
+    byteLength < 0 ||
+    byteOffset > bufferByteLength ||
+    byteLength > bufferByteLength - byteOffset
+  ) {
     throw new RangeError('SliceLike byte range is invalid')
   }
   if (byteLength === 0) throw new Error('cannot seek() to an empty target')
@@ -104,7 +109,7 @@ function normalizeSeekTarget (target) {
   return { buffer, byteOffset, byteLength }
 }
 
-function snapshotSeekTarget (target) {
+function snapshotSeekTarget(target) {
   target = normalizeSeekTarget(target)
   if (typeof target === 'string') return target
   if (Buffer.isBuffer(target)) return copyBytesFrom(target)
@@ -112,7 +117,7 @@ function snapshotSeekTarget (target) {
   return copyBytesFrom(target.buffer, target.byteOffset, target.byteLength)
 }
 
-function prepareAbstractIteratorOptions (options) {
+function prepareAbstractIteratorOptions(options) {
   if (typeof options !== 'object' || options === null) return options
 
   const keyDecoder = Reflect.get(options, kAbstractKeyEncoding, options)
@@ -125,34 +130,34 @@ function prepareAbstractIteratorOptions (options) {
     name: `rocks-level-raw-${name}`,
     format: encoding === 'utf8' || encoding === 'utf-8' ? 'utf8' : 'buffer',
     encode: identity,
-    decode: identity
+    decode: identity,
   })
   const abstractKeyEncoding = keyDecoder ?? fallback('key', keyEncoding)
   const abstractValueEncoding = valueDecoder ?? fallback('value', valueEncoding)
 
   return new Proxy(options, {
-    get (target, property) {
+    get(target, property) {
       if (property === kAbstractKeyEncoding) return abstractKeyEncoding
       if (property === kAbstractValueEncoding) return abstractValueEncoding
       if (property === 'keyEncoding') return keyEncoding
       if (property === 'valueEncoding') return valueEncoding
       return Reflect.get(options, property, options)
-    }
+    },
   })
 }
 
-function iteratorBusyError (operation) {
+function iteratorBusyError(operation) {
   return new ModuleError(
     `Iterator is busy: cannot call ${operation}() until the previous operation has completed`,
     { code: 'LEVEL_ITERATOR_BUSY' }
   )
 }
 
-function iteratorNotOpenError () {
+function iteratorNotOpenError() {
   return new ModuleError('Iterator is not open', { code: 'LEVEL_ITERATOR_NOT_OPEN' })
 }
 
-function assertIteratorIdle (iterator, operation) {
+function assertIteratorIdle(iterator, operation) {
   assert(
     iterator[kContext] || iterator[kInitState] === kFailed,
     `unsafe ${operation}() requires an open iterator`
@@ -165,63 +170,76 @@ function assertIteratorIdle (iterator, operation) {
   assert(!iterator[kUnsafeBusy], `unsafe ${operation}() must not overlap another unsafe operation`)
 }
 
-function packedCacheError () {
-  return new ModuleError(
-    'Cannot read packed rows while prefetched iterator rows remain',
-    { code: 'LEVEL_NOT_SUPPORTED' }
-  )
+function packedCacheError() {
+  return new ModuleError('Cannot read packed rows while prefetched iterator rows remain', {
+    code: 'LEVEL_NOT_SUPPORTED',
+  })
 }
 
-function emptyPackedResult () {
+function emptyPackedResult() {
   return {
     buffer: Buffer.alloc(0),
     offsets: new Uint32Array([0]),
     count: 0,
     finished: true,
-    limited: false
+    limited: false,
   }
 }
 
-function isPackedEncoding (encoding) {
-  return encoding === 'buffer' || encoding === 'slice' ||
-    encoding === 'utf8' || encoding === 'utf-8'
+function isPackedEncoding(encoding) {
+  return (
+    encoding === 'buffer' || encoding === 'slice' || encoding === 'utf8' || encoding === 'utf-8'
+  )
 }
 
-function isJavaScriptEncoding (encoding) {
+function isJavaScriptEncoding(encoding) {
   return encoding === 'slice' || encoding === 'utf8' || encoding === 'utf-8'
 }
 
-function getDefaultPackedMode (iterator) {
-  if ((iterator[kKeys] && iterator[kKeyEncoding] !== 'buffer' && iterator[kKeyEncoding] !== 'slice') ||
-      (iterator[kValues] && iterator[kValueEncoding] !== 'buffer' && iterator[kValueEncoding] !== 'slice')) {
+function getDefaultPackedMode(iterator) {
+  if (
+    (iterator[kKeys] &&
+      iterator[kKeyEncoding] !== 'buffer' &&
+      iterator[kKeyEncoding] !== 'slice') ||
+    (iterator[kValues] &&
+      iterator[kValueEncoding] !== 'buffer' &&
+      iterator[kValueEncoding] !== 'slice')
+  ) {
     return false
   }
 
   return 'auto'
 }
 
-function prepareNativeIteratorOptions (options, keyEncoding, valueEncoding) {
+function prepareNativeIteratorOptions(options, keyEncoding, valueEncoding) {
   if (keyEncoding !== 'slice' && valueEncoding !== 'slice') return options
 
-  return new Proxy({}, {
-    get (target, property) {
-      if (property === 'keyEncoding' && keyEncoding === 'slice') return 'buffer'
-      if (property === 'valueEncoding' && valueEncoding === 'slice') return 'buffer'
-      return Reflect.get(options, property, options)
+  return new Proxy(
+    {},
+    {
+      get(target, property) {
+        if (property === 'keyEncoding' && keyEncoding === 'slice') return 'buffer'
+        if (property === 'valueEncoding' && valueEncoding === 'slice') return 'buffer'
+        return Reflect.get(options, property, options)
+      },
     }
-  })
+  )
 }
 
-function validatePackedEncodings (iterator, packed) {
+function validatePackedEncodings(iterator, packed) {
   if (packed === false) return
 
-  if ((iterator[kKeys] && !isPackedEncoding(iterator[kKeyEncoding])) ||
-      (iterator[kValues] && !isPackedEncoding(iterator[kValueEncoding]))) {
-    throw new TypeError('Packed iterator only supports buffer, slice or utf8 key and value encodings')
+  if (
+    (iterator[kKeys] && !isPackedEncoding(iterator[kKeyEncoding])) ||
+    (iterator[kValues] && !isPackedEncoding(iterator[kValueEncoding]))
+  ) {
+    throw new TypeError(
+      'Packed iterator only supports buffer, slice or utf8 key and value encodings'
+    )
   }
 }
 
-function convertIteratorResult (iterator, result) {
+function convertIteratorResult(iterator, result) {
   if ('rows' in result) {
     const convertKey = iterator[kKeys] && iterator[kKeyEncoding] === 'slice'
     const convertValue = iterator[kValues] && iterator[kValueEncoding] === 'slice'
@@ -260,14 +278,14 @@ function convertIteratorResult (iterator, result) {
   return {
     rows,
     finished: result.finished,
-    limited: result.limited
+    limited: result.limited,
   }
 }
 
 class Iterator extends AbstractIterator<any, any, any> {
   [key: symbol]: any
 
-  constructor (db, context, options) {
+  constructor(db, context, options) {
     const nativeOptions = options
     options = prepareAbstractIteratorOptions(options)
     super(db, options)
@@ -308,7 +326,7 @@ class Iterator extends AbstractIterator<any, any, any> {
     }
   }
 
-  _initialize (callback) {
+  _initialize(callback) {
     if (this[kInitState] === kReady) {
       process.nextTick(callback)
       return
@@ -350,18 +368,14 @@ class Iterator extends AbstractIterator<any, any, any> {
     })
 
     try {
-      binding.iterator_init(
-        this[kContext],
-        this[kInitialTarget],
-        complete
-      )
+      binding.iterator_init(this[kContext], this[kInitialTarget], complete)
       initializationScheduled = true
     } catch (err) {
       process.nextTick(complete, err)
     }
   }
 
-  _initializeSync (initialTarget = this[kInitialTarget]) {
+  _initializeSync(initialTarget = this[kInitialTarget]) {
     if (this[kInitState] === kReady) return
     if (this[kInitState] === kInitializing) throw iteratorBusyError('initialize')
     if (this[kInitState] === kFailed) throw this[kInitError]
@@ -381,7 +395,7 @@ class Iterator extends AbstractIterator<any, any, any> {
     }
   }
 
-  _cleanupFailedInitialization (initializationError) {
+  _cleanupFailedInitialization(initializationError) {
     if (!this[kContext]) return initializationError
 
     try {
@@ -397,7 +411,7 @@ class Iterator extends AbstractIterator<any, any, any> {
     }
   }
 
-  [kFinishInitialization] (err) {
+  [kFinishInitialization](err) {
     let initialized = !err
     if (err) {
       try {
@@ -427,7 +441,7 @@ class Iterator extends AbstractIterator<any, any, any> {
     return err
   }
 
-  _seek (target) {
+  _seek(target) {
     if (this[kInitState] === kClosed) return
     if (this[kNativeBusy]) throw iteratorBusyError('seek')
     if (DEBUG) assert(!this[kUnsafeBusy], 'public seek() must not overlap an unsafe operation')
@@ -453,7 +467,7 @@ class Iterator extends AbstractIterator<any, any, any> {
     }
   }
 
-  async _close () {
+  async _close() {
     if (this[kNativeBusy] && this[kNativeBusy] !== kNativeSeek) {
       throw iteratorBusyError('close')
     }
@@ -476,21 +490,19 @@ class Iterator extends AbstractIterator<any, any, any> {
       }
     }
 
-    const error = new AggregateError(
-      errors,
-      'Iterator resources could not be released cleanly',
-      { cause: errors[0] }
-    )
+    const error = new AggregateError(errors, 'Iterator resources could not be released cleanly', {
+      cause: errors[0],
+    })
     this[kEnsureCleanupResource]()
     throw error
   }
 
   // Undocumented, exposed for tests only
-  get cached () {
+  get cached() {
     return (this[kCache].length - this[kPosition]) / 2
   }
 
-  _next () {
+  _next() {
     if (DEBUG) assert(!this[kUnsafeBusy], 'unsafe _next() must not overlap an unsafe operation')
     if (this[kNativeBusy]) {
       return Promise.reject(iteratorBusyError('next'))
@@ -514,7 +526,7 @@ class Iterator extends AbstractIterator<any, any, any> {
     })
   }
 
-  [kNext] (callback) {
+  [kNext](callback) {
     if (this[kInitState] !== kReady && this[kInitState] !== kUninitialized) {
       this._initialize((err) => {
         if (err) callback(err)
@@ -540,7 +552,7 @@ class Iterator extends AbstractIterator<any, any, any> {
     return this
   }
 
-  _refill (size, callback, initialize) {
+  _refill(size, callback, initialize) {
     let initializationScheduled = false
     if (initialize) this[kInitState] = kInitializing
 
@@ -574,13 +586,7 @@ class Iterator extends AbstractIterator<any, any, any> {
 
     try {
       if (initialize) {
-        binding.iterator_init_nextv(
-          this[kContext],
-          this[kInitialTarget],
-          size,
-          null,
-          complete
-        )
+        binding.iterator_init_nextv(this[kContext], this[kInitialTarget], size, null, complete)
         initializationScheduled = true
       } else {
         binding.iterator_nextv(this[kContext], size, null, complete)
@@ -590,7 +596,7 @@ class Iterator extends AbstractIterator<any, any, any> {
     }
   }
 
-  _nextv (size, options) {
+  _nextv(size, options) {
     if (DEBUG) assert(!this[kUnsafeBusy], 'unsafe _nextv() must not overlap an unsafe operation')
     if (this[kNativeBusy]) {
       return Promise.reject(iteratorBusyError('nextv'))
@@ -617,7 +623,7 @@ class Iterator extends AbstractIterator<any, any, any> {
           // instead of silently marking the public iterator as ended.
           if (rows.length === 0 && !finished) {
             throw new ModuleError('Iterator read stopped before a row was read', {
-              code: 'LEVEL_ABORTED'
+              code: 'LEVEL_ABORTED',
             })
           }
 
@@ -651,7 +657,7 @@ class Iterator extends AbstractIterator<any, any, any> {
   // Keep this boundary aligned with RocksIteratorNative in index.d.ts.
 
   // Reset prefetched JavaScript rows and synchronously refresh native state.
-  _refreshSync () {
+  _refreshSync() {
     if (DEBUG) assertIteratorIdle(this, '_refreshSync')
     this._initializeSync()
     if (DEBUG) assert(this[kContext])
@@ -666,7 +672,7 @@ class Iterator extends AbstractIterator<any, any, any> {
 
   // Seek to an encoded target, discarding prefetched rows. Native admission
   // consumes the target during this call; the wrapper does not retain it.
-  _seekSync (target) {
+  _seekSync(target) {
     if (DEBUG) assertIteratorIdle(this, '_seekSync')
     if (!DEBUG) return this[kSeekSync](target, false)
 
@@ -678,7 +684,7 @@ class Iterator extends AbstractIterator<any, any, any> {
     }
   }
 
-  [kSeekSync] (target, owned) {
+  [kSeekSync](target, owned) {
     if (owned || DEBUG) target = normalizeSeekTarget(target)
     if (owned && this[kInitState] === kClosed) return
 
@@ -699,7 +705,7 @@ class Iterator extends AbstractIterator<any, any, any> {
 
   // Seek to an encoded target without blocking for RocksDB I/O. Native
   // admission copies the target bytes before this method returns.
-  _seekAsync (target, callback) {
+  _seekAsync(target, callback) {
     if (DEBUG) assertIteratorIdle(this, '_seekAsync')
     callback = fromCallback(callback, kPromise)
     const promise = callback[kPromise]
@@ -749,7 +755,7 @@ class Iterator extends AbstractIterator<any, any, any> {
     return promise
   }
 
-  _nextvCached (size) {
+  _nextvCached(size) {
     const end = Math.min(this[kCache].length, this[kPosition] + size * 2)
     const rows = this[kCache].slice(this[kPosition], end)
     this[kPosition] = end
@@ -763,7 +769,7 @@ class Iterator extends AbstractIterator<any, any, any> {
   // Read already-encoded rows without public count/end bookkeeping. Returned
   // buffers and packed arenas own their backing bytes independently of the
   // iterator, but this call may block the JavaScript event loop.
-  _nextvSync (size, options) {
+  _nextvSync(size, options) {
     if (DEBUG) assertIteratorIdle(this, '_nextvSync')
     if (!DEBUG) return this[kNextvSync](size, options)
 
@@ -775,7 +781,7 @@ class Iterator extends AbstractIterator<any, any, any> {
     }
   }
 
-  [kNextvSync] (size, options) {
+  [kNextvSync](size, options) {
     this._initializeSync()
     if (DEBUG) assert(this[kContext])
     const packed = getPackedMode(options, getDefaultPackedMode(this))
@@ -791,11 +797,12 @@ class Iterator extends AbstractIterator<any, any, any> {
       return setPackedResult(convertIteratorResult(this, result), packed === true)
     }
 
-    const nextv = packed === true
-      ? binding.iterator_nextv_packed_sync
-      : packed === 'auto'
-        ? binding.iterator_nextv_auto_sync
-        : binding.iterator_nextv_sync
+    const nextv =
+      packed === true
+        ? binding.iterator_nextv_packed_sync
+        : packed === 'auto'
+          ? binding.iterator_nextv_auto_sync
+          : binding.iterator_nextv_sync
     const result = nextv(this[kContext], size, options)
     this[kFinished] = result.finished
 
@@ -805,7 +812,7 @@ class Iterator extends AbstractIterator<any, any, any> {
 
   // Read already-encoded rows without public count/end bookkeeping. No other
   // operation may start on this wrapper until the callback or promise settles.
-  _nextvAsync (size, options, callback, packed) {
+  _nextvAsync(size, options, callback, packed) {
     if (DEBUG) assertIteratorIdle(this, '_nextvAsync')
     callback = fromCallback(callback, kPromise)
     const promise = callback[kPromise]
@@ -818,7 +825,7 @@ class Iterator extends AbstractIterator<any, any, any> {
     return promise
   }
 
-  [kNextvAsync] (size, options, callback, packed, unsafe, initialize) {
+  [kNextvAsync](size, options, callback, packed, unsafe, initialize) {
     if (initialize && this[kInitState] === kUninitialized) {
       return this[kInitNextvAsync](size, options, callback, unsafe)
     }
@@ -850,11 +857,12 @@ class Iterator extends AbstractIterator<any, any, any> {
         const result = packed === true ? emptyPackedResult() : { rows: [], finished: true }
         this._deferNextResult(callback, null, result, packed === true, unsafe)
       } else {
-        const nextv = packed === true
-          ? binding.iterator_nextv_packed
-          : packed === 'auto'
-            ? binding.iterator_nextv_auto
-            : binding.iterator_nextv
+        const nextv =
+          packed === true
+            ? binding.iterator_nextv_packed
+            : packed === 'auto'
+              ? binding.iterator_nextv_auto
+              : binding.iterator_nextv
         nativeComplete = once((err, result) => {
           this[kCompleteNextv](err, result, callback, unsafe)
         })
@@ -871,7 +879,7 @@ class Iterator extends AbstractIterator<any, any, any> {
     return callback[kPromise]
   }
 
-  [kInitNextvAsync] (size, options, callback, unsafe) {
+  [kInitNextvAsync](size, options, callback, unsafe) {
     this[kInitState] = kInitializing
     let initializationScheduled = false
 
@@ -888,13 +896,7 @@ class Iterator extends AbstractIterator<any, any, any> {
     })
 
     try {
-      binding.iterator_init_nextv(
-        this[kContext],
-        this[kInitialTarget],
-        size,
-        options,
-        complete
-      )
+      binding.iterator_init_nextv(this[kContext], this[kInitialTarget], size, options, complete)
       initializationScheduled = true
     } catch (err) {
       process.nextTick(complete, err)
@@ -903,7 +905,7 @@ class Iterator extends AbstractIterator<any, any, any> {
     return callback[kPromise]
   }
 
-  [kCompleteNextv] (err, result, callback, unsafe) {
+  [kCompleteNextv](err, result, callback, unsafe) {
     if (unsafe) this[kUnsafeBusy] = false
     if (err) {
       callback(err)
@@ -923,7 +925,7 @@ class Iterator extends AbstractIterator<any, any, any> {
     callback(null, result, packedResult)
   }
 
-  _deferNextResult (callback, err, result?, packed?, unsafe?) {
+  _deferNextResult(callback, err, result?, packed?, unsafe?) {
     process.nextTick(() => {
       if (unsafe) this[kUnsafeBusy] = false
       if (err) {
@@ -941,7 +943,7 @@ class Iterator extends AbstractIterator<any, any, any> {
     })
   }
 
-  [kCloseNative] () {
+  [kCloseNative]() {
     this[kCache] = kEmpty
 
     if (this[kContext]) {
@@ -956,7 +958,7 @@ class Iterator extends AbstractIterator<any, any, any> {
     this[kReleaseCleanupResource]()
   }
 
-  [kEnsureCleanupResource] () {
+  [kEnsureCleanupResource]() {
     if (this[kCleanupResource] !== null) return
 
     const resource: any = {
@@ -964,13 +966,13 @@ class Iterator extends AbstractIterator<any, any, any> {
       close: async () => {
         if (!resource.active) return
         await this._close()
-      }
+      },
     }
     this[kCleanupResource] = resource
     ;(this.db as any)[kRegisterCleanupResource](resource)
   }
 
-  [kReleaseCleanupResource] () {
+  [kReleaseCleanupResource]() {
     const resource = this[kCleanupResource]
     if (resource === null) return
 
@@ -982,7 +984,7 @@ class Iterator extends AbstractIterator<any, any, any> {
   // Terminal raw close. It intentionally leaves AbstractLevel's private
   // public status untouched; a native failure leaves the resource attached so
   // the caller can retry cleanup.
-  _closeSync () {
+  _closeSync() {
     if (DEBUG) {
       assert(
         this[kInitState] !== kInitializing,
@@ -998,7 +1000,7 @@ class Iterator extends AbstractIterator<any, any, any> {
 
   // Native cleanup is synchronous; only callback/promise notification is
   // deferred. The same terminal and retry invariants as _closeSync() apply.
-  _closeAsync (callback) {
+  _closeAsync(callback) {
     callback = fromCallback(callback, kPromise)
 
     try {
@@ -1012,16 +1014,16 @@ class Iterator extends AbstractIterator<any, any, any> {
   }
 }
 
-function projectEntries (entries, projection) {
+function projectEntries(entries, projection) {
   for (let i = 0; i < entries.length; i++) entries[i] = entries[i][projection]
   return entries
 }
 
-function entryIteratorOptions (db, options, keys, values) {
+function entryIteratorOptions(db, options, keys, values) {
   const entryOptions = {
     ...options,
     keys,
-    values
+    values,
   }
 
   // The outer iterator owns user decoding. Decode the composed iterator only
@@ -1031,7 +1033,7 @@ function entryIteratorOptions (db, options, keys, values) {
   return entryOptions
 }
 
-function ownedEntryIterator (db, context, options, keys, values) {
+function ownedEntryIterator(db, context, options, keys, values) {
   const iterator = new Iterator(db, context, entryIteratorOptions(db, options, keys, values))
 
   // The wrapper exclusively owns the composed entry iterator. Keep only the
@@ -1044,7 +1046,7 @@ function ownedEntryIterator (db, context, options, keys, values) {
 class KeyIterator extends AbstractKeyIterator<any, any> {
   #iterator
 
-  constructor (db, context, options) {
+  constructor(db, context, options) {
     super(db, options)
 
     try {
@@ -1055,24 +1057,24 @@ class KeyIterator extends AbstractKeyIterator<any, any> {
     }
   }
 
-  async _next () {
+  async _next() {
     const entry = await this.#iterator.next()
     return entry === undefined ? undefined : entry[0]
   }
 
-  async _nextv (size, options) {
+  async _nextv(size, options) {
     return projectEntries(await this.#iterator.nextv(size, options), 0)
   }
 
-  async _all (options) {
+  async _all(options) {
     return projectEntries(await this.#iterator.all(options), 0)
   }
 
-  _seek (target, options) {
+  _seek(target, options) {
     this.#iterator.seek(target, options)
   }
 
-  _close () {
+  _close() {
     return this.#iterator._close()
   }
 }
@@ -1080,7 +1082,7 @@ class KeyIterator extends AbstractKeyIterator<any, any> {
 class ValueIterator extends AbstractValueIterator<any, any, any> {
   #iterator
 
-  constructor (db, context, options) {
+  constructor(db, context, options) {
     super(db, options)
 
     try {
@@ -1091,24 +1093,24 @@ class ValueIterator extends AbstractValueIterator<any, any, any> {
     }
   }
 
-  async _next () {
+  async _next() {
     const entry = await this.#iterator.next()
     return entry === undefined ? undefined : entry[1]
   }
 
-  async _nextv (size, options) {
+  async _nextv(size, options) {
     return projectEntries(await this.#iterator.nextv(size, options), 1)
   }
 
-  async _all (options) {
+  async _all(options) {
     return projectEntries(await this.#iterator.all(options), 1)
   }
 
-  _seek (target, options) {
+  _seek(target, options) {
     this.#iterator.seek(target, options)
   }
 
-  _close () {
+  _close() {
     return this.#iterator._close()
   }
 }

@@ -3,11 +3,11 @@ import binding = require('./binding')
 const kCacheContext = Symbol('cacheContext')
 
 class RocksCache {
-  constructor (optionsOrHandle = {}) {
+  constructor(optionsOrHandle = {}) {
     this[kCacheContext] = binding.cache_init(optionsOrHandle)
   }
 
-  get handle () {
+  get handle() {
     return binding.cache_get_handle(this[kCacheContext])
   }
 }

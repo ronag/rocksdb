@@ -7,7 +7,7 @@ export const kUnref = Symbol('unref')
 export const kRegisterCleanupResource = Symbol('registerCleanupResource')
 export const kUnregisterCleanupResource = Symbol('unregisterCleanupResource')
 
-export function getPackedMode (
+export function getPackedMode(
   options: { packed?: PackedMode } | null | undefined,
   fallback: PackedMode | (() => PackedMode) = false
 ): PackedMode {
@@ -19,7 +19,7 @@ export function getPackedMode (
   return packed
 }
 
-export function setPackedResult (result, packed) {
+export function setPackedResult(result, packed) {
   Object.defineProperty(result, 'packed', { value: packed })
   return result
 }

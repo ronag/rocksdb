@@ -26,24 +26,23 @@ const EMPTY = {}
 const DEBUG = process.env.NODE_ENV !== 'production'
 const cleanupAttempts = 3
 
-function batchBusyError (operation, active) {
+function batchBusyError(operation, active) {
   return new ModuleError(
     `Batch is busy: cannot call ${operation}() while ${active} is in progress`,
     { code: 'LEVEL_BATCH_BUSY' }
   )
 }
 
-function batchNotOpenError (operation) {
-  return new ModuleError(
-    `Batch is not open: cannot call ${operation}() after write() or close()`,
-    { code: 'LEVEL_BATCH_NOT_OPEN' }
-  )
+function batchNotOpenError(operation) {
+  return new ModuleError(`Batch is not open: cannot call ${operation}() after write() or close()`, {
+    code: 'LEVEL_BATCH_NOT_OPEN',
+  })
 }
 
 class ChainedBatch extends AbstractChainedBatch<any, any, any> {
   [key: symbol]: any
 
-  constructor (db, context) {
+  constructor(db, context) {
     super(db)
 
     this[kDbContext] = context
@@ -59,7 +58,7 @@ class ChainedBatch extends AbstractChainedBatch<any, any, any> {
     this[kCleanupResource] = null
   }
 
-  [kEnterOperation] (operation) {
+  [kEnterOperation](operation) {
     if (this[kBatchContext] === null) throw batchNotOpenError(operation)
 
     const active = this[kCloseRequested] ? 'close()' : this[kActiveOperation]
@@ -68,7 +67,7 @@ class ChainedBatch extends AbstractChainedBatch<any, any, any> {
     this[kActiveOperation] = operation
   }
 
-  [kLeaveOperation] () {
+  [kLeaveOperation]() {
     this[kActiveOperation] = null
 
     const barrier = this[kIdleBarrier]
@@ -78,7 +77,7 @@ class ChainedBatch extends AbstractChainedBatch<any, any, any> {
     }
   }
 
-  [kRunOperation] (operation, fn) {
+  [kRunOperation](operation, fn) {
     this[kEnterOperation](operation)
     try {
       return fn()
@@ -87,13 +86,15 @@ class ChainedBatch extends AbstractChainedBatch<any, any, any> {
     }
   }
 
-  [kWaitForIdle] () {
+  [kWaitForIdle]() {
     if (this[kActiveOperation] === null) return Promise.resolve()
 
     let barrier = this[kIdleBarrier]
     if (barrier === null) {
       let resolve
-      const promise = new Promise<void>(land => { resolve = land })
+      const promise = new Promise<void>((land) => {
+        resolve = land
+      })
       barrier = this[kIdleBarrier] = { promise, resolve }
     }
 
@@ -110,7 +111,7 @@ class ChainedBatch extends AbstractChainedBatch<any, any, any> {
   // RocksChainedBatch in index.d.ts.
 
   // Append an encoded put. RocksDB copies key and value before return.
-  _put (key, value, options) {
+  _put(key, value, options) {
     if (DEBUG) {
       assert(key !== null && key !== undefined, 'unsafe _put() requires a key')
       assert(value !== null && value !== undefined, 'unsafe _put() requires a value')
@@ -125,7 +126,7 @@ class ChainedBatch extends AbstractChainedBatch<any, any, any> {
 
   // Append an encoded put assembled from byte parts. RocksDB copies every part
   // before return.
-  _putParts (key, value, options) {
+  _putParts(key, value, options) {
     if (DEBUG) {
       assert(key !== null && key !== undefined, 'unsafe _putParts() requires a key')
       assert(value !== null && value !== undefined, 'unsafe _putParts() requires a value')
@@ -137,7 +138,7 @@ class ChainedBatch extends AbstractChainedBatch<any, any, any> {
   }
 
   // Append encoded log data. RocksDB copies the bytes before return.
-  _putLogData (blob) {
+  _putLogData(blob) {
     if (DEBUG) {
       assert(blob !== null && blob !== undefined, 'unsafe _putLogData() requires data')
     }
@@ -149,7 +150,7 @@ class ChainedBatch extends AbstractChainedBatch<any, any, any> {
   }
 
   // Append an encoded delete. RocksDB copies the key before return.
-  _del (key, options) {
+  _del(key, options) {
     if (DEBUG) {
       assert(key !== null && key !== undefined, 'unsafe _del() requires a key')
     }
@@ -160,16 +161,16 @@ class ChainedBatch extends AbstractChainedBatch<any, any, any> {
     })
   }
 
-  _clear () {
+  _clear() {
     return this[kRunOperation]('_clear', () => {
       binding.batch_clear(this[kBatchContext])
     })
   }
 
-  _write (options) {
+  _write(options) {
     return new Promise<void>((resolve, reject) => {
       try {
-        this[kStartWrite]('_write', options, err => {
+        this[kStartWrite]('_write', options, (err) => {
           if (err === null || err === undefined) resolve()
           else reject(err)
         })
@@ -181,20 +182,16 @@ class ChainedBatch extends AbstractChainedBatch<any, any, any> {
 
   // Submit the current native operations synchronously. This does not consume,
   // clear or close the batch, so another raw write replays the same operations.
-  _writeSync (options) {
+  _writeSync(options) {
     return this[kRunOperation]('_writeSync', () => {
-      binding.batch_write_sync(
-        this[kDbContext],
-        this[kBatchContext],
-        options ?? EMPTY
-      )
+      binding.batch_write_sync(this[kDbContext], this[kBatchContext], options ?? EMPTY)
     })
   }
 
   // Submit the current native operations without consuming, clearing or
   // closing them. The batch and database must remain open and idle until the
   // callback or promise settles.
-  _writeAsync (options, callback) {
+  _writeAsync(options, callback) {
     callback = fromCallback(callback, kPromise)
     try {
       this[kStartWrite]('_writeAsync', options, callback)
@@ -204,7 +201,7 @@ class ChainedBatch extends AbstractChainedBatch<any, any, any> {
     return callback[kPromise]
   }
 
-  [kStartWrite] (operation, options, callback) {
+  [kStartWrite](operation, options, callback) {
     this[kEnterOperation](operation)
     let completed = false
     this[kScheduleWrite](options, (err) => {
@@ -215,20 +212,15 @@ class ChainedBatch extends AbstractChainedBatch<any, any, any> {
     })
   }
 
-  [kScheduleWrite] (options, callback) {
+  [kScheduleWrite](options, callback) {
     try {
-      binding.batch_write(
-        this[kDbContext],
-        this[kBatchContext],
-        options ?? EMPTY,
-        callback
-      )
+      binding.batch_write(this[kDbContext], this[kBatchContext], options ?? EMPTY, callback)
     } catch (err) {
       process.nextTick(callback, err)
     }
   }
 
-  async _close () {
+  async _close() {
     this[kCloseRequested] = true
     await this[kWaitForIdle]()
 
@@ -242,16 +234,14 @@ class ChainedBatch extends AbstractChainedBatch<any, any, any> {
       }
     }
 
-    const error = new AggregateError(
-      errors,
-      'Batch resources could not be released cleanly',
-      { cause: errors[0] }
-    )
+    const error = new AggregateError(errors, 'Batch resources could not be released cleanly', {
+      cause: errors[0],
+    })
     this[kEnsureCleanupResource]()
     throw error
   }
 
-  [kClearNative] () {
+  [kClearNative]() {
     const context = this[kBatchContext]
     if (context !== null) {
       binding.batch_clear(context)
@@ -261,7 +251,7 @@ class ChainedBatch extends AbstractChainedBatch<any, any, any> {
     this[kReleaseCleanupResource]()
   }
 
-  [kEnsureCleanupResource] () {
+  [kEnsureCleanupResource]() {
     if (this[kCleanupResource] !== null) return
 
     const resource: any = {
@@ -269,13 +259,13 @@ class ChainedBatch extends AbstractChainedBatch<any, any, any> {
       close: async () => {
         if (!resource.active) return
         await this._close()
-      }
+      },
     }
     this[kCleanupResource] = resource
     ;(this.db as any)[kRegisterCleanupResource](resource)
   }
 
-  [kReleaseCleanupResource] () {
+  [kReleaseCleanupResource]() {
     const resource = this[kCleanupResource]
     if (resource === null) return
 
@@ -287,7 +277,7 @@ class ChainedBatch extends AbstractChainedBatch<any, any, any> {
   // Terminal raw close for a raw-managed batch. It intentionally leaves
   // AbstractLevel's private public status untouched; a native failure leaves
   // the resource attached so the caller can retry cleanup.
-  _closeSync () {
+  _closeSync() {
     const active = this[kActiveOperation]
     if (active !== null) throw batchBusyError('_closeSync', active)
     if (this[kBatchContext] === null) throw batchNotOpenError('_closeSync')
@@ -299,7 +289,7 @@ class ChainedBatch extends AbstractChainedBatch<any, any, any> {
 
   // Append an encoded RocksDB merge. RocksDB copies key and value before
   // return; merge semantics come from the configured column family operator.
-  _merge (key, value, options) {
+  _merge(key, value, options) {
     if (DEBUG) {
       assert(key !== null && key !== undefined, 'unsafe _merge() requires a key')
       assert(value !== null && value !== undefined, 'unsafe _merge() requires a value')
@@ -314,7 +304,7 @@ class ChainedBatch extends AbstractChainedBatch<any, any, any> {
 
   // Append an encoded merge assembled from byte parts. RocksDB copies every
   // part before return.
-  _mergeParts (key, value, options) {
+  _mergeParts(key, value, options) {
     if (DEBUG) {
       assert(key !== null && key !== undefined, 'unsafe _mergeParts() requires a key')
       assert(value !== null && value !== undefined, 'unsafe _mergeParts() requires a value')
@@ -325,18 +315,18 @@ class ChainedBatch extends AbstractChainedBatch<any, any, any> {
     })
   }
 
-  * [Symbol.iterator] () {
+  *[Symbol.iterator]() {
     const rows = this.toArray()
     for (let n = 0; n < rows.length; n += 4) {
       yield {
         type: rows[n + 0],
         key: rows[n + 1],
-        value: rows[n + 2]
+        value: rows[n + 2],
       }
     }
   }
 
-  toArray (options?) {
+  toArray(options?) {
     if (this[kBatchContext] === null) return []
 
     return this[kRunOperation]('toArray', () => {
@@ -344,7 +334,7 @@ class ChainedBatch extends AbstractChainedBatch<any, any, any> {
         keys: true,
         values: true,
         data: true,
-        ...options
+        ...options,
       })
     })
   }
