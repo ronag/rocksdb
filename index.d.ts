@@ -323,10 +323,13 @@ export type RocksDefaultIteratorPackedMode<
     ? RocksDefaultPackedMode<KEncoding>
     : [KEncoding | VEncoding] extends ['buffer' | 'slice'] ? 'auto' : false
 
-export type RocksPackedReadCallback<T> = (
+export type RocksPackedReadCallback<
+  T,
+  Packed extends RocksPackedReadMode = RocksPackedReadMode
+> = (
   err: Error | undefined | null,
   result?: T,
-  packed?: boolean
+  packed?: RocksSelectedPacked<Packed>
 ) => void
 
 export interface RocksRawGetManyOptions<
@@ -338,6 +341,21 @@ export interface RocksRawGetManyOptions<
     : E & ('buffer' | RocksJavaScriptEncoding)
   packed?: Packed
 }
+
+export type RocksRawUnboundedGetManyOptions<
+  E extends RocksRawEncoding = RocksRawEncoding,
+  Packed extends RocksPackedReadMode = RocksDefaultPackedMode<E>
+> = RocksRawGetManyOptions<E, Packed> & {
+  highWaterMarkBytes?: never
+  timeout?: never
+}
+
+export type RocksRawBoundedGetManyOptions<
+  E extends RocksRawEncoding = RocksRawEncoding,
+  Packed extends RocksPackedReadMode = RocksDefaultPackedMode<E>
+> = RocksRawGetManyOptions<E, Packed> & (
+  { highWaterMarkBytes: number } | { timeout: number }
+)
 
 export type RocksRows<
   K,
@@ -397,8 +415,11 @@ export interface RocksPackedGetManyResult {
 
 export type RocksRawGetManyResult<
   E extends RocksRawEncoding,
-  Packed extends boolean = false
-> = Array<RocksRawDecoded<E> | null | undefined> & { readonly packed: Packed }
+  Packed extends boolean = false,
+  AllowPartial extends boolean = true
+> = Array<RocksRawDecoded<E> | (AllowPartial extends true ? null : never) | undefined> & {
+  readonly packed: Packed
+}
 
 export interface RocksRawIteratorReadOptions<Packed extends RocksPackedReadMode = false> {
   timeout?: number
@@ -437,14 +458,15 @@ export type RocksIteratorReadResult<
 
 export type RocksGetManyReadResult<
   E extends RocksRawEncoding,
-  Packed extends RocksPackedReadMode
+  Packed extends RocksPackedReadMode,
+  AllowPartial extends boolean = true
 > = E extends RocksJavaScriptEncoding
-  ? RocksRawGetManyResult<E, RocksSelectedPacked<Packed>>
+  ? RocksRawGetManyResult<E, RocksSelectedPacked<Packed>, AllowPartial>
   : Packed extends true
     ? RocksPackedGetManyResult
     : Packed extends 'auto'
-      ? RocksPackedGetManyResult | RocksRawGetManyResult<E>
-      : RocksRawGetManyResult<E>
+      ? RocksPackedGetManyResult | RocksRawGetManyResult<E, false, AllowPartial>
+      : RocksRawGetManyResult<E, false, AllowPartial>
 
 /**
  * Supported unsafe iterator extensions. The caller must keep the database and
@@ -816,12 +838,54 @@ export class RocksLevel<KDefault = string, VDefault = string>
     Packed extends RocksPackedReadMode = RocksDefaultPackedMode<E>
   > (
     keys: readonly RocksSlice[],
-    options?: RocksRawGetManyOptions<E, Packed>
+    options: RocksRawBoundedGetManyOptions<E, Packed>
+  ): Promise<RocksGetManyReadResult<E, Packed>>
+  _getManyAsync<
+    E extends RocksRawEncoding = 'buffer',
+    Packed extends RocksPackedReadMode = RocksDefaultPackedMode<E>
+  > (
+    keys: readonly RocksSlice[],
+    options?: RocksRawUnboundedGetManyOptions<E, Packed>
+  ): Promise<RocksGetManyReadResult<E, Packed, false>>
+  _getManyAsync<
+    E extends RocksRawEncoding = 'buffer',
+    Packed extends RocksPackedReadMode = RocksDefaultPackedMode<E>
+  > (
+    keys: readonly RocksSlice[],
+    options: RocksRawGetManyOptions<E, Packed> | undefined
   ): Promise<RocksGetManyReadResult<E, Packed>>
   /**
    * Promise overload with explicit incomplete-result handling; all other
    * invariants apply.
    */
+  _getManyAsync<
+    E extends RocksRawEncoding = 'buffer',
+    Packed extends RocksPackedReadMode = RocksDefaultPackedMode<E>
+  > (
+    keys: readonly RocksSlice[],
+    options: RocksRawBoundedGetManyOptions<E, Packed>,
+    callback: undefined,
+    allowPartial?: undefined
+  ): Promise<RocksGetManyReadResult<E, Packed>>
+  _getManyAsync<
+    E extends RocksRawEncoding = 'buffer',
+    Packed extends RocksPackedReadMode = RocksDefaultPackedMode<E>
+  > (
+    keys: readonly RocksSlice[],
+    options: RocksRawUnboundedGetManyOptions<E, Packed> | undefined,
+    callback: undefined,
+    allowPartial?: undefined
+  ): Promise<RocksGetManyReadResult<E, Packed, false>>
+  _getManyAsync<
+    E extends RocksRawEncoding = 'buffer',
+    Packed extends RocksPackedReadMode = RocksDefaultPackedMode<E>,
+    AllowPartial extends boolean = boolean
+  > (
+    keys: readonly RocksSlice[],
+    options: RocksRawGetManyOptions<E, Packed> | undefined,
+    callback: undefined,
+    allowPartial: AllowPartial
+  ): Promise<RocksGetManyReadResult<E, Packed, AllowPartial>>
   _getManyAsync<
     E extends RocksRawEncoding = 'buffer',
     Packed extends RocksPackedReadMode = RocksDefaultPackedMode<E>
@@ -837,8 +901,39 @@ export class RocksLevel<KDefault = string, VDefault = string>
     Packed extends RocksPackedReadMode = RocksDefaultPackedMode<E>
   > (
     keys: readonly RocksSlice[],
+    options: RocksRawBoundedGetManyOptions<E, Packed>,
+    callback: RocksPackedReadCallback<RocksGetManyReadResult<E, Packed>, Packed>,
+    allowPartial?: undefined
+  ): void
+  _getManyAsync<
+    E extends RocksRawEncoding = 'buffer',
+    Packed extends RocksPackedReadMode = RocksDefaultPackedMode<E>
+  > (
+    keys: readonly RocksSlice[],
+    options: RocksRawUnboundedGetManyOptions<E, Packed> | undefined,
+    callback: RocksPackedReadCallback<RocksGetManyReadResult<E, Packed, false>, Packed>,
+    allowPartial?: undefined
+  ): void
+  _getManyAsync<
+    E extends RocksRawEncoding = 'buffer',
+    Packed extends RocksPackedReadMode = RocksDefaultPackedMode<E>,
+    AllowPartial extends boolean = boolean
+  > (
+    keys: readonly RocksSlice[],
     options: RocksRawGetManyOptions<E, Packed> | undefined,
-    callback: RocksPackedReadCallback<RocksGetManyReadResult<E, Packed>>,
+    callback: RocksPackedReadCallback<
+      RocksGetManyReadResult<E, Packed, AllowPartial>,
+      Packed
+    >,
+    allowPartial: AllowPartial
+  ): void
+  _getManyAsync<
+    E extends RocksRawEncoding = 'buffer',
+    Packed extends RocksPackedReadMode = RocksDefaultPackedMode<E>
+  > (
+    keys: readonly RocksSlice[],
+    options: RocksRawGetManyOptions<E, Packed> | undefined,
+    callback: RocksPackedReadCallback<RocksGetManyReadResult<E, Packed>, Packed>,
     allowPartial?: boolean
   ): void
   /**
