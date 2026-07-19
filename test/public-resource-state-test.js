@@ -1,70 +1,271 @@
 'use strict'
 
 const test = require('tape')
-const { spawnSync } = require('node:child_process')
-const path = require('node:path')
-const testCommon = require('./common')
 const binding = require('../binding')
+const testCommon = require('./common')
 
 const hasCode = (code) => (err) => err && err.code === code
+const tick = () => new Promise(resolve => setImmediate(resolve))
 
-function childMessage (result, success) {
-  if (result.status === 0) return success
+async function rejection (promise) {
+  try {
+    await promise
+  } catch (err) {
+    return err
+  }
 
-  return [
-    result.error && (result.error.stack || result.error.message),
-    result.stderr,
-    result.stdout,
-    `status=${result.status} signal=${result.signal}`
-  ].filter(Boolean).join('\n')
+  return null
 }
 
-test('close lets an accepted public all operation finish', async function (t) {
+test('inherited iterator close waits for accepted native reads', async function (t) {
   const db = testCommon.factory({ keyEncoding: 'utf8', valueEncoding: 'utf8' })
   await db.open()
-  await db.batch(Array.from({ length: 1500 }, (_, index) => ({
-    type: 'put',
-    key: String(index).padStart(4, '0'),
-    value: String(index)
-  })))
+  await db.put('a', '1')
+
+  const cases = [
+    {
+      name: 'next',
+      read: iterator => iterator.next(),
+      expected: ['a', '1']
+    },
+    {
+      name: 'nextv',
+      read: iterator => iterator.nextv(1),
+      expected: [['a', '1']]
+    },
+    {
+      name: 'all',
+      read: iterator => iterator.all(),
+      expected: [['a', '1']]
+    }
+  ]
+
+  for (const entry of cases) {
+    const iterator = db.iterator()
+    const originalInitNextv = binding.iterator_init_nextv
+    const originalClose = binding.iterator_close_sync
+    let completeRead
+    let closeCalls = 0
+
+    binding.iterator_init_nextv = function (...args) {
+      completeRead = args.at(-1)
+    }
+    binding.iterator_close_sync = function (...args) {
+      closeCalls++
+      return originalClose(...args)
+    }
+
+    try {
+      const reading = entry.read(iterator)
+      t.equal(typeof completeRead, 'function', `${entry.name}: private native read started`)
+
+      let closeSettled = false
+      const closing = iterator.close().then(() => { closeSettled = true })
+      await tick()
+
+      t.equal(closeSettled, false, `${entry.name}: inherited close waits for the read`)
+      t.equal(closeCalls, 0, `${entry.name}: native state stays open while the read is pending`)
+
+      completeRead(null, {
+        rows: ['a', '1'],
+        finished: true,
+        limited: false
+      })
+
+      t.deepEqual(await reading, entry.expected, `${entry.name}: accepted read completes`)
+      await closing
+      t.equal(closeCalls, 1, `${entry.name}: native state closes exactly once afterward`)
+    } finally {
+      binding.iterator_init_nextv = originalInitNextv
+      binding.iterator_close_sync = originalClose
+      await iterator.close()
+    }
+  }
+
+  await db.close()
+  t.end()
+})
+
+test('inherited iterator admission rejects overlapping reads before native entry', async function (t) {
+  const db = testCommon.factory({ keyEncoding: 'utf8', valueEncoding: 'utf8' })
+  await db.open()
+  await db.put('a', '1')
 
   const iterator = db.iterator()
-  const reading = iterator.all()
-  const closing = iterator.close()
-  const rows = await reading
+  const originalInitNextv = binding.iterator_init_nextv
+  let completeRead
+  let nativeReads = 0
 
-  t.equal(rows.length, 1500, 'the operation continues across multiple native reads')
-  await closing
-  await db.close()
+  binding.iterator_init_nextv = function (...args) {
+    nativeReads++
+    completeRead = args.at(-1)
+  }
+
+  try {
+    const first = iterator.next()
+    const overlap = await rejection(iterator.nextv(1))
+
+    t.equal(overlap && overlap.code, 'LEVEL_ITERATOR_BUSY', 'abstract-level owns busy admission')
+    t.equal(nativeReads, 1, 'rejected read does not reach native code')
+
+    completeRead(null, {
+      rows: ['a', '1'],
+      finished: true,
+      limited: false
+    })
+    t.deepEqual(await first, ['a', '1'], 'accepted read remains intact')
+  } finally {
+    binding.iterator_init_nextv = originalInitNextv
+    await iterator.close()
+    await db.close()
+  }
+
   t.end()
 })
 
-test('close waits for accepted public next and nextv operations', async function (t) {
+test('retryable empty native pages do not silently end inherited iterators', async function (t) {
   const db = testCommon.factory({ keyEncoding: 'utf8', valueEncoding: 'utf8' })
   await db.open()
-  await db.batch([
-    { type: 'put', key: 'a', value: '1' },
-    { type: 'put', key: 'b', value: '2' }
-  ])
+  await db.put('a', '1')
 
-  const next = db.iterator()
-  const nextReading = next.next()
-  const nextClosing = next.close()
-  t.deepEqual(await nextReading, ['a', '1'], 'next finishes after close is requested')
-  await nextClosing
+  const cases = [
+    { name: 'entry', create: () => db.iterator(), rows: ['a', '1'], expected: [['a', '1']] },
+    { name: 'key', create: () => db.keys(), rows: ['a', undefined], expected: ['a'] },
+    { name: 'value', create: () => db.values(), rows: [undefined, '1'], expected: ['1'] }
+  ]
 
-  const nextv = db.iterator()
-  const nextvReading = nextv.nextv(2)
-  const nextvClosing = nextv.close()
-  t.deepEqual(await nextvReading, [['a', '1'], ['b', '2']],
-    'nextv finishes after close is requested')
-  await nextvClosing
+  for (const entry of cases) {
+    const iterator = entry.create()
+    const originalInitNextv = binding.iterator_init_nextv
+    const originalNextv = binding.iterator_nextv
+    let initCalls = 0
+    let nextCalls = 0
+
+    binding.iterator_init_nextv = function (...args) {
+      initCalls++
+      process.nextTick(args.at(-1), null, {
+        rows: [],
+        finished: false,
+        limited: false
+      })
+    }
+    binding.iterator_nextv = function (...args) {
+      nextCalls++
+      process.nextTick(args.at(-1), null, {
+        rows: entry.rows,
+        finished: true,
+        limited: false
+      })
+    }
+
+    try {
+      const err = await rejection(iterator.nextv(1, { timeout: 1 }))
+      t.equal(err && err.code, 'LEVEL_ABORTED',
+        `${entry.name}: retryable timeout page rejects instead of signaling exhaustion`)
+      t.equal(initCalls, 1, `${entry.name}: first read used fused initialization`)
+      t.deepEqual(await iterator.nextv(1), entry.expected,
+        `${entry.name}: a later public read can continue`)
+      t.equal(nextCalls, 1, `${entry.name}: retry reached the initialized native iterator`)
+    } finally {
+      binding.iterator_init_nextv = originalInitNextv
+      binding.iterator_nextv = originalNextv
+      await iterator.close()
+    }
+  }
 
   await db.close()
   t.end()
 })
 
-test('public write ownership survives sublevels and deferred auto-open', async function (t) {
+test('inherited all rejects rather than returning a truncated timeout prefix', async function (t) {
+  const db = testCommon.factory({ keyEncoding: 'utf8', valueEncoding: 'utf8' })
+  await db.open()
+  const iterator = db.iterator()
+  const originalInitNextv = binding.iterator_init_nextv
+  const originalNextv = binding.iterator_nextv
+  const originalClose = binding.iterator_close_sync
+  let closeCalls = 0
+
+  binding.iterator_init_nextv = function (...args) {
+    process.nextTick(args.at(-1), null, {
+      rows: ['prefix', 'value'],
+      finished: false,
+      limited: false
+    })
+  }
+  binding.iterator_nextv = function (...args) {
+    process.nextTick(args.at(-1), null, {
+      rows: [],
+      finished: false,
+      limited: false
+    })
+  }
+  binding.iterator_close_sync = function (...args) {
+    closeCalls++
+    return originalClose(...args)
+  }
+
+  try {
+    const err = await rejection(iterator.all({ timeout: 1 }))
+    t.equal(err && err.code, 'LEVEL_ABORTED', 'all reports its incomplete native page')
+    t.equal(closeCalls, 1, 'failed all still closes the inherited iterator')
+    t.equal(Number(db.getProperty('rocksdb.num-snapshots')), 0,
+      'failed all releases its native snapshot')
+  } finally {
+    binding.iterator_init_nextv = originalInitNextv
+    binding.iterator_nextv = originalNextv
+    binding.iterator_close_sync = originalClose
+    await iterator.close()
+    await db.close()
+  }
+
+  t.end()
+})
+
+test('inherited chained batch write and close wait for the native private hook', async function (t) {
+  const db = testCommon.factory()
+  await db.open()
+
+  const batch = db.batch().put('key', 'value')
+  const originalWrite = binding.batch_write
+  const originalClear = binding.batch_clear
+  let completeWrite
+  let clearCalls = 0
+
+  binding.batch_write = function (...args) {
+    completeWrite = args.at(-1)
+  }
+  binding.batch_clear = function (...args) {
+    clearCalls++
+    return originalClear(...args)
+  }
+
+  try {
+    let writeSettled = false
+    let closeSettled = false
+    const writing = batch.write().then(() => { writeSettled = true })
+    const closing = batch.close().then(() => { closeSettled = true })
+
+    t.equal(typeof completeWrite, 'function', 'inherited write entered the private native hook')
+    await tick()
+    t.equal(writeSettled, false, 'write remains pending on native completion')
+    t.equal(closeSettled, false, 'concurrent close shares the pending write cleanup')
+    t.equal(clearCalls, 0, 'native batch is not cleared during the write')
+
+    completeWrite(null)
+    await Promise.all([writing, closing])
+    t.equal(clearCalls, 1, 'native batch is cleared exactly once after completion')
+  } finally {
+    binding.batch_write = originalWrite
+    binding.batch_clear = originalClear
+    await batch.close()
+    await db.close()
+  }
+
+  t.end()
+})
+
+test('public database writes retain close ownership through inherited methods', async function (t) {
   const operations = {
     put: db => db.put('key', 'value'),
     del: db => db.del('key'),
@@ -98,8 +299,8 @@ test('public write ownership survives sublevels and deferred auto-open', async f
 
         let closeSettled = false
         const closing = db.close().then(() => { closeSettled = true })
-        await new Promise(resolve => setImmediate(resolve))
-        t.equal(closeSettled, false, `${route} ${name} owns close until completion`)
+        await tick()
+        t.equal(closeSettled, false, `${route} ${name}: database waits for native completion`)
 
         complete(null)
         await writing
@@ -114,518 +315,68 @@ test('public write ownership survives sublevels and deferred auto-open', async f
   t.end()
 })
 
-test('public iterator busy admission stays outside raw hooks', async function (t) {
+test('inherited iterator seek observes abstract-level busy admission', async function (t) {
   const db = testCommon.factory({ keyEncoding: 'utf8', valueEncoding: 'utf8' })
   await db.open()
   await db.put('a', '1')
 
   const operations = [
-    ['next', (iterator) => iterator.next()],
-    ['nextv', (iterator) => iterator.nextv(1)],
-    ['all', (iterator) => iterator.all()]
+    ['next', iterator => iterator.next(), ['a', '1']],
+    ['nextv', iterator => iterator.nextv(1), [['a', '1']]],
+    ['all', iterator => iterator.all(), [['a', '1']]]
   ]
 
-  for (const [name, operation] of operations) {
+  for (const [name, operation, expected] of operations) {
     const iterator = db.iterator()
     let nested
-    iterator.seek('a', {
-      keyEncoding: {
-        name: `nested-${name}`,
-        format: 'buffer',
-        encode (value) {
-          nested = operation(iterator)
-          return Buffer.from(value)
-        },
-        decode: value => value.toString()
-      }
-    })
-    const err = await nested.then(() => null, err => err)
-    t.equal(err && err.code, 'LEVEL_ITERATOR_BUSY', `${name} reports public busy state`)
+    t.throws(
+      () => iterator.seek('a', {
+        keyEncoding: {
+          name: `nested-${name}`,
+          format: 'buffer',
+          encode (value) {
+            nested = operation(iterator)
+            return Buffer.from(value)
+          },
+          decode: value => value.toString()
+        }
+      }),
+      hasCode('LEVEL_ITERATOR_BUSY'),
+      `${name}: outer seek reports the nested read`
+    )
+
+    t.deepEqual(
+      await nested,
+      expected,
+      `${name}: the read admitted by the encoding hook completes safely`
+    )
     await iterator.close()
   }
-
-  const invalid = db.iterator()
-  let invalidSize
-  invalid.seek('a', {
-    keyEncoding: {
-      name: 'nested-invalid-nextv',
-      format: 'buffer',
-      encode (value) {
-        invalidSize = invalid.nextv('invalid')
-        return Buffer.from(value)
-      },
-      decode: value => value.toString()
-    }
-  })
-  const invalidError = await invalidSize.then(() => null, err => err)
-  t.ok(invalidError instanceof TypeError, 'nextv validates size before reporting busy state')
-  await invalid.close()
 
   await db.close()
   t.end()
 })
 
-test('public batch reads avoid the native mutex during write', async function (t) {
+test('inherited batch length tracks public operations only', async function (t) {
   const db = testCommon.factory()
   await db.open()
+  const batch = db.batch()
 
-  const originalWrite = binding.batch_write
-  const originalCount = binding.batch_count
-  const originalIterate = binding.batch_iterate
-  const batches = []
-  let nativeCounts = 0
-  let nativeIterations = 0
-  let complete
+  batch.put('put', 'value')
+  batch.del('delete')
+  t.equal(batch.length, 2, 'public puts and deletes update abstract-level length')
 
-  binding.batch_write = function (...args) {
-    complete = args.at(-1)
-  }
-  binding.batch_count = function () {
-    nativeCounts++
-    throw new Error('length reached the native batch mutex')
-  }
-  binding.batch_iterate = function () {
-    nativeIterations++
-    throw new Error('toArray reached the native batch mutex')
-  }
+  batch._putParts([Buffer.from('put-')], [Buffer.from('parts')])
+  batch._putLogData('metadata')
+  batch._merge('merge', 'value')
+  batch._mergeParts([Buffer.from('merge-')], [Buffer.from('parts')])
+  t.equal(batch.length, 2, 'unsafe native extensions do not mutate abstract-level private state')
 
-  try {
-    const batch = db.batch()
-    batches.push(batch)
-    batch.put('first', 'value')
-    batch.del('second')
+  batch.clear()
+  t.equal(batch.length, 0, 'public clear resets inherited length and native state')
 
-    const writing = batch.write()
-
-    t.equal(typeof complete, 'function', 'write entered native code')
-    t.equal(batch.length, 2, 'length uses the exact cached count while busy')
-    t.equal(nativeCounts, 0, 'length does not enter native code')
-    t.throws(
-      () => batch.toArray(),
-      hasCode('LEVEL_BATCH_BUSY'),
-      'toArray fails fast instead of waiting for the native write mutex'
-    )
-    t.equal(nativeIterations, 0, 'busy toArray does not enter native code')
-
-    const acceptedComplete = complete
-    const secondWriteError = await batch.write().then(() => null, err => err)
-    t.equal(secondWriteError && secondWriteError.code, 'LEVEL_BATCH_NOT_OPEN',
-      'concurrent write is rejected by the public state machine')
-    t.equal(complete, acceptedComplete, 'rejected write did not enter native code')
-    t.throws(
-      () => batch.toArray(),
-      hasCode('LEVEL_BATCH_BUSY'),
-      'rejected write does not clear the accepted write marker'
-    )
-    t.equal(nativeIterations, 0, 'marker race does not enter native code')
-
-    let closeSettled = false
-    const closing = batch.close().then(() => { closeSettled = true })
-    await new Promise(resolve => setImmediate(resolve))
-    t.equal(closeSettled, false, 'close waits for the public write')
-
-    complete(null)
-    await writing
-    await closing
-
-    t.equal(nativeCounts, 0, 'close preserves the cached count')
-    t.equal(batch.length, 2, 'final cached count remains readable after close')
-  } finally {
-    binding.batch_write = originalWrite
-    binding.batch_count = originalCount
-    binding.batch_iterate = originalIterate
-    await Promise.all(batches.map(batch => batch.close()))
-    await db.close()
-  }
-
-  t.end()
-})
-
-test('production chained batch rejects reentrant public admission', function (t) {
-  const script = String.raw`
-    const assert = require('node:assert/strict')
-    const testCommon = require('./test/common')
-
-    ;(async () => {
-      const db = testCommon.factory({ keyEncoding: 'utf8', valueEncoding: 'utf8' })
-      await db.open()
-
-      const batch = db.batch().put('before', '1')
-      const nestedErrors = {}
-      let nestedWrite
-      let entered = false
-      const options = {}
-      Object.defineProperty(options, 'column', {
-        enumerable: true,
-        get () {
-          if (!entered) {
-            entered = true
-            nestedWrite = batch.write()
-            for (const [name, operation] of [
-              ['put', () => batch.put('nested', 'value')],
-              ['clear', () => batch.clear()],
-              ['toArray', () => batch.toArray()]
-            ]) {
-              try {
-                operation()
-              } catch (err) {
-                nestedErrors[name] = err
-              }
-            }
-          }
-          return undefined
-        }
-      })
-
-      assert.equal(batch.put('during', '2', options), batch)
-      assert.equal((await nestedWrite.then(() => null, err => err)).code, 'LEVEL_BATCH_BUSY')
-      for (const name of ['put', 'clear', 'toArray']) {
-        assert.equal(nestedErrors[name]?.code, 'LEVEL_BATCH_BUSY', name)
-      }
-
-      await batch.write()
-      assert.equal(await db.get('before'), '1')
-      assert.equal(await db.get('during'), '2')
-      assert.equal(await db.get('nested'), undefined)
-
-      const closingBatch = db.batch().put('closing', 'value')
-      let closing
-      const rows = closingBatch.toArray({
-        get keys () {
-          closing = closingBatch.close()
-          return true
-        }
-      })
-      assert.equal(rows.length, 4)
-      await closing
-
-      await db.close()
-    })().catch(err => {
-      console.error(err)
-      process.exitCode = 1
-    })
-  `
-
-  const result = spawnSync(process.execPath, ['-e', script], {
-    cwd: path.join(__dirname, '..'),
-    encoding: 'utf8',
-    env: { ...process.env, NODE_ENV: 'production' },
-    timeout: 60_000
-  })
-
-  t.equal(result.status, 0, childMessage(result, 'production admission child passed'))
-  t.end()
-})
-
-test('production raw methods do not claim admission or close ownership', function (t) {
-  const script = String.raw`
-    const assert = require('node:assert/strict')
-    const testCommon = require('./test/common')
-    const binding = require('./binding')
-
-    const tick = () => new Promise(resolve => setImmediate(resolve))
-
-    ;(async () => {
-      const db = testCommon.factory()
-      await db.open()
-      await db.put('key', 'value')
-
-      const originalDbClose = binding.db_close
-      const originalGetMany = binding.db_get_many
-      const originalGetManySync = binding.db_get_many_sync
-      const originalClear = binding.db_clear
-      const originalBatchWrite = binding.batch_write
-      let rawDbCloses = 0
-
-      binding.db_close = function (context, callback) {
-        rawDbCloses++
-        callback()
-      }
-
-      try {
-        const reentrantWrites = []
-        binding.batch_write = function (...args) {
-          reentrantWrites.push(args.at(-1))
-        }
-        let nestedWrite
-        let nestedStarted = false
-        const publicWrite = db.put('public', 'value', {
-          get column () {
-            if (!nestedStarted) {
-              nestedStarted = true
-              nestedWrite = db._put(Buffer.from('raw'), Buffer.from('value'), {})
-            }
-            return undefined
-          }
-        })
-        assert.equal(reentrantWrites.length, 2, 'reentrant raw and public hooks both schedule')
-        reentrantWrites[1](null)
-        await publicWrite
-        db._close(() => {})
-        assert.equal(rawDbCloses, 1, 'reentrant raw _put must not inherit public ownership')
-        reentrantWrites[0](null)
-        await nestedWrite
-        rawDbCloses = 0
-
-        const reads = []
-        binding.db_get_many = function (...args) {
-          reads.push(args.at(-1))
-        }
-        binding.db_get_many_sync = function () {
-          return [Buffer.from('value')]
-        }
-
-        const reading = [
-          db._getManyAsync([Buffer.from('key')], { packed: false }, undefined, false, false),
-          db._getManyAsync([Buffer.from('key')], { packed: false }, undefined, false, false),
-          db._getMany([Buffer.from('key')], { packed: false }),
-          db._get(Buffer.from('key'), { packed: false }),
-          db.get('key', { valueEncoding: 'buffer' })
-        ]
-        assert.equal(reads.length, 5, 'overlapping raw and public reads must all reach native code')
-        assert.deepEqual(
-          db._getManySync([Buffer.from('key')], { packed: false }),
-          [Buffer.from('value')],
-          'raw sync read must run while raw async reads are pending'
-        )
-
-        let rawCloseSettled = false
-        db._close(() => { rawCloseSettled = true })
-        assert.equal(rawDbCloses, 1, 'raw close must bypass public database ownership')
-        assert.equal(rawCloseSettled, true, 'raw close must not wait for public or raw reads')
-
-        for (const complete of reads) complete(null, [Buffer.from('value')])
-        await Promise.all(reading)
-
-        let clearComplete
-        binding.db_clear = function (...args) {
-          clearComplete = args.at(-1)
-        }
-        const clearing = db._clear({})
-        db._close(() => {})
-        assert.equal(rawDbCloses, 2, 'raw clear must not lease the database')
-        clearComplete(null)
-        await clearing
-
-        const writes = []
-        binding.batch_write = function (...args) {
-          writes.push(args.at(-1))
-        }
-        const writing = [
-          db._batch([{ type: 'put', key: Buffer.from('a'), value: Buffer.from('1') }], {}),
-          db._put(Buffer.from('b'), Buffer.from('2'), {}),
-          db._del(Buffer.from('c'), {})
-        ]
-        assert.equal(writes.length, 3, 'raw write hooks must all reach native code')
-        db._close(() => {})
-        assert.equal(rawDbCloses, 3, 'raw array writes must not lease the database')
-        for (const complete of writes) complete(null)
-        await Promise.all(writing)
-      } finally {
-        binding.db_get_many = originalGetMany
-        binding.db_get_many_sync = originalGetManySync
-        binding.db_clear = originalClear
-        binding.batch_write = originalBatchWrite
-      }
-
-      const iterator = db.iterator()
-      await iterator._seekAsync(Buffer.from('key'))
-      const originalIteratorNextv = binding.iterator_nextv
-      const originalIteratorNextvSync = binding.iterator_nextv_sync
-      const originalIteratorSeek = binding.iterator_seek
-      const originalIteratorSeekSync = binding.iterator_seek_sync
-      const originalIteratorRefreshSync = binding.iterator_refresh_sync
-      const nextvCallbacks = []
-      const seekCallbacks = []
-      let syncReads = 0
-      let syncSeeks = 0
-      let syncRefreshes = 0
-
-      binding.iterator_nextv = function (...args) {
-        nextvCallbacks.push(args.at(-1))
-      }
-      binding.iterator_nextv_sync = function () {
-        syncReads++
-        return { rows: [], finished: false, limited: false }
-      }
-      binding.iterator_seek = function (...args) {
-        seekCallbacks.push(args.at(-1))
-      }
-      binding.iterator_seek_sync = function () {
-        syncSeeks++
-      }
-      binding.iterator_refresh_sync = function () {
-        syncRefreshes++
-      }
-
-      try {
-        const reading = iterator._nextvAsync(1, { packed: false })
-        const seeking = iterator._seekAsync(Buffer.from('key'))
-        iterator._nextvSync(1, { packed: false })
-        iterator._seek(Buffer.from('key'))
-        iterator._refreshSync()
-        const next = new Promise((resolve, reject) => {
-          iterator._next((err, key, value) => err ? reject(err) : resolve([key, value]))
-        })
-        const nextv = iterator._nextv(1, { packed: false })
-
-        assert.equal(seekCallbacks.length, 1, 'raw async seek overlaps raw nextv')
-        assert.equal(syncReads, 1, 'raw sync nextv overlaps raw async operations')
-        assert.equal(syncSeeks, 1, 'raw seek hook overlaps raw async operations')
-        assert.equal(syncRefreshes, 1, 'raw refresh overlaps raw async operations')
-        assert.equal(nextvCallbacks.length, 3, 'raw next hooks overlap raw async operations')
-
-        seekCallbacks[0](null)
-        for (const complete of nextvCallbacks) {
-          complete(null, { rows: [], finished: true, limited: false })
-        }
-        await Promise.all([reading, seeking, next, nextv])
-      } finally {
-        binding.iterator_nextv = originalIteratorNextv
-        binding.iterator_nextv_sync = originalIteratorNextvSync
-        binding.iterator_seek = originalIteratorSeek
-        binding.iterator_seek_sync = originalIteratorSeekSync
-        binding.iterator_refresh_sync = originalIteratorRefreshSync
-        await iterator.close()
-      }
-
-      const reentrantIterator = db.iterator()
-      const originalReentrantIteratorClose = binding.iterator_close_sync
-      let reentrantIteratorCloses = 0
-      let rawIteratorClose
-      binding.iterator_close_sync = function (...args) {
-        reentrantIteratorCloses++
-        return originalReentrantIteratorClose(...args)
-      }
-      try {
-        let seekError
-        try {
-          reentrantIterator.seek('key', {
-            keyEncoding: {
-              name: 'raw-close-reentry',
-              format: 'buffer',
-              encode (value) {
-                rawIteratorClose = reentrantIterator._close()
-                assert.equal(reentrantIteratorCloses, 1,
-                  'raw iterator close must bypass public seek ownership')
-                return Buffer.from(value)
-              },
-              decode (value) { return value.toString() }
-            }
-          })
-        } catch (err) {
-          seekError = err
-        }
-        assert(seekError, 'the public seek observes the terminal raw close')
-        await rawIteratorClose
-      } finally {
-        binding.iterator_close_sync = originalReentrantIteratorClose
-        if (!rawIteratorClose) await reentrantIterator.close()
-      }
-
-      const ownedIterator = db.iterator()
-      await ownedIterator._seekAsync(Buffer.from('key'))
-      const originalOwnedNextv = binding.iterator_nextv
-      let ownedNextvComplete
-      binding.iterator_nextv = function (...args) {
-        ownedNextvComplete = args.at(-1)
-      }
-      try {
-        const reading = ownedIterator._nextvAsync(1, { packed: false })
-        let closeSettled = false
-        ownedIterator._close(() => { closeSettled = true })
-        await tick()
-        assert.equal(closeSettled, true, 'raw iterator close must not wait for raw nextv')
-        ownedNextvComplete(null, { rows: [], finished: true, limited: false })
-        await reading
-      } finally {
-        binding.iterator_nextv = originalOwnedNextv
-      }
-
-      const reentrantBatch = db._chainedBatch()
-      reentrantBatch._put('key', 'value')
-      const originalReentrantBatchClear = binding.batch_clear
-      const originalReentrantBatchIterate = binding.batch_iterate
-      let reentrantBatchClears = 0
-      let rawBatchClose
-      binding.batch_clear = function (...args) {
-        reentrantBatchClears++
-        return originalReentrantBatchClear(...args)
-      }
-      binding.batch_iterate = function () { return [] }
-      try {
-        assert.deepEqual(reentrantBatch.toArray({
-          get keys () {
-            rawBatchClose = reentrantBatch._close()
-            assert.equal(reentrantBatchClears, 1,
-              'raw batch close must bypass public toArray ownership')
-            return true
-          }
-        }), [])
-        await rawBatchClose
-      } finally {
-        binding.batch_clear = originalReentrantBatchClear
-        binding.batch_iterate = originalReentrantBatchIterate
-        if (!rawBatchClose) await reentrantBatch.close()
-      }
-
-      const batch = db.batch()
-      batch._put('key', 'value')
-      const originalRawBatchWrite = binding.batch_write
-      const originalBatchWriteSync = binding.batch_write_sync
-      const originalBatchIterate = binding.batch_iterate
-      const rawWriteCallbacks = []
-      let syncWrites = 0
-      let iterations = 0
-
-      binding.batch_write = function (...args) {
-        rawWriteCallbacks.push(args.at(-1))
-      }
-      binding.batch_write_sync = function () {
-        syncWrites++
-      }
-      binding.batch_iterate = function () {
-        iterations++
-        return []
-      }
-
-      try {
-        const callbackWrite = new Promise((resolve, reject) => {
-          batch._write({}, err => err ? reject(err) : resolve())
-        })
-        const asyncWrite = batch._writeAsync({})
-        batch._writeSync({})
-        assert.equal(rawWriteCallbacks.length, 2, 'raw async writes overlap')
-        assert.equal(syncWrites, 1, 'raw sync write overlaps raw async writes')
-        assert.deepEqual(batch.toArray(), [], 'raw writes leave public admission unclaimed')
-        assert.equal(iterations, 1, 'toArray reaches native code during raw writes')
-
-        db._close(() => {})
-        assert.equal(rawDbCloses, 4, 'raw chained writes must not lease the database')
-        for (const complete of rawWriteCallbacks) complete(null)
-        await Promise.all([callbackWrite, asyncWrite])
-      } finally {
-        binding.batch_write = originalRawBatchWrite
-        binding.batch_write_sync = originalBatchWriteSync
-        binding.batch_iterate = originalBatchIterate
-        binding.db_close = originalDbClose
-        await batch.close()
-        await db.close()
-      }
-    })().catch(err => {
-      console.error(err)
-      process.exitCode = 1
-    })
-  `
-
-  const result = spawnSync(process.execPath, ['-e', script], {
-    cwd: path.join(__dirname, '..'),
-    encoding: 'utf8',
-    env: { ...process.env, NODE_ENV: 'production' },
-    timeout: 60_000
-  })
-
-  t.equal(result.status, 0, childMessage(result, 'production raw-contract child passed'))
+  await batch.close()
+  await db.close()
   t.end()
 })
 
@@ -642,14 +393,14 @@ test('synchronous raw getMany failures call back exactly once', async function (
     t.equal(err, expected, 'callback receives the synchronous preparation error')
   })
 
-  await new Promise(resolve => setImmediate(resolve))
-  await new Promise(resolve => setImmediate(resolve))
+  await tick()
+  await tick()
   t.equal(calls, 1, 'callback is scheduled only once')
   await db.close()
   t.end()
 })
 
-test('result conversion failures settle public operations and release resources', async function (t) {
+test('result conversion failures settle inherited operations and release resources', async function (t) {
   const db = testCommon.factory()
   await db.open()
   await db.put('key', 'value')
@@ -669,11 +420,11 @@ test('result conversion failures settle public operations and release resources'
   }
 
   try {
-    const iteratorError = await iterator.next().then(() => null, err => err)
+    const iteratorError = await rejection(iterator.next())
     t.ok(iteratorError instanceof RangeError, 'iterator conversion rejects its public read')
     await iterator.close()
 
-    const getError = await db.get('key').then(() => null, err => err)
+    const getError = await rejection(db.get('key'))
     t.ok(getError instanceof TypeError, 'getMany conversion rejects its public get')
   } finally {
     binding.iterator_nextv = originalNextv
@@ -682,46 +433,11 @@ test('result conversion failures settle public operations and release resources'
     await db.close()
   }
 
-  t.pass('public resources remain closable after conversion errors')
+  t.pass('resources remain closable after conversion errors')
   t.end()
 })
 
-test('batch cleanup failures settle public ownership with both causes', async function (t) {
-  const db = testCommon.factory()
-  await db.open()
-
-  const originalInit = binding.batch_init
-  const originalPut = binding.batch_put
-  const originalWrite = binding.batch_write
-  const originalClear = binding.batch_clear
-  const writeError = new Error('write failed')
-  const cleanupError = new Error('cleanup failed')
-
-  binding.batch_init = function () { return {} }
-  binding.batch_put = function () {}
-  binding.batch_write = function (...args) {
-    process.nextTick(args.at(-1), writeError)
-  }
-  binding.batch_clear = function () { throw cleanupError }
-
-  try {
-    const err = await db.batch([{ type: 'put', key: 'key', value: 'value' }])
-      .then(() => null, err => err)
-    t.ok(err instanceof AggregateError, 'write and cleanup errors are aggregated')
-    t.deepEqual(err.errors, [writeError, cleanupError], 'both original errors are retained')
-  } finally {
-    binding.batch_init = originalInit
-    binding.batch_put = originalPut
-    binding.batch_write = originalWrite
-    binding.batch_clear = originalClear
-    await db.close()
-  }
-
-  t.pass('public database ownership was released after cleanup failed')
-  t.end()
-})
-
-test('failed chained batch construction detaches its public resource', async function (t) {
+test('failed chained batch construction detaches its resource', async function (t) {
   const db = testCommon.factory()
   await db.open()
   const location = db.location
@@ -730,8 +446,7 @@ test('failed chained batch construction detaches its public resource', async fun
 
   binding.batch_init = function () { throw expected }
   try {
-    t.throws(() => db.batch(), err => err === expected,
-      'the original construction error is preserved')
+    t.throws(() => db.batch(), err => err === expected, 'original construction error is preserved')
   } finally {
     binding.batch_init = originalInit
   }
@@ -740,7 +455,7 @@ test('failed chained batch construction detaches its public resource', async fun
   const reopened = new db.constructor(location)
   await reopened.open()
   await reopened.close()
-  t.pass('close settles and releases the directory lock')
+  t.pass('failed construction does not retain the directory lock')
   t.end()
 })
 
@@ -775,11 +490,11 @@ test('iterator option inspection failures do not attach resources', async functi
 
     try {
       t.throws(() => target.iterator(options), err => err === expected,
-        `${name} preserves the option inspection error`)
-      t.equal(attaches, 0, `${name} fails before attaching an iterator`)
-      t.equal(detaches, 0, `${name} has no half-attached iterator to detach`)
+        `${name}: option error is preserved`)
+      t.equal(attaches, 0, `${name}: failure happens before resource attachment`)
+      t.equal(detaches, 0, `${name}: no partial resource needs detaching`)
       t.equal(Number(db.getProperty('rocksdb.num-snapshots')), 0,
-        `${name} does not create a native snapshot`)
+        `${name}: no native snapshot is created`)
     } finally {
       target.attachResource = originalAttach
       target.detachResource = originalDetach
@@ -790,112 +505,42 @@ test('iterator option inspection failures do not attach resources', async functi
   const reopened = new db.constructor(location)
   await reopened.open()
   await reopened.close()
-  t.pass('close settles and releases the directory lock')
+  t.pass('option failures do not retain the directory lock')
   t.end()
 })
 
-test('cached batch length tracks native write-count semantics', async function (t) {
-  const db = testCommon.factory()
-  await db.open()
-  const batch = db.batch()
-  const originalCount = binding.batch_count
-  let nativeCounts = 0
-
-  binding.batch_count = function () {
-    nativeCounts++
-    throw new Error('length reached native code')
-  }
-
-  try {
-    batch._put('put', 'value')
-    batch._putParts([Buffer.from('put-')], [Buffer.from('parts')])
-    batch._putLogData('metadata')
-    batch._del('delete')
-    batch._merge('merge', 'value')
-    batch._mergeParts([Buffer.from('merge-')], [Buffer.from('parts')])
-
-    t.equal(batch.length, 5, 'put, delete and merge records are counted but log data is not')
-    t.equal(nativeCounts, 0, 'cached count never enters native code')
-
-    batch._clear()
-    t.equal(batch.length, 0, 'clearing resets the cached count')
-    await batch.close()
-    t.equal(batch.length, 0, 'closing preserves the final cached count')
-    t.equal(nativeCounts, 0, 'close does not recalculate the count under a native lock')
-  } finally {
-    binding.batch_count = originalCount
-    await batch.close()
-    await db.close()
-  }
-
-  t.end()
-})
-
-test('development assertions diagnose overlapping unsafe operations', async function (t) {
-  if (process.env.NODE_ENV === 'production') {
-    t.pass('debug assertions are intentionally disabled in production')
-    t.end()
-    return
-  }
-
+test('unsafe native overlap guards remain active below inherited admission', async function (t) {
   const db = testCommon.factory()
   await db.open()
   await db.put('key', 'value')
 
-  const initializingIterator = db.iterator()
+  const iterator = db.iterator()
   const originalInitNextv = binding.iterator_init_nextv
-  let completeInitNextv
+  let completeRead
   binding.iterator_init_nextv = function (...args) {
-    completeInitNextv = args.at(-1)
+    completeRead = args.at(-1)
   }
 
   try {
-    const initializing = initializingIterator.next()
+    const reading = iterator.next()
     t.throws(
-      () => initializingIterator._seekSync(Buffer.from('key')),
+      () => iterator._seekSync(Buffer.from('key')),
       /must not overlap iterator initialization/,
-      'iterator initialization overlap is asserted in development'
+      'unsafe iterator operation cannot overlap public initialization'
     )
-    t.throws(
-      () => initializingIterator._closeSync(),
-      /must not overlap iterator initialization/,
-      'iterator close during initialization is asserted in development'
-    )
-    completeInitNextv(null, {
+    completeRead(null, {
       rows: [Buffer.from('key'), Buffer.from('value')],
       finished: true,
       limited: false
     })
-    await initializing
-  } finally {
-    binding.iterator_init_nextv = originalInitNextv
-    await initializingIterator.close()
-  }
-
-  const iterator = db.iterator()
-  await iterator._seekAsync(Buffer.from('key'))
-  const originalNextv = binding.iterator_nextv
-  let completeNextv
-  binding.iterator_nextv = function (...args) {
-    completeNextv = args.at(-1)
-  }
-
-  try {
-    const reading = iterator._nextvAsync(1, { packed: false })
-    t.throws(
-      () => iterator._seekSync(Buffer.from('key')),
-      /must not overlap another unsafe operation/,
-      'iterator overlap is asserted in development'
-    )
-    completeNextv(null, { rows: [], finished: true })
     await reading
   } finally {
-    binding.iterator_nextv = originalNextv
+    binding.iterator_init_nextv = originalInitNextv
     await iterator.close()
   }
 
   const batch = db.batch()
-  batch._put('key', 'value')
+  batch._putParts([Buffer.from('key')], [Buffer.from('value')])
   const originalWrite = binding.batch_write
   let completeWrite
   binding.batch_write = function (...args) {
@@ -903,27 +548,21 @@ test('development assertions diagnose overlapping unsafe operations', async func
   }
 
   try {
-    const writing = new Promise((resolve, reject) => {
-      batch._write({}, err => err ? reject(err) : resolve())
-    })
+    const writing = batch._writeAsync()
     t.throws(
-      () => batch._writeAsync(),
-      /unsafe batch methods must not overlap/,
-      'callback-style raw batch overlap is asserted in development'
+      () => batch._merge('other', 'value'),
+      hasCode('LEVEL_BATCH_BUSY'),
+      'unsafe batch operation cannot overlap a native write'
     )
+
+    let closeSettled = false
+    const closing = batch.close().then(() => { closeSettled = true })
+    await tick()
+    t.equal(closeSettled, false, 'inherited close waits for an accepted unsafe native write')
+
     completeWrite(null)
     await writing
-
-    const publicBatch = db.batch().put('public', 'write')
-    const publicWriting = publicBatch.write()
-    t.throws(
-      () => publicBatch._put('unsafe', 'overlap'),
-      /must not overlap a public write/,
-      'public batch write overlap is asserted in development'
-    )
-    completeWrite(null)
-    await publicWriting
-    await publicBatch.close()
+    await closing
   } finally {
     binding.batch_write = originalWrite
     await batch.close()

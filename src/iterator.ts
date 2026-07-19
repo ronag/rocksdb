@@ -5,7 +5,12 @@ import { AbstractIterator, AbstractKeyIterator, AbstractValueIterator } from 'ab
 import { fromCallback } from 'catering'
 import ModuleError = require('module-error')
 import binding = require('./binding')
-import { getPackedMode, setPackedResult } from './util'
+import {
+  getPackedMode,
+  kRegisterCleanupResource,
+  kUnregisterCleanupResource,
+  setPackedResult
+} from './util'
 
 const kPromise = Symbol('promise')
 const kContext = Symbol('context')
@@ -32,11 +37,15 @@ const kInitNextvAsync = Symbol('initNextvAsync')
 const kCompleteNextv = Symbol('completeNextv')
 const kFinishInitialization = Symbol('finishInitialization')
 const kCloseNative = Symbol('closeNative')
+const kCleanupResource = Symbol('cleanupResource')
+const kEnsureCleanupResource = Symbol('ensureCleanupResource')
+const kReleaseCleanupResource = Symbol('releaseCleanupResource')
 const kAbstractKeyEncoding = (AbstractIterator as any).keyEncoding
 const kAbstractValueEncoding = (AbstractIterator as any).valueEncoding
 
 const kEmpty = Object.freeze([])
 const DEBUG = process.env.NODE_ENV !== 'production'
+const cleanupAttempts = 3
 
 const kUninitialized = 0
 const kInitializing = 1
@@ -45,6 +54,15 @@ const kFailed = 3
 const kClosed = 4
 
 const identity = value => value
+
+function once (callback) {
+  let called = false
+  return (...args) => {
+    if (called) return
+    called = true
+    return callback(...args)
+  }
+}
 
 const getTypedArrayByteLength = Object.getOwnPropertyDescriptor(
   Object.getPrototypeOf(Object.getPrototypeOf(Buffer.prototype)),
@@ -250,6 +268,7 @@ class Iterator extends AbstractIterator<any, any, any> {
   [key: symbol]: any
 
   constructor (db, context, options) {
+    const nativeOptions = options
     options = prepareAbstractIteratorOptions(options)
     super(db, options)
 
@@ -260,7 +279,7 @@ class Iterator extends AbstractIterator<any, any, any> {
       this[kValueEncoding] = options.valueEncoding ?? 'buffer'
 
       const bindingOptions = prepareNativeIteratorOptions(
-        options,
+        nativeOptions,
         this[kKeyEncoding],
         this[kValueEncoding]
       )
@@ -278,6 +297,7 @@ class Iterator extends AbstractIterator<any, any, any> {
       this[kFinished] = false
       this[kPosition] = 0
       this[kNativeBusy] = false
+      this[kCleanupResource] = null
       if (DEBUG) this[kUnsafeBusy] = false
     } catch (err) {
       // AbstractIterator attaches itself to the database in super(). A failed
@@ -308,7 +328,7 @@ class Iterator extends AbstractIterator<any, any, any> {
     this[kInitState] = kInitializing
 
     let initializationScheduled = false
-    const complete = (err) => {
+    const complete = once((err) => {
       // A scheduled native initializer closes failed state in its worker. Only
       // a synchronous scheduling failure still needs fallback cleanup here.
       if (err && !initializationScheduled) {
@@ -327,7 +347,7 @@ class Iterator extends AbstractIterator<any, any, any> {
       this[kInitCallbacks] = []
 
       for (const callback of callbacks) callback(err)
-    }
+    })
 
     try {
       binding.iterator_init(
@@ -446,7 +466,23 @@ class Iterator extends AbstractIterator<any, any, any> {
       assert(!this[kUnsafeBusy], 'public close() must not overlap an unsafe operation')
     }
 
-    this[kCloseNative]()
+    const errors: any[] = []
+    for (let attempt = 0; attempt < cleanupAttempts; attempt++) {
+      try {
+        this[kCloseNative]()
+        return
+      } catch (err) {
+        errors.push(err)
+      }
+    }
+
+    const error = new AggregateError(
+      errors,
+      'Iterator resources could not be released cleanly',
+      { cause: errors[0] }
+    )
+    this[kEnsureCleanupResource]()
+    throw error
   }
 
   // Undocumented, exposed for tests only
@@ -454,47 +490,26 @@ class Iterator extends AbstractIterator<any, any, any> {
     return (this[kCache].length - this[kPosition]) / 2
   }
 
-  _next (callback) {
+  _next () {
     if (DEBUG) assert(!this[kUnsafeBusy], 'unsafe _next() must not overlap an unsafe operation')
-    const owned = callback === undefined
     if (this[kNativeBusy]) {
-      const err = iteratorBusyError('next')
-      if (owned) return Promise.reject(err)
-      process.nextTick(callback, err)
-      return this
+      return Promise.reject(iteratorBusyError('next'))
     }
 
     this[kNativeBusy] = true
     const iterator = this
-    if (!owned) {
-      const complete = callback
-      callback = function () {
-        iterator[kNativeBusy] = false
-        return Reflect.apply(complete, undefined, arguments as any)
-      }
-
-      try {
-        return this[kNext](callback)
-      } catch (err) {
-        this[kNativeBusy] = false
-        process.nextTick(complete, err)
-        return this
-      }
-    }
-
     return new Promise((resolve, reject) => {
-      const complete = function (err, key, value) {
+      const complete = once(function (err, key, value) {
         iterator[kNativeBusy] = false
         if (err) reject(err)
         else if (arguments.length < 3) resolve(undefined)
         else resolve([key, value])
-      }
+      })
 
       try {
         iterator[kNext](complete)
       } catch (err) {
-        iterator[kNativeBusy] = false
-        reject(err)
+        complete(err)
       }
     })
   }
@@ -529,9 +544,16 @@ class Iterator extends AbstractIterator<any, any, any> {
     let initializationScheduled = false
     if (initialize) this[kInitState] = kInitializing
 
-    const complete = (err, result) => {
+    const complete = once((err, result) => {
       if (initialize) {
-        err = this[kFinishInitialization](err)
+        if (err && !initializationScheduled) {
+          err = this._cleanupFailedInitialization(err)
+          this[kInitState] = kFailed
+          this[kInitError] = err
+          this[kInitialTarget] = null
+        } else {
+          err = this[kFinishInitialization](err)
+        }
       }
 
       if (err) {
@@ -548,7 +570,7 @@ class Iterator extends AbstractIterator<any, any, any> {
         }
         this[kNext](callback)
       }
-    }
+    })
 
     try {
       if (initialize) {
@@ -564,59 +586,49 @@ class Iterator extends AbstractIterator<any, any, any> {
         binding.iterator_nextv(this[kContext], size, null, complete)
       }
     } catch (err) {
-      let error = err
-      if (initialize) {
-        // A scheduling failure never reached the worker-side initializer, so
-        // release the construction snapshot here as the existing init path does.
-        if (!initializationScheduled) error = this._cleanupFailedInitialization(error)
-        this[kInitState] = kFailed
-        this[kInitError] = error
-        this[kInitialTarget] = null
-      }
-
-      this._deferNextResult(callback, error)
+      process.nextTick(complete, err)
     }
   }
 
-  _nextv (size, options, callback) {
+  _nextv (size, options) {
     if (DEBUG) assert(!this[kUnsafeBusy], 'unsafe _nextv() must not overlap an unsafe operation')
-    const owned = callback === undefined
     if (this[kNativeBusy]) {
-      const err = iteratorBusyError('nextv')
-      if (owned) return Promise.reject(err)
-      process.nextTick(callback, err)
-      return
+      return Promise.reject(iteratorBusyError('nextv'))
     }
 
     this[kNativeBusy] = true
-    try {
-      callback = fromCallback(callback, kPromise)
-    } catch (err) {
-      this[kNativeBusy] = false
-      throw err
-    }
+    let callback = fromCallback(undefined, kPromise)
     const promise = callback[kPromise]
     const complete = callback
-    callback = (err, entries?, finished?, limited?) => {
+    callback = once((err, entries?) => {
       this[kNativeBusy] = false
-      complete(err, entries, finished, limited)
-    }
+      complete(err, entries)
+    })
 
     const done = (err, val?) => {
       if (err) {
-        callback(err)
+        callback(err, undefined)
       } else {
         try {
-          const { rows, finished, limited } = val
+          const { rows, finished } = val
+
+          // AbstractIterator treats an empty private result as natural
+          // exhaustion. Native timeout is explicitly retryable, so reject it
+          // instead of silently marking the public iterator as ended.
+          if (rows.length === 0 && !finished) {
+            throw new ModuleError('Iterator read stopped before a row was read', {
+              code: 'LEVEL_ABORTED'
+            })
+          }
 
           const entries: any[][] = []
           for (let n = 0; n < rows.length; n += 2) {
             entries.push([rows[n + 0], rows[n + 1]])
           }
 
-          callback(null, entries, finished, limited)
+          callback(null, entries)
         } catch (err) {
-          callback(err)
+          callback(err, undefined)
         }
       }
     }
@@ -690,48 +702,51 @@ class Iterator extends AbstractIterator<any, any, any> {
   _seekAsync (target, callback) {
     if (DEBUG) assertIteratorIdle(this, '_seekAsync')
     callback = fromCallback(callback, kPromise)
+    const promise = callback[kPromise]
+    const settle = callback
+    callback = once((err) => {
+      if (DEBUG) this[kUnsafeBusy] = false
+      settle(err)
+    })
     if (DEBUG) this[kUnsafeBusy] = true
+    let nativeComplete
     try {
       if (DEBUG) target = normalizeSeekTarget(target)
 
       const discardedCount = (this[kCache].length - this[kPosition]) / 2
-      if (this[kInitState] === kUninitialized) {
-        this[kInitialTarget] = target
+      const reset = () => {
         this[kFirst] = true
         this[kCache] = kEmpty
         this[kFinished] = false
         this[kPosition] = 0
+      }
+
+      if (this[kInitState] === kUninitialized) {
+        this[kInitialTarget] = target
+        reset()
 
         this._initialize((err) => {
-          if (DEBUG) this[kUnsafeBusy] = false
-          if (err) callback(err)
-          else callback(null)
+          callback(err)
         })
-        return callback[kPromise]
+        return promise
       }
 
       this._initializeSync()
-      binding.iterator_seek(this[kContext], target, discardedCount, (err) => {
-        if (DEBUG) this[kUnsafeBusy] = false
-        if (err) callback(err)
-        else callback(null)
+      nativeComplete = once((err) => {
+        if (!err) reset()
+        callback(err)
       })
+      binding.iterator_seek(this[kContext], target, discardedCount, nativeComplete)
 
       // Keep cached state intact if native argument validation throws before
       // the seek is scheduled. Once scheduled, no iterator operation can run
       // until this async seek completes.
-      this[kFirst] = true
-      this[kCache] = kEmpty
-      this[kFinished] = false
-      this[kPosition] = 0
+      reset()
     } catch (err) {
-      process.nextTick(() => {
-        if (DEBUG) this[kUnsafeBusy] = false
-        callback(err)
-      })
+      process.nextTick(nativeComplete ?? callback, err)
     }
 
-    return callback[kPromise]
+    return promise
   }
 
   _nextvCached (size) {
@@ -793,8 +808,14 @@ class Iterator extends AbstractIterator<any, any, any> {
   _nextvAsync (size, options, callback, packed) {
     if (DEBUG) assertIteratorIdle(this, '_nextvAsync')
     callback = fromCallback(callback, kPromise)
+    const promise = callback[kPromise]
+    const settle = callback
+    callback = once(function () {
+      return Reflect.apply(settle, undefined, arguments as any)
+    })
     if (DEBUG) this[kUnsafeBusy] = true
-    return this[kNextvAsync](size, options, callback, packed, DEBUG, false)
+    this[kNextvAsync](size, options, callback, packed, DEBUG, false)
+    return promise
   }
 
   [kNextvAsync] (size, options, callback, packed, unsafe, initialize) {
@@ -816,6 +837,7 @@ class Iterator extends AbstractIterator<any, any, any> {
 
     if (DEBUG) assert(this[kContext])
 
+    let nativeComplete
     try {
       if (packed == null) packed = getPackedMode(options, getDefaultPackedMode(this))
       if (DEBUG) validatePackedEncodings(this, packed)
@@ -833,12 +855,17 @@ class Iterator extends AbstractIterator<any, any, any> {
           : packed === 'auto'
             ? binding.iterator_nextv_auto
             : binding.iterator_nextv
-        nextv(this[kContext], size, options, (err, result) => {
+        nativeComplete = once((err, result) => {
           this[kCompleteNextv](err, result, callback, unsafe)
         })
+        nextv(this[kContext], size, options, nativeComplete)
       }
     } catch (err) {
-      this._deferNextResult(callback, err, undefined, undefined, unsafe)
+      if (nativeComplete === undefined) {
+        this._deferNextResult(callback, err, undefined, undefined, unsafe)
+      } else {
+        process.nextTick(nativeComplete, err)
+      }
     }
 
     return callback[kPromise]
@@ -848,10 +875,17 @@ class Iterator extends AbstractIterator<any, any, any> {
     this[kInitState] = kInitializing
     let initializationScheduled = false
 
-    const complete = (err, result) => {
-      err = this[kFinishInitialization](err)
+    const complete = once((err, result) => {
+      if (err && !initializationScheduled) {
+        err = this._cleanupFailedInitialization(err)
+        this[kInitState] = kFailed
+        this[kInitError] = err
+        this[kInitialTarget] = null
+      } else {
+        err = this[kFinishInitialization](err)
+      }
       this[kCompleteNextv](err, result, callback, unsafe)
-    }
+    })
 
     try {
       binding.iterator_init_nextv(
@@ -863,12 +897,7 @@ class Iterator extends AbstractIterator<any, any, any> {
       )
       initializationScheduled = true
     } catch (err) {
-      let error = err
-      if (!initializationScheduled) error = this._cleanupFailedInitialization(error)
-      this[kInitState] = kFailed
-      this[kInitError] = error
-      this[kInitialTarget] = null
-      this._deferNextResult(callback, error, undefined, undefined, unsafe)
+      process.nextTick(complete, err)
     }
 
     return callback[kPromise]
@@ -924,6 +953,30 @@ class Iterator extends AbstractIterator<any, any, any> {
     this[kInitCallbacks] = []
     this[kInitError] = null
     this[kInitialTarget] = null
+    this[kReleaseCleanupResource]()
+  }
+
+  [kEnsureCleanupResource] () {
+    if (this[kCleanupResource] !== null) return
+
+    const resource: any = {
+      active: true,
+      close: async () => {
+        if (!resource.active) return
+        await this._close()
+      }
+    }
+    this[kCleanupResource] = resource
+    ;(this.db as any)[kRegisterCleanupResource](resource)
+  }
+
+  [kReleaseCleanupResource] () {
+    const resource = this[kCleanupResource]
+    if (resource === null) return
+
+    resource.active = false
+    this[kCleanupResource] = null
+    ;(this.db as any)[kUnregisterCleanupResource](resource)
   }
 
   // Terminal raw close. It intentionally leaves AbstractLevel's private
@@ -978,6 +1031,16 @@ function entryIteratorOptions (db, options, keys, values) {
   return entryOptions
 }
 
+function ownedEntryIterator (db, context, options, keys, values) {
+  const iterator = new Iterator(db, context, entryIteratorOptions(db, options, keys, values))
+
+  // The wrapper exclusively owns the composed entry iterator. Keep only the
+  // wrapper attached so database close cannot race the same native iterator
+  // through two independently tracked resources.
+  db.detachResource(iterator)
+  return iterator
+}
+
 class KeyIterator extends AbstractKeyIterator<any, any> {
   #iterator
 
@@ -985,7 +1048,7 @@ class KeyIterator extends AbstractKeyIterator<any, any> {
     super(db, options)
 
     try {
-      this.#iterator = new Iterator(db, context, entryIteratorOptions(db, options, true, false))
+      this.#iterator = ownedEntryIterator(db, context, options, true, false)
     } catch (err) {
       db.detachResource(this)
       throw err
@@ -1009,8 +1072,8 @@ class KeyIterator extends AbstractKeyIterator<any, any> {
     this.#iterator.seek(target, options)
   }
 
-  async _close () {
-    await this.#iterator.close()
+  _close () {
+    return this.#iterator._close()
   }
 }
 
@@ -1021,7 +1084,7 @@ class ValueIterator extends AbstractValueIterator<any, any, any> {
     super(db, options)
 
     try {
-      this.#iterator = new Iterator(db, context, entryIteratorOptions(db, options, false, true))
+      this.#iterator = ownedEntryIterator(db, context, options, false, true)
     } catch (err) {
       db.detachResource(this)
       throw err
@@ -1045,8 +1108,8 @@ class ValueIterator extends AbstractValueIterator<any, any, any> {
     this.#iterator.seek(target, options)
   }
 
-  async _close () {
-    await this.#iterator.close()
+  _close () {
+    return this.#iterator._close()
   }
 }
 

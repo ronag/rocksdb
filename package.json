@@ -43,7 +43,6 @@
     "@nxtedition/slice": "^2.0.0",
     "abstract-level": "^3.1.1",
     "catering": "^2.1.1",
-    "maybe-combine-errors": "^1.0.0",
     "module-error": "^1.0.2",
     "napi-macros": "~2.2.2",
     "node-gyp-build": "^4.8.2"

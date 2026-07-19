@@ -3,6 +3,7 @@ import { AbstractChainedBatch } from 'abstract-level'
 import { fromCallback } from 'catering'
 import ModuleError = require('module-error')
 import binding = require('./binding')
+import { kRegisterCleanupResource, kUnregisterCleanupResource } from './util'
 
 const kPromise = Symbol('promise')
 const kBatchContext = Symbol('batchContext')
@@ -17,9 +18,13 @@ const kWaitForIdle = Symbol('waitForIdle')
 const kScheduleWrite = Symbol('scheduleWrite')
 const kStartWrite = Symbol('startWrite')
 const kClearNative = Symbol('clearNative')
+const kCleanupResource = Symbol('cleanupResource')
+const kEnsureCleanupResource = Symbol('ensureCleanupResource')
+const kReleaseCleanupResource = Symbol('releaseCleanupResource')
 
 const EMPTY = {}
 const DEBUG = process.env.NODE_ENV !== 'production'
+const cleanupAttempts = 3
 
 function batchBusyError (operation, active) {
   return new ModuleError(
@@ -51,6 +56,7 @@ class ChainedBatch extends AbstractChainedBatch<any, any, any> {
     this[kActiveOperation] = null
     this[kCloseRequested] = false
     this[kIdleBarrier] = null
+    this[kCleanupResource] = null
   }
 
   [kEnterOperation] (operation) {
@@ -200,7 +206,10 @@ class ChainedBatch extends AbstractChainedBatch<any, any, any> {
 
   [kStartWrite] (operation, options, callback) {
     this[kEnterOperation](operation)
+    let completed = false
     this[kScheduleWrite](options, (err) => {
+      if (completed) return
+      completed = true
       this[kLeaveOperation]()
       callback(err)
     })
@@ -222,23 +231,57 @@ class ChainedBatch extends AbstractChainedBatch<any, any, any> {
   async _close () {
     this[kCloseRequested] = true
     await this[kWaitForIdle]()
-    this[kClearNative]()
+
+    const errors: any[] = []
+    for (let attempt = 0; attempt < cleanupAttempts; attempt++) {
+      try {
+        this[kClearNative]()
+        return
+      } catch (err) {
+        errors.push(err)
+      }
+    }
+
+    const error = new AggregateError(
+      errors,
+      'Batch resources could not be released cleanly',
+      { cause: errors[0] }
+    )
+    this[kEnsureCleanupResource]()
+    throw error
   }
 
   [kClearNative] () {
     const context = this[kBatchContext]
-    if (context === null) return
+    if (context !== null) {
+      binding.batch_clear(context)
+      this[kBatchContext] = null
+    }
 
-    binding.batch_clear(context)
-    this[kBatchContext] = null
+    this[kReleaseCleanupResource]()
   }
 
-  _flushPendingClose () {
-    if (!this[kBusy] && this[kPendingClose]) {
-      const callback = this[kPendingClose]
-      this[kPendingClose] = null
-      this._close(callback)
+  [kEnsureCleanupResource] () {
+    if (this[kCleanupResource] !== null) return
+
+    const resource: any = {
+      active: true,
+      close: async () => {
+        if (!resource.active) return
+        await this._close()
+      }
     }
+    this[kCleanupResource] = resource
+    ;(this.db as any)[kRegisterCleanupResource](resource)
+  }
+
+  [kReleaseCleanupResource] () {
+    const resource = this[kCleanupResource]
+    if (resource === null) return
+
+    resource.active = false
+    this[kCleanupResource] = null
+    ;(this.db as any)[kUnregisterCleanupResource](resource)
   }
 
   // Terminal raw close for a raw-managed batch. It intentionally leaves

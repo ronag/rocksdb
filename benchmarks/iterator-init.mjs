@@ -8,7 +8,7 @@ import { fileURLToPath, pathToFileURL } from 'node:url'
 
 const localRoot = dirname(dirname(fileURLToPath(import.meta.url)))
 const root = resolve(process.env.ROCKS_LEVEL_ROOT ?? localRoot)
-const { RocksLevel } = await import(pathToFileURL(join(root, 'index.js')).href)
+const { RocksLevel } = await import(pathToFileURL(join(root, 'lib/index.js')).href)
 
 const rounds = Number(process.env.BENCH_ROUNDS ?? 5)
 const iteratorCount = Number(process.env.BENCH_ITERATORS ?? 2000)

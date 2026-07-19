@@ -9,7 +9,14 @@ import { RocksCache } from './cache'
 import { ChainedBatch } from './chained-batch'
 import { Iterator, KeyIterator, ValueIterator } from './iterator'
 import { RocksStatistics, getStatisticsContext } from './statistics'
-import { getPackedMode, kRef, kUnref, setPackedResult } from './util'
+import {
+  getPackedMode,
+  kRef,
+  kRegisterCleanupResource,
+  kUnref,
+  kUnregisterCleanupResource,
+  setPackedResult
+} from './util'
 import { RocksWriteBufferManager } from './write-buffer-manager'
 
 const kContext = Symbol('context')
@@ -18,6 +25,7 @@ const kPromise = Symbol('promise')
 const kRefs = Symbol('refs')
 const kPendingClose = Symbol('pendingClose')
 const kReferenceResource = Symbol('referenceResource')
+const kCleanupResources = Symbol('cleanupResources')
 const kGetManyAsync = Symbol('getManyAsync')
 const kBatchAsync = Symbol('batchAsync')
 const kWithRef = Symbol('withRef')
@@ -26,10 +34,37 @@ const kEmpty = Object.freeze({})
 const DEBUG = process.env.NODE_ENV !== 'production'
 const cleanupAttempts = 3
 
+function once (callback) {
+  let called = false
+  return (...args) => {
+    if (called) return
+    called = true
+    return callback(...args)
+  }
+}
+
 function aggregateErrors (errors: any[], message) {
   return errors.length === 1
     ? errors[0]
     : new AggregateError(errors, message, { cause: errors[0] })
+}
+
+async function drainCleanupResources (resources: Set<any>) {
+  const pending = Array.from(resources)
+  if (pending.length === 0) return
+
+  const results = await Promise.allSettled(
+    pending.map(resource => resource.close())
+  )
+  const errors: any[] = []
+
+  for (const result of results) {
+    if (result.status === 'rejected') errors.push(result.reason)
+  }
+
+  if (errors.length !== 0) {
+    throw aggregateErrors(errors, 'Database cleanup resources could not be released')
+  }
 }
 
 function cleanupDatabaseReference (context) {
@@ -52,7 +87,12 @@ function cleanupDatabaseReference (context) {
     }
 
     const afterClose = (err) => {
-      if (err) errors.push(err)
+      if (!err) {
+        resolve()
+        return
+      }
+
+      errors.push(err)
 
       let closed = false
       try {
@@ -91,12 +131,32 @@ function cleanupDatabaseReference (context) {
   })
 }
 
+async function cleanupProvisionalDatabaseReference (context) {
+  try {
+    await cleanupDatabaseReference(context)
+    return
+  } catch (closeError) {
+    try {
+      // Native admission precedes JavaScript completion, so a failed _open()
+      // can own either a reservation or an already-open reference. Use the
+      // phase-aware finalizer-grade path rather than reservation-only dispose.
+      binding.db_cleanup_failed_open(context)
+    } catch (cleanupError) {
+      throw new AggregateError(
+        [closeError, cleanupError],
+        'Failed-open database reference could not be released',
+        { cause: closeError }
+      )
+    }
+  }
+}
+
 function attachReferenceResource (db, context) {
   const resource = {
     active: true,
     async close () {
       if (!this.active) return
-      await cleanupDatabaseReference(context)
+      await cleanupProvisionalDatabaseReference(context)
       this.active = false
     },
     release () {
@@ -263,6 +323,7 @@ class RocksLevel extends AbstractLevel<any, any, any> {
     this[kColumns] = {}
     this[kRefs] = 0
     this[kPendingClose] = null
+    this[kCleanupResources] = new Set()
     // db_init(handle) may reserve a native lease before AbstractLevel schedules
     // its first open. Model every provisional lease as a normal resource so
     // close-before-open and opening failures are handled by AbstractLevel.
@@ -347,6 +408,16 @@ class RocksLevel extends AbstractLevel<any, any, any> {
     }
   }
 
+  [kRegisterCleanupResource] (resource) {
+    this.attachResource(resource)
+    this[kCleanupResources].add(resource)
+  }
+
+  [kUnregisterCleanupResource] (resource) {
+    this[kCleanupResources].delete(resource)
+    this.detachResource(resource)
+  }
+
   async [kWithRef] (operation) {
     this[kRef]()
     try {
@@ -366,6 +437,12 @@ class RocksLevel extends AbstractLevel<any, any, any> {
       await this[kPendingClose].promise
     }
 
+    // AbstractLevel snapshots its resource set before awaiting close(). A
+    // resource whose first caller owns a close error can attach its fallback
+    // owner after that snapshot while peer callers intentionally suppress the
+    // rejection. Drain the private registry here so native database teardown
+    // cannot overtake that late cleanup debt.
+    await drainCleanupResources(this[kCleanupResources])
     await cleanupDatabaseReference(this[kContext])
     this[kColumns] = {}
   }
@@ -418,7 +495,9 @@ class RocksLevel extends AbstractLevel<any, any, any> {
   }
 
   [kGetManyAsync] (keys, options, callback, allowPartial, packed, exposePacked) {
+    const promise = callback[kPromise]
     let bindingOptions = options
+    let complete
 
     try {
       if (allowPartial == null) {
@@ -445,7 +524,7 @@ class RocksLevel extends AbstractLevel<any, any, any> {
         : packed === 'auto'
           ? binding.db_get_many_auto
           : binding.db_get_many
-      getMany(this[kContext], keys, bindingOptions, (err, val) => {
+      complete = once((err, val) => {
         if (err) {
           callback(err)
           return
@@ -495,11 +574,12 @@ class RocksLevel extends AbstractLevel<any, any, any> {
 
         callback(completionError, completionValue, completionPacked)
       })
+      getMany(this[kContext], keys, bindingOptions, complete)
     } catch (err) {
-      process.nextTick(callback, err)
+      process.nextTick(complete ?? callback, err)
     }
 
-    return callback[kPromise]
+    return promise
   }
 
   // Synchronous counterpart to _getManyAsync(). It has the same open-database,
@@ -566,7 +646,9 @@ class RocksLevel extends AbstractLevel<any, any, any> {
 
   [kBatchAsync] (operations, options, callback, columnOptions?) {
     callback = fromCallback(callback, kPromise)
+    const promise = callback[kPromise]
     let batch
+    let complete
     try {
       batch = binding.batch_init(this[kContext])
 
@@ -584,16 +666,21 @@ class RocksLevel extends AbstractLevel<any, any, any> {
         }
       }
 
-      binding.batch_write(this[kContext], batch, options ?? {}, (err, val) => {
+      complete = once((err, val) => {
         err = clearNativeBatch(batch, err)
         callback(err, val)
       })
+      binding.batch_write(this[kContext], batch, options ?? {}, complete)
     } catch (err) {
-      const completionError = batch ? clearNativeBatch(batch, err) : err
-      process.nextTick(callback, completionError)
+      if (complete !== undefined) {
+        process.nextTick(complete, err)
+      } else {
+        const completionError = batch ? clearNativeBatch(batch, err) : err
+        process.nextTick(callback, completionError)
+      }
     }
 
-    return callback[kPromise]
+    return promise
   }
 
   // Construct a caller-owned raw iterator. Options are synchronously consumed
@@ -705,18 +792,20 @@ class RocksLevel extends AbstractLevel<any, any, any> {
       return callback[kPromise]
     }
 
-    try {
-      this[kRef]()
-      binding.db_query(this[kContext], options ?? kEmpty, (err, value) => {
-        this[kUnref]()
-        callback(err, value)
-      })
-    } catch (err) {
+    const promise = callback[kPromise]
+    this[kRef]()
+    const complete = once((err, value) => {
       this[kUnref]()
-      process.nextTick(callback, err)
+      callback(err, value)
+    })
+
+    try {
+      binding.db_query(this[kContext], options ?? kEmpty, complete)
+    } catch (err) {
+      process.nextTick(complete, err)
     }
 
-    return callback[kPromise]
+    return promise
   }
 
   querySync (options) {
@@ -798,18 +887,20 @@ class RocksLevel extends AbstractLevel<any, any, any> {
       return callback[kPromise]
     }
 
+    const promise = callback[kPromise]
     this[kRef]()
-    try {
-      binding.db_compact_range(this[kContext], options, (err, val) => {
-        this[kUnref]()
-        callback(err, val)
-      })
-    } catch (err) {
+    const complete = once((err, value) => {
       this[kUnref]()
-      process.nextTick(callback, err)
+      callback(err, value)
+    })
+
+    try {
+      binding.db_compact_range(this[kContext], options, complete)
+    } catch (err) {
+      process.nextTick(complete, err)
     }
 
-    return callback[kPromise]
+    return promise
   }
 
   flushWAL (options = {}, callback) {
@@ -826,7 +917,13 @@ class RocksLevel extends AbstractLevel<any, any, any> {
       return callback[kPromise]
     }
 
+    const promise = callback[kPromise]
     this[kRef]()
+    const complete = once((err, value) => {
+      this[kUnref]()
+      callback(err, value)
+    })
+
     try {
       let sync
       if (typeof options === 'boolean') {
@@ -842,16 +939,12 @@ class RocksLevel extends AbstractLevel<any, any, any> {
         }
       }
 
-      binding.db_flush_wal(this[kContext], sync, (err, val) => {
-        this[kUnref]()
-        callback(err, val)
-      })
+      binding.db_flush_wal(this[kContext], sync, complete)
     } catch (err) {
-      this[kUnref]()
-      process.nextTick(callback, err)
+      process.nextTick(complete, err)
     }
 
-    return callback[kPromise]
+    return promise
   }
 }
 

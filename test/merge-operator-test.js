@@ -122,7 +122,12 @@ test('raw write and concurrent close preserve independent results', async functi
   const batch = db.batch()
   const originalWrite = binding.batch_write
   const originalClear = binding.batch_clear
-  const cleanupError = new Error('raw-only cleanup failed')
+  const cleanupErrors = [
+    new Error('first raw-only cleanup failed'),
+    new Error('second raw-only cleanup failed'),
+    new Error('third raw-only cleanup failed')
+  ]
+  let clearCalls = 0
   let release
 
   batch._merge('cleanup', makeVersion('7-asd'))
@@ -130,7 +135,7 @@ test('raw write and concurrent close preserve independent results', async functi
     release = () => args.at(-1)()
   }
   binding.batch_clear = function () {
-    throw cleanupError
+    throw cleanupErrors[clearCalls++]
   }
 
   try {
@@ -139,7 +144,14 @@ test('raw write and concurrent close preserve independent results', async functi
     release()
     const [writeResult, closeResult] = await Promise.allSettled([writing, closing])
     t.equal(writeResult.status, 'fulfilled', 'raw writer reports native write success')
-    t.equal(closeResult.reason, cleanupError, 'concurrent close reports cleanup failure')
+    t.equal(closeResult.status, 'rejected', 'concurrent close reports cleanup failure')
+    t.ok(closeResult.reason instanceof AggregateError,
+      'exhausted private cleanup is reported as an AggregateError')
+    t.deepEqual(closeResult.reason.errors, cleanupErrors,
+      'cleanup failures retain their attempt order')
+    t.equal(closeResult.reason.cause, cleanupErrors[0],
+      'the first cleanup failure remains the cause')
+    t.equal(clearCalls, 3, 'private close exhausts its bounded cleanup attempts')
   } finally {
     binding.batch_write = originalWrite
     binding.batch_clear = originalClear

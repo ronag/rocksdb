@@ -361,12 +361,12 @@ db._getManyAsync([slice], { timeout: null })
 const boundedValues = db.getMany(['key'], { highWaterMarkBytes: 0 })
 expectTrue<Equal<
   Awaited<typeof boundedValues>,
-  Array<string | null | undefined>
+  Array<string | undefined>
 >>()
 const timedValues = db.getMany(['key'], { timeout: 1 })
 expectTrue<Equal<
   Awaited<typeof timedValues>,
-  Array<string | null | undefined>
+  Array<string | undefined>
 >>()
 const unboundedValues = db.getMany(['key'])
 expectTrue<Equal<Awaited<typeof unboundedValues>, Array<string | undefined>>>()
@@ -381,7 +381,7 @@ const annotatedBoundedOptions: RocksGetManyOptions<string, string> = {
 const annotatedBoundedValues = db.getMany(['key'], annotatedBoundedOptions)
 expectTrue<Equal<
   Awaited<typeof annotatedBoundedValues>,
-  Array<string | null | undefined>
+  Array<string | undefined>
 >>()
 
 const query = db.querySync({ gte: slice, lt: Buffer.from('z') })

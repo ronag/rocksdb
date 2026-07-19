@@ -17,6 +17,7 @@ function runChild (t, script, env, marker) {
   delete childEnv.ROCKS_LEVEL_TEST_UPDATES_CLOSE_EXCEPTION_COUNTDOWN
   delete childEnv.ROCKS_LEVEL_TEST_DB_CLOSE_EXCEPTION_AFTER_TRANSFER_COUNTDOWN
   delete childEnv.ROCKS_LEVEL_TEST_DB_CLOSE_EXCEPTION_BEFORE_TRANSFER_COUNTDOWN
+  delete childEnv.ROCKS_LEVEL_TEST_DB_CLOSE_EXCEPTION_BEFORE_TRANSFER_REMAINING
   delete childEnv.ROCKS_LEVEL_TEST_DB_CLOSE_EXCEPTION_COLUMN_COUNTDOWN
   delete childEnv.ROCKS_LEVEL_TEST_DB_OPEN_EXCEPTION_AFTER_COLUMN_COUNTDOWN
   delete childEnv.ROCKS_LEVEL_TEST_DB_OPEN_CLEANUP_EXCEPTION_COUNTDOWN
@@ -149,11 +150,13 @@ test('public updates cleanup retries one native CloseResources exception', { ski
 
 test('failed imported open retries a real pre-transfer cleanup exception', { skip: !nativeFaults }, function (t) {
   const packagePath = JSON.stringify(require.resolve('..'))
+  const bindingPath = JSON.stringify(require.resolve('../binding'))
   const script = `
     'use strict'
     const assert = require('node:assert/strict')
     const temporaryDirectory = require(${temporaryDirectoryPath})
     const { RocksLevel } = require(${packagePath})
+    const binding = require(${bindingPath})
 
     const rejection = async (promise) => {
       try {
@@ -170,12 +173,25 @@ test('failed imported open retries a real pre-transfer cleanup exception', { ski
       await source.put('key', 'value')
 
       const imported = new RocksLevel(source.handle, { parallelism: 0 })
+      const originalClose = binding.db_close
+      const closeErrors = []
+      let closeCalls = 0
+      binding.db_close = (context, callback) => {
+        closeCalls++
+        originalClose(context, (err) => {
+          if (err) closeErrors.push(err)
+          callback(err)
+        })
+      }
+
       const err = await rejection(imported.open())
-      const failure = err?.cause
-      assert.ok(failure instanceof AggregateError)
-      assert.match(failure.cause?.message, /parallelism/)
-      assert.match(failure.errors?.[1]?.message, /Injected database close exception before ownership transfer/)
+      assert.equal(err?.code, 'LEVEL_DATABASE_NOT_OPEN')
+      assert.match(err?.cause?.message, /parallelism/)
+      assert.equal(closeCalls, 2)
+      assert.equal(closeErrors.length, 1)
+      assert.match(closeErrors[0].message, /Injected database close exception before ownership transfer/)
       assert.equal(imported.status, 'closed')
+      binding.db_close = originalClose
       await imported.close()
 
       assert.equal(await source.get('key'), 'value')
@@ -195,6 +211,103 @@ test('failed imported open retries a real pre-transfer cleanup exception', { ski
   }, 'failed-import-cleanup-retried')
   t.end()
 })
+
+for (const phase of ['reserved', 'open']) {
+  const owner = phase === 'reserved' ? 'import' : 'location'
+  test(`failed ${phase} ${owner} terminally cleans up when every graceful close faults`,
+    { skip: !nativeFaults }, function (t) {
+      const packagePath = JSON.stringify(require.resolve('..'))
+      const bindingPath = JSON.stringify(require.resolve('../binding'))
+      const phaseValue = JSON.stringify(phase)
+      const marker = `failed-${phase}-${owner}-terminally-cleaned`
+      const script = `
+        'use strict'
+        const assert = require('node:assert/strict')
+        const temporaryDirectory = require(${temporaryDirectoryPath})
+        const { RocksLevel } = require(${packagePath})
+        const binding = require(${bindingPath})
+        const phase = ${phaseValue}
+
+        const rejection = async (promise) => {
+          try {
+            await promise
+          } catch (err) {
+            return err
+          }
+          return null
+        }
+
+        const contextOf = (db) => {
+          const symbol = Object.getOwnPropertySymbols(db)
+            .find((symbol) => symbol.description === 'context')
+          return db[symbol]
+        }
+
+        ;(async () => {
+          const location = temporaryDirectory()
+          const source = phase === 'reserved' ? await RocksLevel.open(location) : null
+          if (source !== null) await source.put('key', 'value')
+
+          const imported = phase === 'reserved'
+            ? new RocksLevel(source.handle, { parallelism: 0 })
+            : new RocksLevel(location)
+          const context = contextOf(imported)
+          const originalOpen = binding.db_open
+          const originalClose = binding.db_close
+          const completionError = new Error('synthetic error after native open admission')
+          let closeCalls = 0
+
+          if (phase === 'open') {
+            binding.db_open = (context, options, callback) => {
+              originalOpen(context, options, (err, columns) => {
+                callback(err || completionError, columns)
+              })
+            }
+          }
+          binding.db_close = function (...args) {
+            closeCalls++
+            return originalClose(...args)
+          }
+
+          let err
+          try {
+            err = await rejection(imported.open())
+          } finally {
+            binding.db_open = originalOpen
+            binding.db_close = originalClose
+          }
+
+          assert.equal(err?.code, 'LEVEL_DATABASE_NOT_OPEN')
+          if (phase === 'reserved') {
+            assert.match(err?.cause?.message, /parallelism/)
+          } else {
+            assert.equal(err?.cause, completionError)
+          }
+          assert.equal(closeCalls, 3)
+          assert.equal(imported.status, 'closed')
+          assert.equal(binding.db_is_closed(context), true)
+          await imported.close()
+
+          if (source !== null) {
+            assert.equal(await source.get('key'), 'value')
+            await source.close()
+          }
+          const reopened = await RocksLevel.open(location, { createIfMissing: false })
+          if (source !== null) assert.equal(await reopened.get('key'), 'value')
+          await reopened.close()
+          console.log(${JSON.stringify(marker)})
+        })().catch((err) => {
+          console.error(err)
+          process.exitCode = 1
+        })
+      `
+
+      runChild(t, script, {
+        ROCKS_LEVEL_TEST_DB_CLOSE_EXCEPTION_BEFORE_TRANSFER_REMAINING: '6'
+      }, marker)
+      t.end()
+    })
+}
 
 test('database finalizer retries a pre-transfer close exception', { skip: !nativeFaults }, function (t) {
   const bindingPath = JSON.stringify(require.resolve('../binding'))
@@ -334,23 +447,15 @@ test('terminal exception after ownership transfer releases the database', { skip
     const temporaryDirectory = require(${temporaryDirectoryPath})
     const { RocksLevel } = require(${packagePath})
 
-    const rejection = async (promise) => {
-      try {
-        await promise
-      } catch (err) {
-        return err
-      }
-      return null
-    }
-
     ;(async () => {
       const location = temporaryDirectory()
       const db = await RocksLevel.open(location)
       await db.put('key', 'value')
 
-      const err = await rejection(db.close())
-      assert.equal(err?.code, 'LEVEL_DATABASE_NOT_CLOSED')
-      assert.match(err?.cause?.message, /Injected database close exception after ownership transfer/)
+      // The callback fault happens after native ownership has transferred and
+      // the context reports itself closed. The private close hook therefore
+      // fulfills so abstract-level records the truthful terminal state.
+      await db.close()
       assert.equal(db.status, 'closed')
       await db.close()
 
@@ -382,15 +487,6 @@ test('terminal exception classifies an imported final lease as closed', { skip: 
     const temporaryDirectory = require(${temporaryDirectoryPath})
     const { RocksLevel } = require(${packagePath})
 
-    const rejection = async (promise) => {
-      try {
-        await promise
-      } catch (err) {
-        return err
-      }
-      return null
-    }
-
     ;(async () => {
       const location = temporaryDirectory()
       const source = await RocksLevel.open(location)
@@ -401,9 +497,10 @@ test('terminal exception classifies an imported final lease as closed', { skip: 
       // This is not the final lease, so it returns before the transfer fault.
       await source.close()
 
-      const err = await rejection(imported.close())
-      assert.equal(err?.code, 'LEVEL_DATABASE_NOT_CLOSED')
-      assert.match(err?.cause?.message, /Injected database close exception after ownership transfer/)
+      // The final imported lease observes a callback fault only after native
+      // ownership has transferred. Its private close hook fulfills because
+      // the shared context is already terminal.
+      await imported.close()
       assert.equal(imported.status, 'closed')
       await imported.close()
 
@@ -432,25 +529,15 @@ test('multi-column destruction exceptions finish terminal cleanup', { skip: !nat
     const { RocksLevel } = require(${packagePath})
 
     const columns = { default: {}, first: {}, second: {} }
-    const rejection = async (promise) => {
-      try {
-        await promise
-      } catch (err) {
-        return err
-      }
-      return null
-    }
-
     ;(async () => {
       const location = temporaryDirectory()
       const db = await RocksLevel.open(location, { columns })
       await db.put('key', 'value')
 
       // Countdown two destroys one handle before throwing. Terminal cleanup
-      // must destroy both handles still owned locally and close the database.
-      const err = await rejection(db.close())
-      assert.equal(err?.code, 'LEVEL_DATABASE_NOT_CLOSED')
-      assert.match(err?.cause?.message, /Injected database column destruction exception/)
+      // destroys both handles still owned locally and closes the database, so
+      // the private close hook fulfills despite the terminal callback fault.
+      await db.close()
       assert.equal(db.status, 'closed')
       await db.close()
 

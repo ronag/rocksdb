@@ -254,13 +254,14 @@ test('chained batch write preserves falsy listener errors', async function (t) {
   t.end()
 })
 
-test('public chained mutations defer reentrant database close', async function (t) {
+test('public chained mutations reject when an options getter starts database close', async function (t) {
   for (const [name, mutate] of [
     ['put', (batch, options) => batch.put('key', 'value', options)],
     ['del', (batch, options) => batch.del('key', options)]
   ]) {
     const db = testCommon.factory()
     await db.open()
+    await db.put('key', 'original')
     const batch = db.batch()
     let closing
     let nestedError
@@ -282,19 +283,25 @@ test('public chained mutations defer reentrant database close', async function (
       }
     })
 
-    let result
-    t.doesNotThrow(() => {
-      result = mutate(batch, options)
-    }, `${name} does not leak an unsafe assertion when its options close the database`)
-    t.equal(result, batch, `${name} completes its accepted synchronous mutation`)
+    let mutationError
+    try {
+      mutate(batch, options)
+    } catch (err) {
+      mutationError = err
+    }
+
     t.equal(nestedError && nestedError.code, 'LEVEL_BATCH_NOT_OPEN',
-      `${name} rejects a later nested mutation once close is requested`)
+      `${name} rejects the nested public mutation after close changes batch status`)
+    t.equal(mutationError && mutationError.code, 'LEVEL_BATCH_BUSY',
+      `${name} rejects when its private hook observes the pending native close`)
+    t.equal(batch.length, 0, `${name} does not admit the interrupted operation`)
     await closing
     t.ok(optionReads > 0, `${name} exercised the reentrant option accessor`)
-    t.equal(db.status, 'closed', `${name} lets the deferred database close land`)
+    t.equal(db.status, 'closed', `${name} lets the database close land`)
 
     await db.open({ createIfMissing: false })
-    t.equal(await db.get('key'), undefined, `${name} close discarded the unwritten batch`)
+    t.equal(await db.get('key'), 'original', `${name} leaves the existing value unchanged`)
+    t.equal(await db.get('nested'), undefined, `${name} does not admit the nested put`)
     await db.close()
   }
 
@@ -367,7 +374,7 @@ test('raw chained _clear retains documented v3 private bookkeeping', async funct
   t.end()
 })
 
-test('public getMany allows explicitly bounded partial results', async function (t) {
+test('public getMany rejects explicitly bounded incomplete results', async function (t) {
   const db = testCommon.factory({ valueEncoding: 'utf8' })
   await db.open()
   const value = 'x'.repeat(1024)
@@ -377,10 +384,13 @@ test('public getMany allows explicitly bounded partial results', async function 
     value
   })))
 
-  const rows = await db.getMany(['key0', 'key1', 'key2'], { highWaterMarkBytes: 0 })
-  t.equal(rows.length, 3, 'returns one slot per requested key')
-  t.ok(rows.includes(null), 'the explicit high-water mark can return partial results')
-  t.ok(rows.every((row) => row === null || row === value), 'each slot is a value or an explicit partial marker')
+  const err = await rejection(db.getMany(
+    ['key0', 'key1', 'key2'],
+    { highWaterMarkBytes: 0 }
+  ))
+  t.equal(err && err.code, 'LEVEL_ABORTED', 'incomplete public reads reject atomically')
+  t.same(await db.getMany(['key0', 'key1', 'key2']), [value, value, value],
+    'an unbounded public read still returns every value')
   await db.close()
   t.end()
 })
@@ -426,8 +436,18 @@ test('raw bounded getMany preserves partial markers', async function (t) {
   t.end()
 })
 
-test('bounded getMany preserves partial markers across value decoding', async function (t) {
-  const db = testCommon.factory({ valueEncoding: 'hex' })
+test('bounded getMany rejects before custom value decoding', async function (t) {
+  let decodeCalls = 0
+  const valueEncoding = {
+    name: 'bounded-public-values',
+    format: 'buffer',
+    encode: value => Buffer.from(value, 'hex'),
+    decode (value) {
+      decodeCalls++
+      return value.toString('hex')
+    }
+  }
+  const db = testCommon.factory({ valueEncoding })
   await db.open()
   await db.batch(['key0', 'key1', 'key2'].map((key) => ({
     type: 'put',
@@ -435,16 +455,21 @@ test('bounded getMany preserves partial markers across value decoding', async fu
     value: 'ff'.repeat(1024)
   })))
 
-  const rows = await db.getMany(['key0', 'key1', 'key2'], { highWaterMarkBytes: 0 })
-  t.ok(rows.includes(null), 'bounded reads expose at least one partial marker')
-  t.ok(rows.every((row) => row === null || row === 'ff'.repeat(1024)),
-    'hex decoding leaves partial markers intact')
+  const err = await rejection(db.getMany(
+    ['key0', 'key1', 'key2'],
+    { highWaterMarkBytes: 0 }
+  ))
+  t.equal(err && err.code, 'LEVEL_ABORTED', 'incomplete public reads reject')
+  t.equal(decodeCalls, 0, 'incomplete markers never reach the public decoder')
+  t.same(await db.getMany(['key0', 'key1', 'key2']), Array(3).fill('ff'.repeat(1024)),
+    'complete public reads still use the custom decoder')
+  t.equal(decodeCalls, 3, 'the custom decoder receives only complete values')
 
   await db.close()
   t.end()
 })
 
-test('bounded sublevel getMany preserves partial markers across nested decoding', async function (t) {
+test('bounded sublevel getMany rejects incomplete nested reads', async function (t) {
   const db = testCommon.factory()
   await db.open()
   const targets = [
@@ -459,14 +484,17 @@ test('bounded sublevel getMany preserves partial markers across nested decoding'
       value: 'ff'.repeat(1024)
     })))
 
-    const rows = await target.getMany(['key0', 'key1', 'key2'], { highWaterMarkBytes: 0 })
-    t.ok(rows.includes(null), `${name} exposes at least one partial marker`)
-    t.ok(rows.every((row) => row === null || row === 'ff'.repeat(1024)),
-      `${name} leaves partial markers intact`)
+    const err = await rejection(target.getMany(
+      ['key0', 'key1', 'key2'],
+      { highWaterMarkBytes: 0 }
+    ))
+    t.equal(err && err.code, 'LEVEL_ABORTED', `${name} rejects incomplete reads`)
 
     for (const primitive of [1, 'ignored']) {
       const complete = await target.getMany(['key0', 'key1', 'key2'], primitive)
       t.equal(complete.length, 3, `${name} preserves primitive-options defaulting`)
+      t.ok(complete.every(value => value === 'ff'.repeat(1024)),
+        `${name} returns only decoded values for complete reads`)
     }
   }
 
@@ -490,6 +518,7 @@ test('single get never returns a partial marker', async function (t) {
       'single-key aborts use the singular message')
 
     const manyErr = await rejection(db.getMany(['one', 'two']))
+    t.equal(manyErr && manyErr.code, 'LEVEL_ABORTED', 'partial multi-key reads reject')
     t.equal(manyErr && manyErr.message, 'Multi-get stopped before every value was read',
       'multi-key aborts keep the plural message')
   } finally {
