@@ -167,6 +167,19 @@ test('slice getMany converts unpacked and packed native values to Slice objects'
     t.ok(large[0] instanceof Slice, `${name} auto converts an unpacked value to Slice`)
   }
 
+  const unexposed = await db._getManyAsync(
+    ['a', 'missing', 'empty'],
+    { packed: 'auto', valueEncoding: 'slice' },
+    undefined,
+    false,
+    undefined,
+    false
+  )
+  t.equal(Object.hasOwn(unexposed, 'packed'), false, 'async can omit the packed discriminator')
+  t.ok(unexposed[0] instanceof Slice, 'unexposed packed values remain Slice objects')
+  t.equal(unexposed[1], undefined, 'unexposed packed values preserve missing keys')
+  t.equal(unexposed[0].buffer, unexposed[2].buffer, 'unexposed slices still share the packed arena')
+
   await db.close()
   t.end()
 })

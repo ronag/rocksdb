@@ -17,6 +17,7 @@ import {
   RocksRawBoundedGetManyOptions,
   RocksRawGetManyOptions,
   RocksRawGetManyResult,
+  RocksRawGetManyValues,
   RocksRawUnboundedGetManyOptions,
   RocksRawIteratorResult,
   RocksStatistics,
@@ -262,6 +263,33 @@ expectTrue<Equal<
   Awaited<typeof autoRawValues>,
   RocksPackedGetManyResult | RocksRawGetManyResult<'buffer', false, false>
 >>()
+const unexposedSliceValues = db._getManyAsync(
+  [slice],
+  { packed: 'auto', valueEncoding: 'slice' },
+  undefined,
+  false,
+  undefined,
+  false
+)
+expectTrue<Equal<
+  Awaited<typeof unexposedSliceValues>,
+  RocksRawGetManyValues<'slice', false>
+>>()
+unexposedSliceValues.then((values) => {
+  // @ts-expect-error exposePacked false omits the packed discriminator
+  void values.packed
+})
+// @ts-expect-error Unexposed values require an explicit JavaScript encoding
+db._getManyAsync([slice], { packed: 'auto' }, undefined, false, undefined, false)
+db._getManyAsync(
+  [slice],
+  // @ts-expect-error Buffer encoding cannot guarantee a plain value array
+  { packed: 'auto', valueEncoding: 'buffer' },
+  undefined,
+  false,
+  undefined,
+  false
+)
 db._getManyAsync([slice], { packed: 'auto' }, (err, result, packed) => {
   expectType<Error | null | undefined>(err)
   expectTrue<Equal<
@@ -322,6 +350,21 @@ db._getManyAsync(
     expectTrue<Equal<typeof packed, false | undefined>>()
   },
   optionalBooleanFlag
+)
+db._getManyAsync(
+  [slice],
+  { packed: 'auto', valueEncoding: 'slice' },
+  (err, result, packed) => {
+    expectType<Error | null | undefined>(err)
+    expectTrue<Equal<
+      typeof result,
+      RocksRawGetManyValues<'slice', false> | undefined
+    >>()
+    expectTrue<Equal<typeof packed, boolean | undefined>>()
+  },
+  false,
+  undefined,
+  false
 )
 expectType<RocksPackedGetManyResult>(
   db._getManySync([slice], { packed: true, valueEncoding: 'buffer' })
