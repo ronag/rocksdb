@@ -1,11 +1,10 @@
 import assert from 'node:assert'
 import { Buffer } from 'node:buffer'
 import { Slice } from '@nxtedition/slice'
-import { AbstractIterator } from 'abstract-level'
+import { AbstractIterator, AbstractKeyIterator, AbstractValueIterator } from 'abstract-level'
 import { fromCallback } from 'catering'
 import ModuleError = require('module-error')
 import binding = require('./binding')
-import { iteratePublicIterator } from './public-lifecycle'
 import { getPackedMode, setPackedResult } from './util'
 
 const kPromise = Symbol('promise')
@@ -18,31 +17,25 @@ const kCache = Symbol('cache')
 const kFinished = Symbol('finished')
 const kFirst = Symbol('first')
 const kPosition = Symbol('position')
-const kBusy = Symbol('busy')
-const kPendingClose = Symbol('pendingClose')
-const kCloseRequested = Symbol('closeRequested')
-const kPublicSeek = Symbol('publicSeek')
+const kNativeBusy = Symbol('nativeBusy')
+const kNativeSeek = Symbol('nativeSeek')
 const kUnsafeBusy = Symbol('unsafeBusy')
-const kNoFieldsNext = Symbol('noFieldsNext')
 const kKeys = Symbol('keys')
 const kValues = Symbol('values')
 const kKeyEncoding = Symbol('keyEncoding')
 const kValueEncoding = Symbol('valueEncoding')
+const kNext = Symbol('next')
 const kSeekSync = Symbol('seekSync')
 const kNextvSync = Symbol('nextvSync')
 const kNextvAsync = Symbol('nextvAsync')
 const kInitNextvAsync = Symbol('initNextvAsync')
 const kCompleteNextv = Symbol('completeNextv')
 const kFinishInitialization = Symbol('finishInitialization')
-const kPublicFirstUse = Symbol('publicFirstUse')
-const kPublicCleanup = Symbol('publicCleanup')
-const kCleanupDebt = Symbol('cleanupDebt')
-const kCleanupDebtClose = Symbol('cleanupDebtClose')
-const kPublicClose = Symbol('publicClose')
-const kCloseCleanupDebt = Symbol('closeCleanupDebt')
+const kCloseNative = Symbol('closeNative')
+const kAbstractKeyEncoding = (AbstractIterator as any).keyEncoding
+const kAbstractValueEncoding = (AbstractIterator as any).valueEncoding
 
 const kEmpty = Object.freeze([])
-const noFieldsNextOptions = Object.freeze({ [kNoFieldsNext]: true })
 const DEBUG = process.env.NODE_ENV !== 'production'
 
 const kUninitialized = 0
@@ -50,6 +43,8 @@ const kInitializing = 1
 const kReady = 2
 const kFailed = 3
 const kClosed = 4
+
+const identity = value => value
 
 const getTypedArrayByteLength = Object.getOwnPropertyDescriptor(
   Object.getPrototypeOf(Object.getPrototypeOf(Buffer.prototype)),
@@ -99,6 +94,35 @@ function snapshotSeekTarget (target) {
   return copyBytesFrom(target.buffer, target.byteOffset, target.byteLength)
 }
 
+function prepareAbstractIteratorOptions (options) {
+  if (typeof options !== 'object' || options === null) return options
+
+  const keyDecoder = Reflect.get(options, kAbstractKeyEncoding, options)
+  const valueDecoder = Reflect.get(options, kAbstractValueEncoding, options)
+  if (keyDecoder != null && valueDecoder != null) return options
+
+  const keyEncoding = Reflect.get(options, 'keyEncoding', options) ?? 'buffer'
+  const valueEncoding = Reflect.get(options, 'valueEncoding', options) ?? 'buffer'
+  const fallback = (name, encoding) => ({
+    name: `rocks-level-raw-${name}`,
+    format: encoding === 'utf8' || encoding === 'utf-8' ? 'utf8' : 'buffer',
+    encode: identity,
+    decode: identity
+  })
+  const abstractKeyEncoding = keyDecoder ?? fallback('key', keyEncoding)
+  const abstractValueEncoding = valueDecoder ?? fallback('value', valueEncoding)
+
+  return new Proxy(options, {
+    get (target, property) {
+      if (property === kAbstractKeyEncoding) return abstractKeyEncoding
+      if (property === kAbstractValueEncoding) return abstractValueEncoding
+      if (property === 'keyEncoding') return keyEncoding
+      if (property === 'valueEncoding') return valueEncoding
+      return Reflect.get(options, property, options)
+    }
+  })
+}
+
 function iteratorBusyError (operation) {
   return new ModuleError(
     `Iterator is busy: cannot call ${operation}() until the previous operation has completed`,
@@ -119,8 +143,7 @@ function assertIteratorIdle (iterator, operation) {
     iterator[kInitState] !== kInitializing,
     `unsafe ${operation}() must not overlap iterator initialization`
   )
-  assert(!iterator[kCloseRequested], `unsafe ${operation}() must not overlap close()`)
-  assert(!iterator[kBusy], `unsafe ${operation}() must not overlap another operation`)
+  assert(!iterator[kNativeBusy], `unsafe ${operation}() must not overlap another operation`)
   assert(!iterator[kUnsafeBusy], `unsafe ${operation}() must not overlap another unsafe operation`)
 }
 
@@ -227,6 +250,7 @@ class Iterator extends AbstractIterator<any, any, any> {
   [key: symbol]: any
 
   constructor (db, context, options) {
+    options = prepareAbstractIteratorOptions(options)
     super(db, options)
 
     try {
@@ -253,15 +277,7 @@ class Iterator extends AbstractIterator<any, any, any> {
       this[kCache] = kEmpty
       this[kFinished] = false
       this[kPosition] = 0
-      this[kBusy] = false
-      this[kPendingClose] = null
-      this[kCloseRequested] = false
-      this[kPublicSeek] = false
-      this[kPublicCleanup] = 0
-      this[kCleanupDebt] = null
-      this[kCleanupDebtClose] = null
-      this[kPublicFirstUse] = false
-      this[kPublicClose] = null
+      this[kNativeBusy] = false
       if (DEBUG) this[kUnsafeBusy] = false
     } catch (err) {
       // AbstractIterator attaches itself to the database in super(). A failed
@@ -391,208 +407,46 @@ class Iterator extends AbstractIterator<any, any, any> {
     return err
   }
 
-  [Symbol.asyncDispose] () {
-    return this.close()
-  }
-
-  next () {
-    if (DEBUG) assert(!this[kUnsafeBusy], 'public next() must not overlap an unsafe operation')
-    if (!this[kBusy] || this[kCloseRequested]) return super.next()
-
-    return Promise.reject(iteratorBusyError('next'))
-  }
-
-  nextv (size, options?): any {
-    if (DEBUG) assert(!this[kUnsafeBusy], 'public nextv() must not overlap an unsafe operation')
-    if (!this[kBusy] || this[kCloseRequested]) {
-      const previous = this[kPublicFirstUse]
-      // Explicit read options are inspected only after lazy initialization in
-      // the existing path. Keep that exception/access ordering; the common
-      // no-options form can safely initialize and read in one worker.
-      const fuse = options === undefined || options === noFieldsNextOptions
-      this[kPublicFirstUse] = fuse
-      try {
-        return super.nextv(size, options)
-      } finally {
-        this[kPublicFirstUse] = previous
-      }
-    }
-
-    const err = Number.isInteger(size)
-      ? iteratorBusyError('nextv')
-      : new TypeError("The first argument 'size' must be an integer")
-    return Promise.reject(err)
-  }
-
-  all (options?): any {
-    if (DEBUG) assert(!this[kUnsafeBusy], 'public all() must not overlap an unsafe operation')
-    if (!this[kBusy] || this[kCloseRequested]) {
-      const previous = this[kPublicFirstUse]
-      // Explicit objects can gain own or inherited options while the lazy
-      // initializer is running. Preserve initialization-before-option-access
-      // ordering for every caller-owned object; only omission is immutable.
-      const fuse = options === undefined
-      this[kPublicFirstUse] = fuse
-      try {
-        return super.all(options)
-      } finally {
-        this[kPublicFirstUse] = previous
-      }
-    }
-
-    return Promise.reject(iteratorBusyError('all'))
-  }
-
-  seek (target, options?) {
-    if (DEBUG) assert(!this[kUnsafeBusy], 'public seek() must not overlap an unsafe operation')
-    if (this[kCloseRequested]) return super.seek(target, options)
-    if (this[kBusy]) throw iteratorBusyError('seek')
-
-    this[kBusy] = true
-    this[kPublicSeek] = true
-    try {
-      return super.seek(target, options)
-    } finally {
-      this[kPublicSeek] = false
-      this[kBusy] = false
-      this._flushPendingClose()
-    }
-  }
-
-  close () {
-    if (DEBUG) assert(!this[kUnsafeBusy], 'public close() must not overlap an unsafe operation')
-    this[kCloseRequested] = true
-
-    if (this[kPublicClose] !== null) return this[kPublicClose]
-    if (this[kCleanupDebt] !== null) return this[kCloseCleanupDebt]()
-
-    const previousDebt = this[kCleanupDebt]
-    this[kPublicCleanup]++
-    const promise = (async () => {
-      try {
-        await super.close()
-        const debt = this[kCleanupDebt]
-        if (debt !== previousDebt) {
-          // AbstractIterator detached us after our promise hook completed. If
-          // database shutdown owned this close, restore the attachment so a
-          // later db.close() retries the native cleanup before closing RocksDB.
-          if (this.db.status === 'closing') this.db.attachResource(this)
-          throw debt.error
-        }
-      } finally {
-        this[kPublicCleanup]--
-      }
-    })()
-    this[kPublicClose] = promise
-
-    const clear = () => {
-      if (this[kPublicClose] === promise) this[kPublicClose] = null
-    }
-    promise.then(clear, clear)
-    return promise
-  }
-
-  [kCloseCleanupDebt] () {
-    const debt = this[kCleanupDebt]
-    const active = this[kCleanupDebtClose]
-    if (active !== null && active.debt === debt) return active.promise
-
-    const group: any = { debt, promise: null }
-    group.promise = new Promise<void>((resolve, reject) => {
-      process.nextTick(() => {
-        let err
-        try {
-          this._closeSync()
-        } catch (cause) {
-          err = cause
-        }
-
-        if (this[kCleanupDebt] === debt) {
-          this[kCleanupDebt] = err ? { error: err } : null
-        }
-
-        if (err) {
-          reject(err)
-        } else {
-          this.db.detachResource(this)
-          resolve()
-        }
-      })
-    })
-    this[kCleanupDebtClose] = group
-
-    const clear = () => {
-      if (this[kCleanupDebtClose] === group) this[kCleanupDebtClose] = null
-    }
-    group.promise.then(clear, clear)
-    return group.promise
-  }
-
-  [Symbol.asyncIterator] () {
-    return iteratePublicIterator(this)
-  }
-
   _seek (target) {
-    if (this[kPublicSeek] && this[kCloseRequested]) return
-    if (this[kInitState] === kUninitialized) {
-      if (DEBUG && !this[kPublicSeek]) assertIteratorIdle(this, '_seek')
-      let initialTarget
-      if (this[kPublicSeek]) {
-        initialTarget = snapshotSeekTarget(target)
-      } else {
-        initialTarget = DEBUG ? normalizeSeekTarget(target) : target
+    if (this[kInitState] === kClosed) return
+    if (this[kNativeBusy]) throw iteratorBusyError('seek')
+    if (DEBUG) assert(!this[kUnsafeBusy], 'public seek() must not overlap an unsafe operation')
+
+    this[kNativeBusy] = kNativeSeek
+    try {
+      if (this[kInitState] === kUninitialized) {
+        const initialTarget = snapshotSeekTarget(target)
+        if (this[kInitState] === kClosed) return
+        if (this[kInitState] !== kUninitialized) throw iteratorBusyError('seek')
+
+        this[kInitialTarget] = initialTarget
+        this[kFirst] = true
+        this[kCache] = kEmpty
+        this[kFinished] = false
+        this[kPosition] = 0
+        return
       }
-      if (this[kPublicSeek] && this[kCloseRequested]) return
 
-      this[kInitialTarget] = initialTarget
-      this[kFirst] = true
-      this[kCache] = kEmpty
-      this[kFinished] = false
-      this[kPosition] = 0
-      return
-    }
-    if (this[kPublicSeek]) return this[kSeekSync](target, true)
-    this._seekSync(target)
-  }
-
-  _close (callback?) {
-    if (callback === undefined) {
-      return new Promise<void>((resolve, reject) => {
-        this._close(err => err ? reject(err) : resolve())
-      })
-    }
-
-    // AbstractIterator serializes its async public operations. kBusy is only
-    // needed for synchronous public seek accessors that reenter close(). Raw
-    // methods deliberately do not acquire cleanup debt or close ownership.
-    const publicCleanup = this[kPublicCleanup] > 0
-    if (DEBUG && !publicCleanup) assertIteratorIdle(this, '_close')
-    const complete = (err) => {
-      if (err && publicCleanup) {
-        this[kCleanupDebt] = { error: err }
-        callback()
-      } else {
-        callback(err)
-      }
-    }
-
-    if (publicCleanup && this[kBusy]) {
-      this[kPendingClose] = complete
-    } else {
-      this._closeAsync(complete)
+      this[kSeekSync](target, true)
+    } finally {
+      this[kNativeBusy] = false
     }
   }
 
-  _flushPendingClose () {
-    if (!this[kBusy] && this[kPendingClose]) {
-      const callback = this[kPendingClose]
-      this[kPendingClose] = null
-      this._closeAsync(callback)
+  async _close () {
+    if (this[kNativeBusy] && this[kNativeBusy] !== kNativeSeek) {
+      throw iteratorBusyError('close')
     }
-  }
 
-  _end (callback) {
-    this._close(callback)
+    if (DEBUG) {
+      assert(
+        this[kInitState] !== kInitializing,
+        'public close() must not overlap iterator initialization'
+      )
+      assert(!this[kUnsafeBusy], 'public close() must not overlap an unsafe operation')
+    }
+
+    this[kCloseNative]()
   }
 
   // Undocumented, exposed for tests only
@@ -601,22 +455,55 @@ class Iterator extends AbstractIterator<any, any, any> {
   }
 
   _next (callback) {
-    if (callback === undefined) {
-      return new Promise((resolve, reject) => {
-        this._next(function (err, key, value) {
-          if (err) reject(err)
-          else if (arguments.length < 3) resolve(undefined)
-          else resolve([key, value])
-        })
-      })
+    if (DEBUG) assert(!this[kUnsafeBusy], 'unsafe _next() must not overlap an unsafe operation')
+    const owned = callback === undefined
+    if (this[kNativeBusy]) {
+      const err = iteratorBusyError('next')
+      if (owned) return Promise.reject(err)
+      process.nextTick(callback, err)
+      return this
     }
 
-    if (DEBUG) assert(!this[kUnsafeBusy], 'unsafe _next() must not overlap an unsafe operation')
+    this[kNativeBusy] = true
+    const iterator = this
+    if (!owned) {
+      const complete = callback
+      callback = function () {
+        iterator[kNativeBusy] = false
+        return Reflect.apply(complete, undefined, arguments as any)
+      }
 
+      try {
+        return this[kNext](callback)
+      } catch (err) {
+        this[kNativeBusy] = false
+        process.nextTick(complete, err)
+        return this
+      }
+    }
+
+    return new Promise((resolve, reject) => {
+      const complete = function (err, key, value) {
+        iterator[kNativeBusy] = false
+        if (err) reject(err)
+        else if (arguments.length < 3) resolve(undefined)
+        else resolve([key, value])
+      }
+
+      try {
+        iterator[kNext](complete)
+      } catch (err) {
+        iterator[kNativeBusy] = false
+        reject(err)
+      }
+    })
+  }
+
+  [kNext] (callback) {
     if (this[kInitState] !== kReady && this[kInitState] !== kUninitialized) {
       this._initialize((err) => {
         if (err) callback(err)
-        else this._next(callback)
+        else this[kNext](callback)
       })
       return this
     }
@@ -659,7 +546,7 @@ class Iterator extends AbstractIterator<any, any, any> {
           callback(err)
           return
         }
-        this._next(callback)
+        this[kNext](callback)
       }
     }
 
@@ -693,49 +580,54 @@ class Iterator extends AbstractIterator<any, any, any> {
 
   _nextv (size, options, callback) {
     if (DEBUG) assert(!this[kUnsafeBusy], 'unsafe _nextv() must not overlap an unsafe operation')
-    callback = fromCallback(callback, kPromise)
-    const publicFirstUse = this[kPublicFirstUse]
-    const combineInitialization = publicFirstUse === true ||
-      (typeof publicFirstUse === 'object' && publicFirstUse !== null && publicFirstUse !== options)
+    const owned = callback === undefined
+    if (this[kNativeBusy]) {
+      const err = iteratorBusyError('nextv')
+      if (owned) return Promise.reject(err)
+      process.nextTick(callback, err)
+      return
+    }
+
+    this[kNativeBusy] = true
+    try {
+      callback = fromCallback(callback, kPromise)
+    } catch (err) {
+      this[kNativeBusy] = false
+      throw err
+    }
+    const promise = callback[kPromise]
+    const complete = callback
+    callback = (err, entries?, finished?, limited?) => {
+      this[kNativeBusy] = false
+      complete(err, entries, finished, limited)
+    }
 
     const done = (err, val?) => {
       if (err) {
         callback(err)
       } else {
-        const { rows, finished, limited } = val
+        try {
+          const { rows, finished, limited } = val
 
-        const entries: any[][] = []
-        for (let n = 0; n < rows.length; n += 2) {
-          entries.push([rows[n + 0], rows[n + 1]])
+          const entries: any[][] = []
+          for (let n = 0; n < rows.length; n += 2) {
+            entries.push([rows[n + 0], rows[n + 1]])
+          }
+
+          callback(null, entries, finished, limited)
+        } catch (err) {
+          callback(err)
         }
-
-        callback(null, entries, finished, limited)
       }
     }
 
-    if (options === noFieldsNextOptions) {
-      if (this[kPosition] < this[kCache].length || this[kFinished]) {
-        this[kNextvAsync](size, null, done, false, false, combineInitialization)
-      } else {
-        const prefetch = this[kFirst] ? 1 : 1000
-        this[kFirst] = false
-
-        this[kNextvAsync](prefetch, null, (err, result) => {
-          if (err) return done(err)
-
-          this[kCache] = result.rows
-          this[kFinished] = result.finished
-          this[kPosition] = 0
-          done(null, this._nextvCached(size))
-        }, false, false, combineInitialization)
-      }
-
-      return callback[kPromise]
+    try {
+      this[kNextvAsync](size, options, done, false, false, true)
+    } catch (err) {
+      process.nextTick(done, err)
     }
 
-    this[kNextvAsync](size, options, done, false, false, combineInitialization)
-
-    return callback[kPromise]
+    return promise
   }
 
   // Supported unsafe user-space extensions. These methods deliberately bypass
@@ -776,7 +668,7 @@ class Iterator extends AbstractIterator<any, any, any> {
 
   [kSeekSync] (target, owned) {
     if (owned || DEBUG) target = normalizeSeekTarget(target)
-    if (owned && this[kCloseRequested]) return
+    if (owned && this[kInitState] === kClosed) return
 
     const discardedCount = (this[kCache].length - this[kPosition]) / 2
     this[kFirst] = true
@@ -786,7 +678,6 @@ class Iterator extends AbstractIterator<any, any, any> {
 
     if (this[kInitState] === kUninitialized) {
       const initialTarget = owned ? snapshotSeekTarget(target) : target
-      if (owned && this[kCloseRequested]) return
       this._initializeSync(initialTarget)
     } else {
       this._initializeSync()
@@ -1021,19 +912,7 @@ class Iterator extends AbstractIterator<any, any, any> {
     })
   }
 
-  // Terminal raw close. It intentionally leaves AbstractLevel's private
-  // public status untouched; a native failure leaves the resource attached so
-  // the caller can retry cleanup.
-  _closeSync () {
-    if (DEBUG) {
-      assert(
-        this[kInitState] !== kInitializing,
-        'unsafe _closeSync() must not overlap iterator initialization'
-      )
-      assert(!this[kBusy], 'unsafe _closeSync() must not overlap a public operation')
-      assert(!this[kUnsafeBusy], 'unsafe _closeSync() must not overlap an unsafe operation')
-    }
-
+  [kCloseNative] () {
     this[kCache] = kEmpty
 
     if (this[kContext]) {
@@ -1045,6 +924,22 @@ class Iterator extends AbstractIterator<any, any, any> {
     this[kInitCallbacks] = []
     this[kInitError] = null
     this[kInitialTarget] = null
+  }
+
+  // Terminal raw close. It intentionally leaves AbstractLevel's private
+  // public status untouched; a native failure leaves the resource attached so
+  // the caller can retry cleanup.
+  _closeSync () {
+    if (DEBUG) {
+      assert(
+        this[kInitState] !== kInitializing,
+        'unsafe _closeSync() must not overlap iterator initialization'
+      )
+      assert(!this[kNativeBusy], 'unsafe _closeSync() must not overlap another operation')
+      assert(!this[kUnsafeBusy], 'unsafe _closeSync() must not overlap an unsafe operation')
+    }
+
+    this[kCloseNative]()
     this.db.detachResource(this)
   }
 
@@ -1064,33 +959,95 @@ class Iterator extends AbstractIterator<any, any, any> {
   }
 }
 
-class ProjectedIterator extends Iterator {
-  #projection
+function projectEntries (entries, projection) {
+  for (let i = 0; i < entries.length; i++) entries[i] = entries[i][projection]
+  return entries
+}
 
-  constructor (db, context, options, projection) {
-    super(db, context, options)
-    this.#projection = projection
+function entryIteratorOptions (db, options, keys, values) {
+  const entryOptions = {
+    ...options,
+    keys,
+    values
   }
 
-  async next () {
-    const entry = await super.next()
-    return entry === undefined ? undefined : entry[this.#projection]
+  // The outer iterator owns user decoding. Decode the composed iterator only
+  // from the database's storage formats, as db.iterator() would.
+  entryOptions[kAbstractKeyEncoding] = db.keyEncoding(options.keyEncoding)
+  entryOptions[kAbstractValueEncoding] = db.valueEncoding(options.valueEncoding)
+  return entryOptions
+}
+
+class KeyIterator extends AbstractKeyIterator<any, any> {
+  #iterator
+
+  constructor (db, context, options) {
+    super(db, options)
+
+    try {
+      this.#iterator = new Iterator(db, context, entryIteratorOptions(db, options, true, false))
+    } catch (err) {
+      db.detachResource(this)
+      throw err
+    }
   }
 
-  async nextv (size, options?) {
-    const entries = await super.nextv(size, options)
-    return this.project(entries)
+  async _next () {
+    const entry = await this.#iterator.next()
+    return entry === undefined ? undefined : entry[0]
   }
 
-  async all (options?) {
-    const entries = await super.all(options)
-    return this.project(entries)
+  async _nextv (size, options) {
+    return projectEntries(await this.#iterator.nextv(size, options), 0)
   }
 
-  private project (entries) {
-    for (let i = 0; i < entries.length; i++) entries[i] = entries[i][this.#projection]
-    return entries
+  async _all (options) {
+    return projectEntries(await this.#iterator.all(options), 0)
+  }
+
+  _seek (target, options) {
+    this.#iterator.seek(target, options)
+  }
+
+  async _close () {
+    await this.#iterator.close()
   }
 }
 
-export { Iterator, ProjectedIterator, noFieldsNextOptions }
+class ValueIterator extends AbstractValueIterator<any, any, any> {
+  #iterator
+
+  constructor (db, context, options) {
+    super(db, options)
+
+    try {
+      this.#iterator = new Iterator(db, context, entryIteratorOptions(db, options, false, true))
+    } catch (err) {
+      db.detachResource(this)
+      throw err
+    }
+  }
+
+  async _next () {
+    const entry = await this.#iterator.next()
+    return entry === undefined ? undefined : entry[1]
+  }
+
+  async _nextv (size, options) {
+    return projectEntries(await this.#iterator.nextv(size, options), 1)
+  }
+
+  async _all (options) {
+    return projectEntries(await this.#iterator.all(options), 1)
+  }
+
+  _seek (target, options) {
+    this.#iterator.seek(target, options)
+  }
+
+  async _close () {
+    await this.#iterator.close()
+  }
+}
+
+export { Iterator, KeyIterator, ValueIterator }

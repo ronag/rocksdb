@@ -24,6 +24,14 @@ function mergeFactory () {
   })
 }
 
+async function writeRaw (batch) {
+  try {
+    await batch._writeAsync()
+  } finally {
+    await batch.close()
+  }
+}
+
 // Regression for the compareRev off-by-one: the final content byte was never
 // compared, so two revisions differing only in their last byte compared equal
 // and the strictly-larger one was silently not adopted by the maxRev merge.
@@ -37,13 +45,13 @@ test('maxRev adopts the larger revision when only the last byte differs', async 
   const b1 = db.batch()
   b1._merge('fwd', lo)
   b1._merge('fwd', hi)
-  await b1.write()
+  await writeRaw(b1)
   t.equal((await db.get('fwd')).toString('utf8', 1), '3-aab', 'lower then higher -> higher wins')
 
   const b2 = db.batch()
   b2._merge('rev', hi)
   b2._merge('rev', lo)
-  await b2.write()
+  await writeRaw(b2)
   t.equal((await db.get('rev')).toString('utf8', 1), '3-aab', 'higher then lower -> higher wins')
 
   await db.close()
@@ -58,7 +66,7 @@ test('maxRev compares the revision number before the rest', async function (t) {
   b._merge('k', makeVersion('1-zzz'))
   b._merge('k', makeVersion('3-aaa'))
   b._merge('k', makeVersion('2-mmm'))
-  await b.write()
+  await writeRaw(b)
   t.equal((await db.get('k')).toString('utf8', 1), '3-aaa', 'highest revision number wins')
 
   await db.close()
@@ -76,7 +84,7 @@ test('maxRev handles zero-content and oversized-prefix operands safely', async f
   const b = db.batch()
   b._merge('k', Buffer.from([0])) // declares 0 content bytes
   b._merge('k', makeVersion('1-aaa'))
-  await b.write()
+  await writeRaw(b)
   t.equal((await db.get('k')).toString('utf8', 1), '1-aaa', 'real value beats zero-content operand')
 
   // A length prefix far larger than the buffer must be clamped to the available
@@ -85,7 +93,7 @@ test('maxRev handles zero-content and oversized-prefix operands safely', async f
   const b2 = db.batch()
   b2._merge('m', Buffer.from([200, 0x41, 0x42])) // prefix (200) far exceeds size
   b2._merge('m', makeVersion('9-zzz'))
-  await b2.write()
+  await writeRaw(b2)
   t.ok(Buffer.isBuffer(await db.get('m')), 'oversized-prefix merge does not crash')
 
   await db.close()
@@ -108,7 +116,7 @@ test('maxRev orders high bytes (>= 0x80) as unsigned, matching the JS comparator
   const b1 = db.batch()
   b1._merge('fwd', lo)
   b1._merge('fwd', hi)
-  await b1.write()
+  await writeRaw(b1)
   t.deepEqual(
     [...(await db.get('fwd')).subarray(1)],
     [0x33, 0x2d, 0x80],
@@ -118,7 +126,7 @@ test('maxRev orders high bytes (>= 0x80) as unsigned, matching the JS comparator
   const b2 = db.batch()
   b2._merge('rev', hi)
   b2._merge('rev', lo)
-  await b2.write()
+  await writeRaw(b2)
   t.deepEqual(
     [...(await db.get('rev')).subarray(1)],
     [0x33, 0x2d, 0x80],

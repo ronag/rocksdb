@@ -18,6 +18,14 @@ async function rejection (promise) {
   return null
 }
 
+async function writeRaw (batch) {
+  try {
+    await batch._writeAsync()
+  } finally {
+    await batch.close()
+  }
+}
+
 test('explicit columns inherit top-level column options', async function (t) {
   let overrideReads = 0
   let overrideReceiver
@@ -45,13 +53,13 @@ test('explicit columns inherit top-level column options', async function (t) {
   inherited._merge('key', makeVersion('1-value'), { column: db.columns.default })
   inherited._merge('key', makeVersion('3-value'), { column: db.columns.default })
   inherited._merge('key', makeVersion('2-value'), { column: db.columns.default })
-  await inherited.write()
+  await writeRaw(inherited)
   t.equal((await db.get('key', { column: db.columns.default })).subarray(1).toString(), '3-value',
     'the default column inherits the top-level merge operator')
 
   const overridden = db._chainedBatch()
   overridden._merge('key', makeVersion('1-value'), { column: db.columns.plain })
-  const err = await rejection(overridden.write())
+  const err = await rejection(writeRaw(overridden))
   t.ok(err, 'an explicit per-column option overrides the inherited default')
   t.equal(overrideReads, 1, 'the per-column accessor is read once')
   t.is(overrideReceiver, plain, 'the per-column accessor keeps its original receiver')
@@ -72,7 +80,7 @@ test('frozen column maps inherit top-level column options', async function (t) {
   const batch = db._chainedBatch()
   batch._merge('key', makeVersion('1-value'), { column: db.columns.default })
   batch._merge('key', makeVersion('2-value'), { column: db.columns.default })
-  await batch.write()
+  await writeRaw(batch)
   t.equal((await db.get('key', { column: db.columns.default })).subarray(1).toString(), '2-value',
     'fixed data properties do not violate Proxy invariants')
 
@@ -104,7 +112,7 @@ test('virtual per-column options override inherited defaults', async function (t
 
   const batch = db._chainedBatch()
   batch._merge('key', makeVersion('1-value'), { column: db.columns.default })
-  const err = await rejection(batch.write())
+  const err = await rejection(writeRaw(batch))
   t.ok(err, 'a virtual non-undefined override wins over the top-level default')
   t.deepEqual(accesses, ['get'], 'the option is read before and without a presence check')
 
@@ -127,7 +135,7 @@ test('explicit empty per-column options suppress inherited defaults', async func
   for (const name of ['undefined', 'null', 'inherited']) {
     const batch = db._chainedBatch()
     batch._merge('key', makeVersion('1-value'), { column: db.columns[name] })
-    const err = await rejection(batch.write())
+    const err = await rejection(writeRaw(batch))
     t.match(err && err.message, /merge/i, `${name} suppresses the inherited merge operator`)
   }
 

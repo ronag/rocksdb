@@ -1,58 +1,38 @@
 import assert from 'node:assert'
 import { AbstractChainedBatch } from 'abstract-level'
 import { fromCallback } from 'catering'
-import combineErrors = require('maybe-combine-errors')
 import ModuleError = require('module-error')
 import binding = require('./binding')
 
 const kPromise = Symbol('promise')
 const kBatchContext = Symbol('batchContext')
 const kDbContext = Symbol('dbContext')
-const kLength = Symbol('length')
-const kAbstractLength = Symbol('abstractLength')
-const kRawWrite = Symbol('rawWrite')
+const kActiveOperation = Symbol('activeOperation')
+const kCloseRequested = Symbol('closeRequested')
+const kIdleBarrier = Symbol('idleBarrier')
+const kEnterOperation = Symbol('enterOperation')
+const kLeaveOperation = Symbol('leaveOperation')
+const kRunOperation = Symbol('runOperation')
+const kWaitForIdle = Symbol('waitForIdle')
 const kScheduleWrite = Symbol('scheduleWrite')
-const kUnsafeBusy = Symbol('unsafeBusy')
-const kPublicWriting = Symbol('publicWriting')
-const kPublicWriteToken = Symbol('publicWriteToken')
-const kPublicCleanup = Symbol('publicCleanup')
-const kPublicCloseStarted = Symbol('publicCloseStarted')
-const kCleanupDebt = Symbol('cleanupDebt')
-const kCleanupDebtClose = Symbol('cleanupDebtClose')
-const kCloseCleanupDebt = Symbol('closeCleanupDebt')
-const kPublicClose = Symbol('publicClose')
-const kWriteRawBatch = Symbol('writeRawBatch')
-const kPublicAdmissionDepth = Symbol('publicAdmissionDepth')
-const kRunPublicAdmission = Symbol('runPublicAdmission')
-const kPendingPublicClose = Symbol('pendingPublicClose')
-const kFlushPendingPublicClose = Symbol('flushPendingPublicClose')
+const kStartWrite = Symbol('startWrite')
+const kClearNative = Symbol('clearNative')
 
 const EMPTY = {}
 const DEBUG = process.env.NODE_ENV !== 'production'
 
-function batchBusyError (operation) {
+function batchBusyError (operation, active) {
   return new ModuleError(
-    `Batch is busy: cannot call ${operation}() while another operation is being admitted`,
+    `Batch is busy: cannot call ${operation}() while ${active} is in progress`,
     { code: 'LEVEL_BATCH_BUSY' }
   )
 }
 
-function batchNotOpenError (method) {
+function batchNotOpenError (operation) {
   return new ModuleError(
-    `Batch is not open: cannot call ${method}() after write() or close()`,
+    `Batch is not open: cannot call ${operation}() after write() or close()`,
     { code: 'LEVEL_BATCH_NOT_OPEN' }
   )
-}
-
-function assertBatchIdle (batch) {
-  assert(batch[kBatchContext], 'unsafe batch method requires an open batch')
-  assert(!batch[kPublicWriting], 'unsafe batch methods must not overlap a public write')
-  assert(!batch[kUnsafeBusy], 'unsafe batch methods must not overlap')
-}
-
-function combineCleanupError (operationError, cleanupError) {
-  if (!cleanupError || operationError === cleanupError) return operationError
-  return combineErrors([operationError, cleanupError])
 }
 
 class ChainedBatch extends AbstractChainedBatch<any, any, any> {
@@ -68,295 +48,50 @@ class ChainedBatch extends AbstractChainedBatch<any, any, any> {
       db.detachResource(this)
       throw err
     }
-    this[kLength] = 0
-    this[kAbstractLength] = 0
-    this[kRawWrite] = null
-    this[kPublicWriting] = false
-    this[kPublicWriteToken] = null
-    this[kPublicCleanup] = 0
-    this[kPublicCloseStarted] = 0
-    this[kCleanupDebt] = null
-    this[kCleanupDebtClose] = null
-    this[kPublicClose] = null
-    this[kPublicAdmissionDepth] = 0
-    this[kPendingPublicClose] = null
-    if (DEBUG) this[kUnsafeBusy] = false
+    this[kActiveOperation] = null
+    this[kCloseRequested] = false
+    this[kIdleBarrier] = null
   }
 
-  [Symbol.asyncDispose] () {
-    return this.close()
+  [kEnterOperation] (operation) {
+    if (this[kBatchContext] === null) throw batchNotOpenError(operation)
+
+    const active = this[kCloseRequested] ? 'close()' : this[kActiveOperation]
+    if (active !== null) throw batchBusyError(operation, active)
+
+    this[kActiveOperation] = operation
   }
 
-  get length () {
-    // Native length also includes custom raw operations such as _merge(), while
-    // super.length additionally includes prewrite operations that have not yet
-    // been materialized into the native batch. Subtract the overlap.
-    return this[kLength] + super.length - this[kAbstractLength]
+  [kLeaveOperation] () {
+    this[kActiveOperation] = null
+
+    const barrier = this[kIdleBarrier]
+    if (barrier !== null) {
+      this[kIdleBarrier] = null
+      barrier.resolve()
+    }
   }
 
-  put (key, value, options?) {
-    if (this[kRawWrite] !== null || this[kPendingPublicClose] !== null) {
-      throw batchNotOpenError('put')
-    }
-
-    return this[kRunPublicAdmission]('put', () => {
-      const result = super.put(key, value, options)
-      this[kAbstractLength]++
-      return result
-    })
-  }
-
-  del (key, options?) {
-    if (this[kRawWrite] !== null || this[kPendingPublicClose] !== null) {
-      throw batchNotOpenError('del')
-    }
-
-    return this[kRunPublicAdmission]('del', () => {
-      const result = super.del(key, options)
-      this[kAbstractLength]++
-      return result
-    })
-  }
-
-  clear () {
-    if (this[kRawWrite] !== null || this[kPendingPublicClose] !== null) {
-      throw batchNotOpenError('clear')
-    }
-
-    return this[kRunPublicAdmission]('clear', () => {
-      const result = super.clear()
-      this[kAbstractLength] = 0
-      return result
-    })
-  }
-
-  write (options?): any {
-    if (this[kRawWrite] !== null || this[kPublicClose] !== null ||
-        this[kPendingPublicClose] !== null || this[kCleanupDebt] !== null ||
-        this[kBatchContext] === null) {
-      return Promise.reject(batchNotOpenError('write'))
-    }
-    const previousDebt = this[kCleanupDebt]
-    const previousClose = this[kPublicCloseStarted]
-    let promise
-    let rawGroup: any = null
-
-    try {
-      this[kRunPublicAdmission]('write', () => {
-        this[kPublicCleanup]++
-        const previous = this[kPublicWriteToken]
-        this[kPublicWriteToken] = true
-
-        try {
-          // Custom unsafe operations (for example _merge()) are intentionally not
-          // reflected in AbstractChainedBatch's private length. Bridge only the
-          // write decision here, leaving those unsafe operation methods untouched.
-          if (this.length === 0) {
-            promise = super.close()
-          } else if (super.length === 0) {
-            let resolveClose
-            let rejectClose
-            const closeResult = new Promise<void>((resolve, reject) => {
-              resolveClose = resolve
-              rejectClose = reject
-            })
-            rawGroup = {
-              closeResult,
-              rejectClose,
-              resolveClose,
-              settled: false
-            }
-            closeResult.catch(() => {})
-            this[kRawWrite] = rawGroup
-            promise = this[kWriteRawBatch](options)
-          } else {
-            // abstract-level materializes queued prewrite operations synchronously
-            // before super.write() returns its promise. Count those as overlap too.
-            const before = this[kLength]
-            promise = super.write(options)
-            this[kAbstractLength] += this[kLength] - before
-          }
-        } catch (err) {
-          this[kPublicCleanup]--
-          throw err
-        } finally {
-          this[kPublicWriteToken] = previous
-        }
-      })
-    } catch (err) {
-      return Promise.reject(err)
-    }
-
-    return (async () => {
-      let operationError
-      let operationFailed = false
-      let value
-      try {
-        value = await promise
-      } catch (err) {
-        operationFailed = true
-        operationError = err
-      }
-
-      try {
-        // A write listener can throw after abstract-level has initiated close,
-        // but before our callback-based cleanup has recorded any cleanup debt.
-        // Join that close so both errors are visible to this write caller.
-        if (operationFailed && this[kPublicCloseStarted] !== previousClose) {
-          await super.close()
-        }
-      } finally {
-        this[kPublicCleanup]--
-      }
-
-      const debt = this[kCleanupDebt]
-      const cleanupError = debt !== previousDebt ? debt?.error : null
-      if (cleanupError && this.db.status === 'closing') this.db.attachResource(this)
-      if (rawGroup !== null) {
-        rawGroup.settled = true
-        if (cleanupError) {
-          rawGroup.rejectClose(cleanupError)
-        } else {
-          rawGroup.resolveClose()
-        }
-      }
-      const error = combineCleanupError(
-        operationError,
-        cleanupError
-      )
-      if (operationFailed || cleanupError) throw error
-      return value
-    })()
-  }
-
-  async [kWriteRawBatch] (options) {
-    let operationError
-    if (this[kLength] > 0) {
-      try {
-        await this._write(options)
-      } catch (err) {
-        operationError = err
-      }
-    }
-
-    try {
-      await super.close()
-    } catch (cleanupError) {
-      operationError = combineCleanupError(operationError, cleanupError)
-    }
-
-    if (operationError) throw operationError
-  }
-
-  close () {
-    if (this[kPublicAdmissionDepth] > 0) {
-      if (this[kPendingPublicClose] !== null) return this[kPendingPublicClose].promise
-
-      let landResolve
-      let landReject
-      const promise = new Promise((resolve, reject) => {
-        landResolve = resolve
-        landReject = reject
-      })
-      this[kPendingPublicClose] = { promise, resolve: landResolve, reject: landReject }
-      return promise
-    }
-
-    const rawGroup = this[kRawWrite]
-    if (rawGroup !== null && !rawGroup.settled) {
-      return rawGroup.closeResult
-    }
-
-    if (this[kPublicClose] !== null) return this[kPublicClose]
-    if (this[kCleanupDebt] !== null) return this[kCloseCleanupDebt]()
-
-    const previousDebt = this[kCleanupDebt]
-    this[kPublicCleanup]++
-    const promise = (async () => {
-      try {
-        await super.close()
-        const debt = this[kCleanupDebt]
-        if (debt !== previousDebt) {
-          // AbstractChainedBatch detached us after our promise hook completed.
-          // During database shutdown, restore ownership so db.close() retries
-          // this native cleanup before closing the database itself.
-          if (this.db.status === 'closing') this.db.attachResource(this)
-          throw debt.error
-        }
-      } finally {
-        this[kPublicCleanup]--
-      }
-    })()
-    this[kPublicClose] = promise
-
-    const clear = () => {
-      if (this[kPublicClose] === promise) this[kPublicClose] = null
-    }
-    promise.then(clear, clear)
-    return promise
-  }
-
-  [kFlushPendingPublicClose] () {
-    const pending = this[kPendingPublicClose]
-    if (this[kPublicAdmissionDepth] !== 0 || pending === null) return
-
-    this[kPendingPublicClose] = null
-    let closing
-    try {
-      closing = this.close()
-    } catch (err) {
-      pending.reject(err)
-      return
-    }
-    Promise.resolve(closing).then(pending.resolve, pending.reject)
-  }
-
-  [kRunPublicAdmission] (operation, fn) {
-    if (this[kPublicAdmissionDepth] !== 0) throw batchBusyError(operation)
-
-    this[kPublicAdmissionDepth]++
+  [kRunOperation] (operation, fn) {
+    this[kEnterOperation](operation)
     try {
       return fn()
     } finally {
-      this[kPublicAdmissionDepth]--
-      this[kFlushPendingPublicClose]()
+      this[kLeaveOperation]()
     }
   }
 
-  [kCloseCleanupDebt] () {
-    const debt = this[kCleanupDebt]
-    const active = this[kCleanupDebtClose]
-    if (active !== null && active.debt === debt) return active.promise
+  [kWaitForIdle] () {
+    if (this[kActiveOperation] === null) return Promise.resolve()
 
-    const group: any = { debt, promise: null }
-    group.promise = new Promise<void>((resolve, reject) => {
-      process.nextTick(() => {
-        let err
-        try {
-          this._closeSync()
-        } catch (cause) {
-          err = cause
-        }
-
-        if (this[kCleanupDebt] === debt) {
-          this[kCleanupDebt] = err ? { error: err } : null
-        }
-
-        if (err) {
-          reject(err)
-        } else {
-          this.db.detachResource(this)
-          resolve()
-        }
-      })
-    })
-    this[kCleanupDebtClose] = group
-
-    const clear = () => {
-      if (this[kCleanupDebtClose] === group) this[kCleanupDebtClose] = null
+    let barrier = this[kIdleBarrier]
+    if (barrier === null) {
+      let resolve
+      const promise = new Promise<void>(land => { resolve = land })
+      barrier = this[kIdleBarrier] = { promise, resolve }
     }
-    group.promise.then(clear, clear)
-    return group.promise
+
+    return barrier.promise
   }
 
   // Supported unsafe user-space extensions. Direct calls bypass AbstractLevel
@@ -371,163 +106,131 @@ class ChainedBatch extends AbstractChainedBatch<any, any, any> {
   // Append an encoded put. RocksDB copies key and value before return.
   _put (key, value, options) {
     if (DEBUG) {
-      assertBatchIdle(this)
       assert(key !== null && key !== undefined, 'unsafe _put() requires a key')
       assert(value !== null && value !== undefined, 'unsafe _put() requires a value')
     }
 
-    key = typeof key === 'string' ? Buffer.from(key) : key
-    value = typeof value === 'string' ? Buffer.from(value) : value
-
-    binding.batch_put(this[kBatchContext], key, value, options ?? EMPTY)
-    this[kLength]++
+    return this[kRunOperation]('_put', () => {
+      key = typeof key === 'string' ? Buffer.from(key) : key
+      value = typeof value === 'string' ? Buffer.from(value) : value
+      binding.batch_put(this[kBatchContext], key, value, options ?? EMPTY)
+    })
   }
 
   // Append an encoded put assembled from byte parts. RocksDB copies every part
   // before return.
   _putParts (key, value, options) {
     if (DEBUG) {
-      assertBatchIdle(this)
       assert(key !== null && key !== undefined, 'unsafe _putParts() requires a key')
       assert(value !== null && value !== undefined, 'unsafe _putParts() requires a value')
     }
 
-    binding.batch_put_parts(this[kBatchContext], key, value, options ?? EMPTY)
-    this[kLength]++
+    return this[kRunOperation]('_putParts', () => {
+      binding.batch_put_parts(this[kBatchContext], key, value, options ?? EMPTY)
+    })
   }
 
   // Append encoded log data. RocksDB copies the bytes before return.
   _putLogData (blob) {
     if (DEBUG) {
-      assertBatchIdle(this)
       assert(blob !== null && blob !== undefined, 'unsafe _putLogData() requires data')
     }
 
-    blob = typeof blob === 'string' ? Buffer.from(blob) : blob
-
-    binding.batch_put_log_data(this[kBatchContext], blob)
+    return this[kRunOperation]('_putLogData', () => {
+      blob = typeof blob === 'string' ? Buffer.from(blob) : blob
+      binding.batch_put_log_data(this[kBatchContext], blob)
+    })
   }
 
   // Append an encoded delete. RocksDB copies the key before return.
   _del (key, options) {
     if (DEBUG) {
-      assertBatchIdle(this)
       assert(key !== null && key !== undefined, 'unsafe _del() requires a key')
     }
 
-    key = typeof key === 'string' ? Buffer.from(key) : key
-
-    binding.batch_del(this[kBatchContext], key, options ?? EMPTY)
-    this[kLength]++
+    return this[kRunOperation]('_del', () => {
+      key = typeof key === 'string' ? Buffer.from(key) : key
+      binding.batch_del(this[kBatchContext], key, options ?? EMPTY)
+    })
   }
 
-  // Raw API boundary: _clear() clears only the native RocksDB batch. It cannot
-  // clear abstract-level v3's private queued-operation, write-event or prewrite
-  // metadata. After public put()/del(), use clear(), which clears both layers.
-  // Keep the raw implementation below unchanged for unsafe native-only callers.
   _clear () {
-    if (DEBUG) assertBatchIdle(this)
-
-    binding.batch_clear(this[kBatchContext])
-    this[kLength] = 0
+    return this[kRunOperation]('_clear', () => {
+      binding.batch_clear(this[kBatchContext])
+    })
   }
 
-  _write (options, callback?) {
-    if (callback === undefined) {
-      return new Promise<void>((resolve, reject) => {
-        this._write(options, err => err ? reject(err) : resolve())
-      })
-    }
-
-    if (DEBUG) assertBatchIdle(this)
-    const owned = this[kPublicWriteToken] === true
-    if (owned) this[kPublicWriteToken] = false
-    if (owned) this[kPublicWriting] = true
-    else if (DEBUG) this[kUnsafeBusy] = true
-    this[kScheduleWrite](options, (err) => {
-      if (owned) this[kPublicWriting] = false
-      else if (DEBUG) this[kUnsafeBusy] = false
-      callback(err)
+  _write (options) {
+    return new Promise<void>((resolve, reject) => {
+      try {
+        this[kStartWrite]('_write', options, err => {
+          if (err === null || err === undefined) resolve()
+          else reject(err)
+        })
+      } catch (err) {
+        reject(err)
+      }
     })
   }
 
   // Submit the current native operations synchronously. This does not consume,
   // clear or close the batch, so another raw write replays the same operations.
   _writeSync (options) {
-    if (DEBUG) assertBatchIdle(this)
-    if (!DEBUG) {
-      binding.batch_write_sync(this[kDbContext], this[kBatchContext], options ?? EMPTY)
-      return
-    }
-
-    this[kUnsafeBusy] = true
-    try {
-      binding.batch_write_sync(this[kDbContext], this[kBatchContext], options ?? EMPTY)
-    } finally {
-      this[kUnsafeBusy] = false
-    }
+    return this[kRunOperation]('_writeSync', () => {
+      binding.batch_write_sync(
+        this[kDbContext],
+        this[kBatchContext],
+        options ?? EMPTY
+      )
+    })
   }
 
   // Submit the current native operations without consuming, clearing or
   // closing them. The batch and database must remain open and idle until the
   // callback or promise settles.
   _writeAsync (options, callback) {
-    if (DEBUG) assertBatchIdle(this)
     callback = fromCallback(callback, kPromise)
-    if (DEBUG) {
-      this[kUnsafeBusy] = true
-      this[kScheduleWrite](options, (err) => {
-        this[kUnsafeBusy] = false
-        callback(err)
-      })
-    } else {
-      this[kScheduleWrite](options, callback)
+    try {
+      this[kStartWrite]('_writeAsync', options, callback)
+    } catch (err) {
+      process.nextTick(callback, err)
     }
-
     return callback[kPromise]
+  }
+
+  [kStartWrite] (operation, options, callback) {
+    this[kEnterOperation](operation)
+    this[kScheduleWrite](options, (err) => {
+      this[kLeaveOperation]()
+      callback(err)
+    })
   }
 
   [kScheduleWrite] (options, callback) {
     try {
-      binding.batch_write(this[kDbContext], this[kBatchContext], options ?? EMPTY, callback)
+      binding.batch_write(
+        this[kDbContext],
+        this[kBatchContext],
+        options ?? EMPTY,
+        callback
+      )
     } catch (err) {
       process.nextTick(callback, err)
     }
   }
 
-  _close (callback?) {
-    if (callback === undefined) {
-      if (this[kPublicCleanup] > 0) this[kPublicCloseStarted]++
-      return new Promise<void>((resolve, reject) => {
-        this._close(err => err ? reject(err) : resolve())
-      })
-    }
-    const publicCleanup = this[kPublicCleanup] > 0
-    if (DEBUG) {
-      if (!publicCleanup) {
-        assert(this[kBatchContext], 'unsafe _close() requires an open batch')
-        assert(this[kPublicAdmissionDepth] === 0,
-          'unsafe _close() must not overlap a public operation')
-        assert(!this[kPublicWriting], 'unsafe _close() must not overlap a public write')
-      }
-      assert(!this[kUnsafeBusy], 'unsafe _close() must not overlap an unsafe operation')
-    }
+  async _close () {
+    this[kCloseRequested] = true
+    await this[kWaitForIdle]()
+    this[kClearNative]()
+  }
 
-    const complete = (err) => {
-      if (err && publicCleanup) {
-        this[kCleanupDebt] = { error: err }
-        callback()
-      } else {
-        callback(err)
-      }
-    }
+  [kClearNative] () {
+    const context = this[kBatchContext]
+    if (context === null) return
 
-    try {
-      this._closeSync()
-      process.nextTick(complete, null)
-    } catch (err) {
-      process.nextTick(complete, err)
-    }
+    binding.batch_clear(context)
+    this[kBatchContext] = null
   }
 
   _flushPendingClose () {
@@ -542,10 +245,12 @@ class ChainedBatch extends AbstractChainedBatch<any, any, any> {
   // AbstractLevel's private public status untouched; a native failure leaves
   // the resource attached so the caller can retry cleanup.
   _closeSync () {
-    if (DEBUG) assertBatchIdle(this)
+    const active = this[kActiveOperation]
+    if (active !== null) throw batchBusyError('_closeSync', active)
+    if (this[kBatchContext] === null) throw batchNotOpenError('_closeSync')
 
-    binding.batch_clear(this[kBatchContext])
-    this[kBatchContext] = null
+    this[kCloseRequested] = true
+    this[kClearNative]()
     this.db.detachResource(this)
   }
 
@@ -553,29 +258,28 @@ class ChainedBatch extends AbstractChainedBatch<any, any, any> {
   // return; merge semantics come from the configured column family operator.
   _merge (key, value, options) {
     if (DEBUG) {
-      assertBatchIdle(this)
       assert(key !== null && key !== undefined, 'unsafe _merge() requires a key')
       assert(value !== null && value !== undefined, 'unsafe _merge() requires a value')
     }
 
-    key = typeof key === 'string' ? Buffer.from(key) : key
-    value = typeof value === 'string' ? Buffer.from(value) : value
-
-    binding.batch_merge(this[kBatchContext], key, value, options ?? EMPTY)
-    this[kLength]++
+    return this[kRunOperation]('_merge', () => {
+      key = typeof key === 'string' ? Buffer.from(key) : key
+      value = typeof value === 'string' ? Buffer.from(value) : value
+      binding.batch_merge(this[kBatchContext], key, value, options ?? EMPTY)
+    })
   }
 
   // Append an encoded merge assembled from byte parts. RocksDB copies every
   // part before return.
   _mergeParts (key, value, options) {
     if (DEBUG) {
-      assertBatchIdle(this)
       assert(key !== null && key !== undefined, 'unsafe _mergeParts() requires a key')
       assert(value !== null && value !== undefined, 'unsafe _mergeParts() requires a value')
     }
 
-    binding.batch_merge_parts(this[kBatchContext], key, value, options ?? EMPTY)
-    this[kLength]++
+    return this[kRunOperation]('_mergeParts', () => {
+      binding.batch_merge_parts(this[kBatchContext], key, value, options ?? EMPTY)
+    })
   }
 
   * [Symbol.iterator] () {
@@ -590,14 +294,9 @@ class ChainedBatch extends AbstractChainedBatch<any, any, any> {
   }
 
   toArray (options?) {
-    if (DEBUG) assert(!this[kUnsafeBusy], 'public toArray() must not overlap an unsafe operation')
-    if (this[kPublicWriting]) throw batchBusyError('toArray')
+    if (this[kBatchContext] === null) return []
 
-    if (!this[kBatchContext]) {
-      return []
-    }
-
-    return this[kRunPublicAdmission]('toArray', () => {
+    return this[kRunOperation]('toArray', () => {
       return binding.batch_iterate(this[kDbContext], this[kBatchContext], {
         keys: true,
         values: true,
