@@ -3372,7 +3372,8 @@ static rocksdb::Status PackGetManyResult(const std::vector<rocksdb::Status>& sta
       result.offsets.push_back(-1);
     } else {
       ROCKS_STATUS_RETURN(status);
-      if (values[n].size() > std::numeric_limits<int32_t>::max() - data->size()) {
+      constexpr auto maxPackedSize = static_cast<size_t>(std::numeric_limits<int32_t>::max());
+      if (data->size() > maxPackedSize || values[n].size() > maxPackedSize - data->size()) {
         return rocksdb::Status::InvalidArgument("Packed getMany result exceeds 2 GiB");
       }
       result.offsets.push_back(static_cast<int32_t>(data->size()));
