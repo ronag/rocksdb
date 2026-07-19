@@ -378,6 +378,22 @@ test('raw bounded getMany preserves partial markers', async function (t) {
     t.equal(rows[0].toString(), 'value', 'found values remain buffers')
     t.equal(rows[1], undefined, 'missing keys remain undefined')
     t.equal(rows[2], null, 'partial reads remain null for raw callers')
+
+    const completeOnlyError = await rejection(db._getManyAsync(
+      ['found', 'missing', 'partial'],
+      { highWaterMarkBytes: 0, packed: false },
+      undefined,
+      false
+    ))
+    t.equal(completeOnlyError.code, 'LEVEL_ABORTED', 'explicit complete-only reads reject partial results')
+
+    const explicitPartialRows = await db._getManyAsync(
+      ['found', 'missing', 'partial'],
+      { highWaterMarkBytes: 0, packed: false },
+      undefined,
+      true
+    )
+    t.equal(explicitPartialRows[2], null, 'explicit partial reads preserve incomplete markers')
   } finally {
     binding.db_get_many = dbGetMany
     await db.close()
