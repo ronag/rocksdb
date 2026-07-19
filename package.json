@@ -1,6 +1,6 @@
 {
   "name": "@nxtedition/rocksdb",
-  "version": "17.0.1",
+  "version": "17.0.2",
   "description": "A low-level Node.js RocksDB binding",
   "bugs": {
     "url": "https://github.com/nxtedition/rocks-level/issues"
