@@ -5,6 +5,14 @@ const testCommon = require('./common')
 
 let db
 
+async function writeRaw (batch) {
+  try {
+    await batch._writeAsync()
+  } finally {
+    await batch.close()
+  }
+}
+
 test('setUp db', async function (t) {
   db = testCommon.factory({
     valueEncoding: 'buffer',
@@ -39,7 +47,7 @@ test('max rev', async function (t) {
     column: db.columns.default
   })
 
-  await batch.write()
+  await writeRaw(batch)
 
   t.same((await db.get('test')).toString('utf8', 1), rev1)
 

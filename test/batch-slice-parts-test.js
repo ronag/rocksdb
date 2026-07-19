@@ -5,6 +5,14 @@ const testCommon = require('./common')
 
 let db
 
+async function writeRaw (batch) {
+  try {
+    await batch._writeAsync()
+  } finally {
+    await batch.close()
+  }
+}
+
 test('setUp batch SliceParts database', async function (t) {
   db = testCommon.factory({
     keyEncoding: 'buffer',
@@ -38,7 +46,7 @@ test('batch put concatenates Buffer and SliceLike parts synchronously', async fu
   t.same(rows, ['put', Buffer.from('record_key'), Buffer.from('value-middle-tail'), null],
     'batch inspection exposes the concatenated entry')
 
-  await batch.write()
+  await writeRaw(batch)
   t.same(await db.get(Buffer.from('record_key')), Buffer.from('value-middle-tail'),
     'database receives the concatenated key and value')
   t.end()
@@ -57,7 +65,7 @@ test('batch put supports more parts than the inline native storage', async funct
   for (const part of keyParts) part.fill(0)
   for (const part of valueParts) part.fill(0)
 
-  await batch.write()
+  await writeRaw(batch)
   t.same(await db.get(expectedKey), expectedValue,
     'overflow parts are concatenated and owned by the batch')
   t.end()
@@ -69,7 +77,7 @@ test('batch merge compares a revision split across parts', async function (t) {
   batch._mergeParts(key, [Buffer.from([5]), Buffer.from('1-old')])
   batch._mergeParts(key, [Buffer.from([5]), Buffer.from('3-new')])
   batch._mergeParts(key, [Buffer.from([5]), Buffer.from('2-mid')])
-  await batch.write()
+  await writeRaw(batch)
 
   t.same(await db.get(Buffer.from('merged')), Buffer.from([5, ...Buffer.from('3-new')]),
     'merge operator observes the same byte stream as a contiguous value')

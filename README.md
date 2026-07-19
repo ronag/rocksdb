@@ -58,7 +58,7 @@ documented as supported unsafe extensions.
   In development, a pre-admission invariant assertion may throw synchronously.
 - Direct unsafe calls bypass public status and operation queues, public and
   custom key/value codecs, sublevel prefixing, hooks and events,
-  abstract-level iterator count/end bookkeeping, cleanup retry ownership and
+  abstract-level iterator count/end bookkeeping, cleanup ownership and
   public resource state. Native iterator ranges and limits, and the declared
   raw result encodings, still apply.
 
@@ -83,9 +83,11 @@ caller can retry cleanup; the caller owns and must observe the original error.
 
 ### Raw chained batches
 
-Raw mutators can be followed by public mutators and public terminal methods. If
-any public mutation or prewrite bookkeeping exists, use public `write()`,
-`clear()` or `close()` so abstract-level can reconcile its private state.
+Raw mutators can be followed by public mutators, `clear()` or `close()`. Public
+`write()` submits the native batch only when at least one public or prewrite
+operation also exists, because raw operations do not change abstract-level's
+private length. A raw-only batch must use `_writeSync()` or `_writeAsync()` and
+then be explicitly cleared or closed.
 
 Direct `_clear()`, `_writeSync()`, `_writeAsync()` and raw close are valid only
 when native/raw state is the complete batch state. `_clear()` clears only the
@@ -109,6 +111,12 @@ This affects root, key, value and sublevel iterators, and includes RocksDB-
 specific read options such as `timeout`. Await `open()` before creating an
 iterator that will call `all(options)`. Awaiting only before the later `all()`
 call is not sufficient. Deferred `nextv()` does forward its per-read options.
+
+A timed iterator read can stop before producing a row while native state remains
+retryable, especially when filters skip many rows. Public `nextv()` and `all()`
+report that case as `LEVEL_ABORTED` rather than returning an empty array that
+abstract-level would treat as permanent exhaustion. A `nextv()` caller can retry;
+`all()` follows abstract-level's terminal error cleanup and closes the iterator.
 
 ## Packed raw reads
 

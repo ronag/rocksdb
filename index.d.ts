@@ -10,7 +10,6 @@ import {
   AbstractPutOptions,
   AbstractDelOptions,
   AbstractBatchOptions,
-  AbstractBatchOperation,
   AbstractBatchPutOperation,
   AbstractBatchDelOperation,
   AbstractClearOptions,
@@ -472,7 +471,7 @@ export type RocksGetManyReadResult<
  * Supported unsafe iterator extensions. The caller must keep the database and
  * iterator open and serialize every public and unsafe operation until it
  * settles. Inputs are already encoded. These methods bypass public accounting,
- * state, codecs, hooks and cleanup retries; development builds may assert the
+ * state, codecs, hooks and cleanup ownership; development builds may assert the
  * contract, while production builds assume it. Returned buffers and packed
  * arenas own their backing bytes and remain valid after iterator close.
  */
@@ -486,7 +485,6 @@ export interface RocksIteratorNative<
 > {
   /** @internal Test-only count of decoded entries currently cached in JavaScript. */
   readonly cached: number
-  [Symbol.asyncDispose] (): Promise<void>
   /**
    * Reset prefetched rows and refresh the native iterator. Requires an idle,
    * open iterator and may lazily initialize and block on RocksDB I/O.
@@ -619,10 +617,8 @@ export interface RocksBatchToArrayOptions<
 export interface RocksChainedBatch<TDatabase, KDefault, VDefault>
   extends AbstractChainedBatch<TDatabase, KDefault, VDefault> {
   put (key: KDefault, value: VDefault): this
-  put<K = KDefault, V = VDefault> (key: K, value: V, options: AbstractChainedBatchPutOptions<TDatabase, K, V>): this
   put<K = KDefault, V = VDefault> (key: K, value: V, options: RocksChainedBatchPutOptions<TDatabase, K, V>): this
   del (key: KDefault): this
-  del<K = KDefault> (key: K, options: AbstractChainedBatchDelOptions<TDatabase, K>): this
   del<K = KDefault> (key: K, options: RocksChainedBatchDelOptions<TDatabase, K>): this
   write (): Promise<void>
   write (options: RocksChainedBatchWriteOptions): Promise<void>
@@ -677,7 +673,6 @@ export interface RocksChainedBatch<TDatabase, KDefault, VDefault>
     'put' | 'del' | 'merge' | 'data' | RocksDecoded<KEncoding> | RocksDecoded<VEncoding> | null
   >
   [Symbol.iterator] (): IterableIterator<RocksBatchEntry<string, string>>
-  [Symbol.asyncDispose] (): Promise<void>
 }
 
 export interface RocksQueryOptions<
@@ -772,16 +767,8 @@ export class RocksLevel<KDefault = string, VDefault = string>
   getMany (keys: KDefault[]): Promise<Array<VDefault | undefined>>
   getMany<K = KDefault, V = VDefault> (
     keys: K[],
-    options: RocksBoundedGetManyOptions<K, V>
-  ): Promise<Array<V | null | undefined>>
-  getMany<K = KDefault, V = VDefault> (
-    keys: K[],
-    options: RocksUnboundedGetManyOptions<K, V>
-  ): Promise<Array<V | undefined>>
-  getMany<K = KDefault, V = VDefault> (
-    keys: K[],
     options: RocksGetManyOptions<K, V>
-  ): Promise<Array<V | null | undefined>>
+  ): Promise<Array<V | undefined>>
 
   put (key: KDefault, value: VDefault): Promise<void>
   put<K = KDefault, V = VDefault> (key: K, value: V, options: RocksPutOptions<K, V>): Promise<void>
@@ -789,8 +776,6 @@ export class RocksLevel<KDefault = string, VDefault = string>
   del (key: KDefault): Promise<void>
   del<K = KDefault> (key: K, options: RocksDelOptions<K>): Promise<void>
 
-  batch (operations: Array<AbstractBatchOperation<this, KDefault, VDefault>>): Promise<void>
-  batch<K = KDefault, V = VDefault> (operations: Array<AbstractBatchOperation<this, K, V>>, options: AbstractBatchOptions<K, V>): Promise<void>
   batch (operations: Array<RocksBatchOperation<this, KDefault, VDefault>>): Promise<void>
   batch<K = KDefault, V = VDefault> (operations: Array<RocksBatchOperation<this, K, V>>, options: RocksBatchOptions<K, V>): Promise<void>
   batch (): RocksChainedBatch<this, KDefault, VDefault>
@@ -1035,8 +1020,6 @@ export class RocksLevel<KDefault = string, VDefault = string>
   flushWAL (callback: RocksNodeCallback<void>): void
   flushWAL (sync: boolean, callback: RocksNodeCallback<void>): void
   flushWAL (options: RocksFlushWALOptions, callback: RocksNodeCallback<void>): void
-
-  [Symbol.asyncDispose] (): Promise<void>
 }
 
 /**

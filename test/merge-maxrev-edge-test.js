@@ -45,6 +45,14 @@ function jsMax (revs) {
 
 let db
 
+async function writeRaw (batch) {
+  try {
+    await batch._writeAsync()
+  } finally {
+    await batch.close()
+  }
+}
+
 test('maxRev edge setup', async function (t) {
   db = testCommon.factory({
     valueEncoding: 'buffer',
@@ -66,7 +74,7 @@ test('maxRev: higher numeric revision wins regardless of leading zeros', async f
     const key = Buffer.from('lz:' + ops.join(','))
     const b = db.batch()
     for (const o of ops) b._merge(key, makeVersion(o))
-    await b.write()
+    await writeRaw(b)
     t.same((await db.get(key)).toString('utf8', 1), winner, `${ops} -> ${winner}`)
   }
   t.end()
@@ -81,7 +89,7 @@ test('maxRev: INF sentinel outranks every numeric revision', async function (t) 
     const key = Buffer.from('inf:' + ops.join(','))
     const b = db.batch()
     for (const o of ops) b._merge(key, makeVersion(o))
-    await b.write()
+    await writeRaw(b)
     t.same((await db.get(key)).toString('utf8', 1), winner, `${ops} -> ${winner}`)
   }
   t.end()
@@ -92,7 +100,7 @@ test('maxRev: high bytes (>=0x80) compare as unsigned', async function (t) {
   const b = db.batch()
   b._merge(key, makeVersion(Buffer.from([0x31, 0x2d, 0x10]))) // "1-\x10"
   b._merge(key, makeVersion(Buffer.from([0x31, 0x2d, 0x80]))) // "1-\x80" (larger unsigned)
-  await b.write()
+  await writeRaw(b)
   const got = await db.get(key)
   t.same([...got.subarray(1)], [0x31, 0x2d, 0x80], '0x80 > 0x10 unsigned')
   t.end()
@@ -113,7 +121,7 @@ test('maxRev: durable winner == JS-comparator max over random revisions', async 
     const key = Buffer.from('prop:' + i)
     const b = db.batch()
     for (const r of revs) b._merge(key, makeVersion(r))
-    await b.write()
+    await writeRaw(b)
     const got = (await db.get(key)).toString('utf8', 1)
     const want = jsMax(revs)
     // Equal-magnitude+id revisions are indistinguishable; compare by the JS

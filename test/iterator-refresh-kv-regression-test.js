@@ -408,7 +408,7 @@ test('seek target validation uses intrinsic lengths and snapshots accessors', as
   t.end()
 })
 
-test('public seek serializes key encoding hooks', async function (t) {
+test('public seek follows abstract-level encoding reentrancy', async function (t) {
   const db = testCommon.factory()
   await db.open()
   await db.batch([
@@ -421,41 +421,41 @@ test('public seek serializes key encoding hooks', async function (t) {
 
   const nextIterator = db.iterator()
   let nestedNext
-  nextIterator.seek('b', {
-    keyEncoding: {
-      name: 'nested-next',
-      format: 'buffer',
-      encode (value) {
-        nestedNext = nextIterator.next().then(
-          () => null,
-          (err) => err
-        )
-        return Buffer.from(value)
-      },
-      decode
-    }
-  })
-  t.equal((await nestedNext).code, 'LEVEL_ITERATOR_BUSY',
-    'a nested public read rejects while the target is encoded')
-  t.same(await nextIterator.next(), ['b', '2'], 'outer public seek uses its encoded target')
+  t.throws(
+    () => nextIterator.seek('b', {
+      keyEncoding: {
+        name: 'nested-next',
+        format: 'buffer',
+        encode (value) {
+          nestedNext = nextIterator.next()
+          return Buffer.from(value)
+        },
+        decode
+      }
+    }),
+    (err) => err && err.code === 'LEVEL_ITERATOR_BUSY',
+    'the nested read is admitted before the outer seek reaches private admission'
+  )
+  t.same(await nestedNext, ['a', '1'],
+    'the admitted nested read fulfills from the pre-seek position')
 
   const optionsIterator = db.iterator()
-  let nestedOptionSeekError
+  let nestedOptionSeekCompleted = false
   const options = {}
   Object.defineProperty(options, 'keyEncoding', {
     get () {
-      try {
+      if (!nestedOptionSeekCompleted) {
         optionsIterator.seek('a')
-      } catch (err) {
-        nestedOptionSeekError = err
+        nestedOptionSeekCompleted = true
       }
       return 'utf8'
     }
   })
-  optionsIterator.seek('b', options)
-  t.equal(nestedOptionSeekError && nestedOptionSeekError.code, 'LEVEL_ITERATOR_BUSY',
-    'a keyEncoding accessor cannot start a nested public seek')
-  t.same(await optionsIterator.next(), ['b', '2'], 'options reentrancy leaves the outer seek intact')
+  t.doesNotThrow(() => optionsIterator.seek('b', options),
+    'a keyEncoding accessor can complete a nested seek')
+  t.equal(nestedOptionSeekCompleted, true, 'the nested seek completed synchronously')
+  t.same(await optionsIterator.next(), ['b', '2'],
+    'the outer seek runs afterward and determines the final position')
 
   const closeIterator = db.iterator()
   let closing

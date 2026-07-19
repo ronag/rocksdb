@@ -2,8 +2,10 @@
 
 const { createHook } = require('node:async_hooks')
 const test = require('tape')
+const { RocksLevel } = require('..')
 const binding = require('../binding')
 const testCommon = require('./common')
+const temporaryDirectory = require('./temporary-directory')
 
 async function rejection (promise) {
   try {
@@ -102,6 +104,37 @@ test('failed iterator construction detaches its partial database resource', asyn
     db.attachResource = originalAttach
     db.detachResource = originalDetach
     await db.close()
+  }
+
+  t.end()
+})
+
+test('failed key and value iterator construction releases every owner', async function (t) {
+  for (const route of ['immediate', 'deferred', 'sublevel']) {
+    for (const name of ['keys', 'values']) {
+      const location = temporaryDirectory()
+      const db = new RocksLevel(location)
+
+      if (route === 'deferred') {
+        db[name]({ highWaterMarkBytes: -1 })
+        const err = await rejection(db.open())
+        t.ok(err instanceof RangeError, `${route} ${name} reports the construction error`)
+      } else {
+        await db.open()
+        const target = route === 'sublevel' ? db.sublevel('child') : db
+        if (route === 'sublevel') await target.open()
+        t.throws(
+          () => target[name]({ highWaterMarkBytes: -1 }),
+          RangeError,
+          `${route} ${name} reports the construction error`
+        )
+      }
+
+      t.error(await rejection(db.close()), `${route} ${name} succeeds on the first close`)
+      const reopened = await RocksLevel.open(location, { createIfMissing: false })
+      await reopened.close()
+      t.pass(`${route} ${name} releases the database lock`)
+    }
   }
 
   t.end()

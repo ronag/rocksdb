@@ -4,6 +4,8 @@ type PackedMode = boolean | 'auto'
 
 export const kRef = Symbol('ref')
 export const kUnref = Symbol('unref')
+export const kRegisterCleanupResource = Symbol('registerCleanupResource')
+export const kUnregisterCleanupResource = Symbol('unregisterCleanupResource')
 
 export function getPackedMode (
   options: { packed?: PackedMode } | null | undefined,

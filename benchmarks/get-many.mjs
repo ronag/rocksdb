@@ -9,7 +9,7 @@ import { cleanupAfterBenchmark } from './cleanup.mjs'
 
 const localRoot = dirname(dirname(fileURLToPath(import.meta.url)))
 const root = resolve(process.env.ROCKS_LEVEL_ROOT ?? localRoot)
-const { RocksLevel } = await import(pathToFileURL(join(root, 'index.js')).href)
+const { RocksLevel } = await import(pathToFileURL(join(root, 'lib/index.js')).href)
 
 function revision () {
   try {

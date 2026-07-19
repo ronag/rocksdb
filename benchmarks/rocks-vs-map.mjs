@@ -54,7 +54,8 @@ try {
   const getOpts = {
     keyEncoding: 'buffer',
     valueEncoding: 'buffer',
-    fillCache: true
+    fillCache: true,
+    packed: false
   }
 
   const warmed = await db._getMany(values, getOpts)

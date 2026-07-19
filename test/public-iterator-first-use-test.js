@@ -27,7 +27,7 @@ function snapshotCount (db) {
   return Number(db.getProperty('rocksdb.num-snapshots'))
 }
 
-test('first public reads fuse only when options are omitted', async function (t) {
+test('first public reads share the fused initialization worker timing', async function (t) {
   const db = testCommon.factory()
   await db.open()
   await seed(db, 3)
@@ -72,19 +72,6 @@ test('first public reads fuse only when options are omitted', async function (t)
     for (const name of Object.keys(calls)) calls[name] = 0
   }
 
-  const checkSeparateWorkers = (label) => {
-    t.same(resourceTypes, ['leveldown.iterator_init', 'iterator.nextv'],
-      `${label} exposes separate initialization and read resources`)
-    t.same(calls, {
-      iterator_init: 1,
-      iterator_init_nextv: 0,
-      iterator_nextv: 1,
-      iterator_nextv_sync: 0
-    }, `${label} preserves explicit option access after initialization`)
-    resourceTypes.length = 0
-    for (const name of Object.keys(calls)) calls[name] = 0
-  }
-
   let iterator
   try {
     iterator = db.iterator()
@@ -100,7 +87,7 @@ test('first public reads fuse only when options are omitted', async function (t)
     t.same(await iterator.nextv(1, {}), [['key00000', 'value0']],
       'nextv({}) returns its first row')
     hook.disable()
-    checkSeparateWorkers('nextv({})')
+    checkOneWorker('nextv({})')
     await iterator.close()
 
     iterator = db.iterator({ keys: false, values: false })
@@ -118,24 +105,6 @@ test('first public reads fuse only when options are omitted', async function (t)
     hook.disable()
     checkOneWorker('no-fields next()')
     await iterator.close()
-
-    iterator = db.iterator({ limit: 1 })
-    hook.enable()
-    t.same(await iterator.all(), [['key00000', 'value0']],
-      'bounded all() preserves its public limit')
-    hook.disable()
-    checkOneWorker('all()')
-    t.equal(iterator.count, 1, 'all() accounts for its returned row')
-    t.equal(snapshotCount(db), 0, 'all() auto-close releases its snapshot')
-
-    iterator = db.iterator({ limit: 1 })
-    hook.enable()
-    t.same(await iterator.all({}), [['key00000', 'value0']],
-      'bounded all({}) preserves its public limit')
-    hook.disable()
-    checkSeparateWorkers('all({})')
-    t.equal(iterator.count, 1, 'all({}) accounts for its returned row')
-    t.equal(snapshotCount(db), 0, 'all({}) auto-close releases its snapshot')
   } finally {
     hook.disable()
     for (const [name, original] of Object.entries(originals)) binding[name] = original
@@ -146,17 +115,20 @@ test('first public reads fuse only when options are omitted', async function (t)
   t.end()
 })
 
-test('explicit empty read options retain inherited and later properties', async function (t) {
+test('explicit read options are consumed at combined admission', async function (t) {
   const db = testCommon.factory()
   await db.open()
   await seed(db, 2)
 
-  const inheritedIterator = db.iterator({ limit: 1 })
-  const mutatedIterator = db.iterator({ limit: 1 })
+  const inheritedIterator = db.iterator()
+  const mutatedIterator = db.iterator()
+  const originalInitNextv = binding.iterator_init_nextv
+  const order = []
   let inheritedReads = 0
   const inheritedOptions = Object.create({
     get timeout () {
       inheritedReads++
+      order.push('timeout getter')
       return 0
     }
   })
@@ -164,22 +136,36 @@ test('explicit empty read options retain inherited and later properties', async 
   const mutationError = new Error('later timeout getter failed')
   let mutationReads = 0
 
+  binding.iterator_init_nextv = function (...args) {
+    order.push('combined admission')
+    return originalInitNextv(...args)
+  }
+
   try {
-    t.same(await inheritedIterator.nextv(1, inheritedOptions), [['key00000', 'value0']],
-      'nextv({}) forwards an inherited read option')
+    const inheritedReading = inheritedIterator.nextv(1, inheritedOptions)
+    order.push('nextv returned')
+    t.same(order, ['combined admission', 'timeout getter', 'nextv returned'],
+      'combined binding reads inherited options before nextv() returns')
+    t.same(await inheritedReading, [['key00000', 'value0']],
+      'nextv() forwards the inherited read option')
     t.equal(inheritedReads, 1, 'the inherited timeout getter is read once')
 
-    const reading = mutatedIterator.all(mutatedOptions)
+    order.length = 0
+    const reading = mutatedIterator.nextv(1, mutatedOptions)
+    order.push('nextv returned')
     Object.defineProperty(mutatedOptions, 'timeout', {
       get () {
         mutationReads++
         throw mutationError
       }
     })
-    t.equal(await rejection(reading), mutationError,
-      'all({}) observes a property added while lazy initialization is pending')
-    t.equal(mutationReads, 1, 'the later timeout getter is read once')
+    t.same(order, ['combined admission', 'nextv returned'],
+      'combined admission snapshots the available options synchronously')
+    t.same(await reading, [['key00000', 'value0']],
+      'a later option mutation does not affect the admitted read')
+    t.equal(mutationReads, 0, 'the getter added after admission is never observed')
   } finally {
+    binding.iterator_init_nextv = originalInitNextv
     await inheritedIterator.close()
     await mutatedIterator.close()
     await db.close()
@@ -188,12 +174,14 @@ test('explicit empty read options retain inherited and later properties', async 
   t.end()
 })
 
-test('explicit nextv options retain lazy initialization error ordering', async function (t) {
+test('explicit nextv option errors precede lazy native filter errors', async function (t) {
   const db = testCommon.factory()
   await db.open()
 
   const iterator = db.iterator({ keyFilter: '[' })
-  const optionError = new Error('timeout getter must not run before initialization')
+  const originalInitNextv = binding.iterator_init_nextv
+  const optionError = new Error('timeout getter failed during combined admission')
+  let initNextvCalls = 0
   let timeoutReads = 0
   const options = {
     get timeout () {
@@ -202,14 +190,19 @@ test('explicit nextv options retain lazy initialization error ordering', async f
     }
   }
 
+  binding.iterator_init_nextv = function (...args) {
+    initNextvCalls++
+    return originalInitNextv(...args)
+  }
+
   try {
     const err = await rejection(iterator.nextv(1, options))
-    t.match(err && err.message, /Invalid key filter regex/,
-      'the initialization error wins over a read-options getter')
-    t.notEqual(err, optionError, 'the read-options error is not observed first')
-    t.equal(timeoutReads, 0, 'read options are not inspected after failed initialization')
-    t.equal(snapshotCount(db), 0, 'failed initialization releases its snapshot')
+    t.equal(err, optionError, 'synchronous option access fails before lazy filter compilation')
+    t.equal(timeoutReads, 1, 'the timeout getter is read exactly once at admission')
+    t.equal(initNextvCalls, 1, 'the combined binding is the attempted first operation')
+    t.equal(snapshotCount(db), 0, 'failed combined admission releases its snapshot')
   } finally {
+    binding.iterator_init_nextv = originalInitNextv
     await iterator.close()
     await db.close()
   }
@@ -217,21 +210,21 @@ test('explicit nextv options retain lazy initialization error ordering', async f
   t.end()
 })
 
-test('explicit all options retain lazy initialization error ordering', async function (t) {
+test('first all with explicit options uses the combined worker', async function (t) {
   const db = testCommon.factory()
   await db.open()
+  await seed(db, 2)
 
-  const iterator = db.iterator({ keyFilter: '[' })
+  const iterator = db.iterator({ limit: 1 })
   const originalInit = binding.iterator_init
   const originalInitNextv = binding.iterator_init_nextv
-  const optionError = new Error('timeout getter must not run before initialization')
   let initCalls = 0
   let initNextvCalls = 0
   let timeoutReads = 0
   const options = {
     get timeout () {
       timeoutReads++
-      throw optionError
+      return 0
     }
   }
 
@@ -245,14 +238,13 @@ test('explicit all options retain lazy initialization error ordering', async fun
   }
 
   try {
-    const err = await rejection(iterator.all(options))
-    t.match(err && err.message, /Invalid key filter regex/,
-      'the initialization error wins over a read-options getter')
-    t.notEqual(err, optionError, 'the read-options error is not observed first')
-    t.equal(timeoutReads, 0, 'read options are not inspected after failed initialization')
-    t.equal(initCalls, 1, 'explicit options use the separate initialization worker')
-    t.equal(initNextvCalls, 0, 'explicit options do not use the combined read worker')
-    t.equal(snapshotCount(db), 0, 'failed initialization releases its snapshot')
+    t.same(await iterator.all(options), [['key00000', 'value0']],
+      'bounded all(options) returns its first row')
+    t.equal(timeoutReads, 1, 'all options are read once at combined admission')
+    t.equal(initCalls, 0, 'all does not schedule a separate initialization worker')
+    t.equal(initNextvCalls, 1, 'all schedules the combined initialization and read worker')
+    t.equal(iterator.count, 1, 'all accounts for its returned row')
+    t.equal(snapshotCount(db), 0, 'all auto-close releases its snapshot')
   } finally {
     binding.iterator_init = originalInit
     binding.iterator_init_nextv = originalInitNextv
