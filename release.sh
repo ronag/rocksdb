@@ -3,6 +3,13 @@ set -e
 
 cd "$(dirname "$0")"
 
+# Releases and their tags must originate from the canonical branch.
+BRANCH=$(git branch --show-current)
+if [ "$BRANCH" != master ]; then
+  echo "Releases must be run from master (current branch: ${BRANCH:-detached HEAD})." >&2
+  exit 1
+fi
+
 # Never let an explicit local fault-injection build leak into published
 # artifacts. Both dependency and addon builds inherit this shell environment.
 export ROCKS_LEVEL_TEST_FAULTS=0
@@ -20,7 +27,6 @@ if [ -n "$(git status --porcelain)" ]; then
 fi
 
 # Fail fast: don't build/publish on a branch that's behind or diverged from origin.
-BRANCH=$(git rev-parse --abbrev-ref HEAD)
 echo "Fetching origin..."
 git fetch origin "$BRANCH"
 
