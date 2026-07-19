@@ -8,7 +8,9 @@ function unpack (result) {
   return Array.from(result.statuses, (status, index) => {
     if (status === 1) return undefined
     if (status === 2) return null
-    return result.buffer.subarray(result.offsets[index], result.offsets[index + 1])
+    const layoutIndex = index * 2
+    const byteOffset = result.offsets[layoutIndex]
+    return result.buffer.subarray(byteOffset, byteOffset + result.offsets[layoutIndex + 1])
   })
 }
 
@@ -23,7 +25,7 @@ test('packed getMany sync and async preserve values, empty values and misses', a
 
   const keys = ['a', 'missing', 'empty', 'c']
   const expectedStatuses = new Uint8Array([0, 1, 0, 0])
-  const expectedOffsets = new Uint32Array([0, 3, 3, 3, 8])
+  const expectedOffsets = new Int32Array([0, 3, -1, 0, 3, 0, 3, 5])
 
   for (const [name, result] of [
     ['sync', db._getManySync(keys, { packed: true })],
@@ -32,7 +34,7 @@ test('packed getMany sync and async preserve values, empty values and misses', a
     t.equal(result.packed, true, `${name} exposes the selected packed mode`)
     t.equal(result.count, keys.length, `${name} reports one result per key`)
     t.same(result.statuses, expectedStatuses, `${name} distinguishes values from missing keys`)
-    t.same(result.offsets, expectedOffsets, `${name} preserves empty value boundaries`)
+    t.same(result.offsets, expectedOffsets, `${name} preserves value layouts and missing values`)
     t.same(unpack(result), [Buffer.from('one'), undefined, Buffer.alloc(0), Buffer.from('three')],
       `${name} arena reconstructs every result`)
   }
@@ -298,6 +300,12 @@ test('packed getMany reports bounded partial reads', async function (t) {
   t.ok(result.statuses.includes(2), 'marks values skipped by the bound as incomplete')
   t.ok(result.statuses.every((status) => status === 0 || status === 2),
     'existing keys are either values or incomplete')
+  for (let index = 0; index < result.count; index++) {
+    if (result.statuses[index] === 2) {
+      t.same(Array.from(result.offsets.subarray(index * 2, index * 2 + 2)), [-1, -1],
+        'incomplete values expose the aborted byte layout')
+    }
+  }
 
   await db.close()
   t.end()

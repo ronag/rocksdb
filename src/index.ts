@@ -261,10 +261,10 @@ function prepareRawGetManyOptions(options, packed?) {
 function convertRawGetManyResult(result, valueEncoding) {
   if (!isJavaScriptEncoding(valueEncoding)) return result
 
-  const convert = (buffer, start = 0, end = buffer.byteLength) =>
+  const convert = (buffer, byteOffset = 0, byteLength = buffer.byteLength - byteOffset) =>
     valueEncoding === 'slice'
-      ? new Slice(buffer, start, end - start)
-      : buffer.toString('utf8', start, end)
+      ? new Slice(buffer, byteOffset, byteLength)
+      : buffer.toString('utf8', byteOffset, byteOffset + byteLength)
 
   if (Array.isArray(result)) {
     if (valueEncoding !== 'slice') return result
@@ -275,7 +275,7 @@ function convertRawGetManyResult(result, valueEncoding) {
     if (status === 1) return undefined
     if (status === 2) return null
 
-    return convert(result.buffer, result.offsets[index], result.offsets[index + 1])
+    return convert(result.buffer, result.offsets[index * 2], result.offsets[index * 2 + 1])
   })
 }
 

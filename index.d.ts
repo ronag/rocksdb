@@ -403,10 +403,11 @@ export interface RocksPackedGetManyResult {
   /** Concatenated bytes for values whose status is 0. */
   readonly buffer: Buffer
   /**
-   * Cumulative value boundaries, starting at zero. Missing and incomplete
-   * values do not advance their boundary.
+   * `count * 2` signed entries. Key `i` uses `offsets[i * 2]` as its byte
+   * offset and `offsets[i * 2 + 1]` as its byte length. Missing values use
+   * `[-1, 0]`; incomplete values use `[-1, -1]`.
    */
-  readonly offsets: Uint32Array
+  readonly offsets: Int32Array
   /** Per-key status: 0 is a value, 1 is not found, 2 is incomplete. */
   readonly statuses: Uint8Array
   readonly count: number

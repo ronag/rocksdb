@@ -156,25 +156,33 @@ function validatePackedGetMany (result, count, context) {
   }
 
   assert.ok(Buffer.isBuffer(result.buffer), `${context}: arena is a Buffer`)
-  assert.ok(result.offsets instanceof Uint32Array, `${context}: offsets are Uint32Array`)
+  assert.ok(result.offsets instanceof Int32Array, `${context}: offsets are Int32Array`)
   assert.ok(result.statuses instanceof Uint8Array, `${context}: statuses are Uint8Array`)
   assert.equal(result.count, count, `${context}: logical count`)
   assert.equal(result.statuses.length, count, `${context}: status count`)
-  assert.equal(result.offsets.length, count + 1, `${context}: offset count`)
-  assert.equal(result.offsets[0], 0, `${context}: first offset`)
+  assert.equal(result.offsets.length, count * 2, `${context}: layout count`)
 
+  let packedBytes = 0
   for (let index = 0; index < count; index++) {
     assert.ok(result.statuses[index] <= 2, `${context}: valid status ${index}`)
-    assert.ok(result.offsets[index] <= result.offsets[index + 1],
-      `${context}: monotonic offsets ${index}`)
-    if (result.statuses[index] !== 0) {
-      assert.equal(result.offsets[index], result.offsets[index + 1],
-        `${context}: absent value ${index} consumes no bytes`)
+    const layoutIndex = index * 2
+    const byteOffset = result.offsets[layoutIndex]
+    const byteLength = result.offsets[layoutIndex + 1]
+    if (result.statuses[index] === 0) {
+      assert.equal(byteOffset, packedBytes, `${context}: value offset ${index}`)
+      assert.ok(byteLength >= 0, `${context}: value length ${index}`)
+      assert.ok(byteOffset + byteLength <= result.buffer.length,
+        `${context}: value bounds ${index}`)
+      packedBytes += byteLength
+    } else if (result.statuses[index] === 1) {
+      assert.equal(byteOffset, -1, `${context}: missing offset ${index}`)
+      assert.equal(byteLength, 0, `${context}: missing length ${index}`)
+    } else {
+      assert.equal(byteOffset, -1, `${context}: incomplete offset ${index}`)
+      assert.equal(byteLength, -1, `${context}: incomplete length ${index}`)
     }
   }
-
-  assert.equal(result.offsets[result.offsets.length - 1], result.buffer.length,
-    `${context}: final offset equals arena size`)
+  assert.equal(packedBytes, result.buffer.length, `${context}: layouts consume the arena`)
 }
 
 function decodeGetMany (result) {
@@ -185,7 +193,12 @@ function decodeGetMany (result) {
   return Array.from(result.statuses, (status, index) => {
     if (status === 1) return undefined
     if (status === 2) return null
-    return Buffer.from(result.buffer.subarray(result.offsets[index], result.offsets[index + 1]))
+    const layoutIndex = index * 2
+    const byteOffset = result.offsets[layoutIndex]
+    return Buffer.from(result.buffer.subarray(
+      byteOffset,
+      byteOffset + result.offsets[layoutIndex + 1]
+    ))
   })
 }
 
@@ -646,7 +659,7 @@ test('raw async resources survive forced GC and finalizers release snapshots and
       }
       for (const result of getManyResults) {
         assert.deepEqual(Array.from(result.statuses), Array(64).fill(0))
-        assert.ok(result.buffer.subarray(result.offsets[0], result.offsets[1])
+        assert.ok(result.buffer.subarray(result.offsets[0], result.offsets[0] + result.offsets[1])
           .equals(Buffer.alloc(2048, 0)))
       }
 
