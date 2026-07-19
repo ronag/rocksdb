@@ -413,11 +413,16 @@ export interface RocksPackedGetManyResult {
   readonly count: number
 }
 
+export type RocksRawGetManyValues<
+  E extends RocksRawEncoding,
+  AllowPartial extends boolean = true
+> = Array<RocksRawDecoded<E> | (AllowPartial extends true ? null : never) | undefined>
+
 export type RocksRawGetManyResult<
   E extends RocksRawEncoding,
   Packed extends boolean = false,
   AllowPartial extends boolean = true
-> = Array<RocksRawDecoded<E> | (AllowPartial extends true ? null : never) | undefined> & {
+> = RocksRawGetManyValues<E, AllowPartial> & {
   readonly packed: Packed
 }
 
@@ -895,6 +900,22 @@ export class RocksLevel<KDefault = string, VDefault = string>
     callback: undefined,
     allowPartial?: boolean
   ): Promise<RocksGetManyReadResult<E, Packed>>
+  /**
+   * Promise overload that omits the packed-mode discriminator from decoded
+   * JavaScript values; all other invariants apply.
+   */
+  _getManyAsync<
+    E extends RocksJavaScriptEncoding,
+    Packed extends RocksPackedReadMode = RocksDefaultPackedMode<E>,
+    AllowPartial extends boolean = boolean
+  > (
+    keys: readonly RocksSlice[],
+    options: RocksRawGetManyOptions<E, Packed> | undefined,
+    callback: undefined,
+    allowPartial: AllowPartial,
+    packed: undefined,
+    exposePacked: false
+  ): Promise<RocksRawGetManyValues<E, AllowPartial>>
   /** Callback overload with the same encoded-input and open-database contract. */
   _getManyAsync<
     E extends RocksRawEncoding = 'buffer',
@@ -935,6 +956,18 @@ export class RocksLevel<KDefault = string, VDefault = string>
     options: RocksRawGetManyOptions<E, Packed> | undefined,
     callback: RocksPackedReadCallback<RocksGetManyReadResult<E, Packed>, Packed>,
     allowPartial?: boolean
+  ): void
+  _getManyAsync<
+    E extends RocksJavaScriptEncoding,
+    Packed extends RocksPackedReadMode = RocksDefaultPackedMode<E>,
+    AllowPartial extends boolean = boolean
+  > (
+    keys: readonly RocksSlice[],
+    options: RocksRawGetManyOptions<E, Packed> | undefined,
+    callback: RocksPackedReadCallback<RocksRawGetManyValues<E, AllowPartial>, Packed>,
+    allowPartial: AllowPartial,
+    packed: undefined,
+    exposePacked: false
   ): void
   /**
    * Read encoded keys synchronously from an open database. Raw reads may
