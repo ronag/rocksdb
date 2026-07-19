@@ -167,8 +167,18 @@ expectTrue<Equal<
   Awaited<typeof boundedValues>,
   Array<string | null | undefined>
 >>()
+const timedValues = db.getMany(['key'], { timeout: 1 })
+expectTrue<Equal<
+  Awaited<typeof timedValues>,
+  Array<string | null | undefined>
+>>()
 const unboundedValues = db.getMany(['key'])
 expectTrue<Equal<Awaited<typeof unboundedValues>, Array<string | undefined>>>()
+const unboundedOptionValues = db.getMany(['key'], { valueEncoding: 'utf8' })
+expectTrue<Equal<
+  Awaited<typeof unboundedOptionValues>,
+  Array<string | undefined>
+>>()
 const annotatedBoundedOptions: RocksGetManyOptions<string, string> = {
   highWaterMarkBytes: 0
 }

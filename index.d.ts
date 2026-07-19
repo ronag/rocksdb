@@ -253,6 +253,10 @@ export interface RocksWriteOptions extends RocksColumnOperationOptions {
 
 export interface RocksGetOptions<K, V> extends AbstractGetOptions<K, V>, RocksReadOptions {}
 export interface RocksGetManyOptions<K, V> extends AbstractGetManyOptions<K, V>, RocksReadOptions {}
+export type RocksUnboundedGetManyOptions<K, V> = RocksGetManyOptions<K, V> & {
+  highWaterMarkBytes?: never
+  timeout?: never
+}
 export type RocksBoundedGetManyOptions<K, V> = RocksGetManyOptions<K, V> & (
   { highWaterMarkBytes: number } | { timeout: number }
 )
@@ -748,6 +752,10 @@ export class RocksLevel<KDefault = string, VDefault = string>
     keys: K[],
     options: RocksBoundedGetManyOptions<K, V>
   ): Promise<Array<V | null | undefined>>
+  getMany<K = KDefault, V = VDefault> (
+    keys: K[],
+    options: RocksUnboundedGetManyOptions<K, V>
+  ): Promise<Array<V | undefined>>
   getMany<K = KDefault, V = VDefault> (
     keys: K[],
     options: RocksGetManyOptions<K, V>
