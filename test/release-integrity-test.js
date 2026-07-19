@@ -3,7 +3,7 @@
 const fs = require('node:fs')
 const os = require('node:os')
 const path = require('node:path')
-const { execFileSync } = require('node:child_process')
+const { execFileSync, spawnSync } = require('node:child_process')
 const test = require('tape')
 const {
   DEPENDENCIES,
@@ -20,6 +20,75 @@ function git (args) {
     stdio: ['ignore', 'pipe', 'inherit']
   }).trim()
 }
+
+function executable (file, source) {
+  fs.writeFileSync(file, source, { mode: 0o755 })
+}
+
+function runReleaseBranchCheck (branch) {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), 'rocks-level-release-'))
+  const bin = path.join(root, 'bin')
+  const npmLog = path.join(root, 'npm.log')
+
+  try {
+    fs.mkdirSync(bin)
+    fs.copyFileSync(path.join(__dirname, '..', 'release.sh'), path.join(root, 'release.sh'))
+    executable(
+      path.join(bin, 'git'),
+      `#!/bin/bash
+if [ "$1:$2" = "branch:--show-current" ]; then
+  printf '%s' "\${FAKE_GIT_BRANCH:-}"
+  exit 0
+fi
+exit 99
+`
+    )
+    executable(
+      path.join(bin, 'npm'),
+      `#!/bin/bash
+printf '%s\n' "$*" >> "$FAKE_NPM_LOG"
+exit 99
+`
+    )
+
+    const result = spawnSync('/bin/bash', ['./release.sh'], {
+      cwd: root,
+      encoding: 'utf8',
+      env: {
+        ...process.env,
+        FAKE_GIT_BRANCH: branch,
+        FAKE_NPM_LOG: npmLog,
+        PATH: `${bin}${path.delimiter}${process.env.PATH}`
+      }
+    })
+
+    return {
+      npmCalled: fs.existsSync(npmLog),
+      result
+    }
+  } finally {
+    fs.rmSync(root, { recursive: true, force: true })
+  }
+}
+
+test('release requires the master branch before running npm', function (t) {
+  for (const [branch, visibleBranch] of [
+    ['feature/release', 'feature/release'],
+    ['', 'detached HEAD']
+  ]) {
+    const { npmCalled, result } = runReleaseBranchCheck(branch)
+
+    t.equal(result.status, 1, `${visibleBranch} is rejected`)
+    t.match(result.stderr, new RegExp(`current branch: ${visibleBranch}`))
+    t.notOk(npmCalled, `${visibleBranch} is rejected before npm authentication`)
+  }
+
+  const { npmCalled, result } = runReleaseBranchCheck('master')
+  t.equal(result.status, 1, 'the fake npm authentication stops the master fixture')
+  t.ok(npmCalled, 'master proceeds to npm authentication')
+  t.match(result.stderr, /Not logged in to npm/, 'master reaches the existing authentication guard')
+  t.end()
+})
 
 test('native dependencies use exact audited upstream commits', function (t) {
   t.same(
