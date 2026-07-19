@@ -103,6 +103,27 @@ make('updates with batch operations', async function (db, t, done) {
   done()
 })
 
+make('updates excludes log data from the next sequence', async function (db, t, done) {
+  const since = db.sequence + 1
+  const batch = db.batch()
+  try {
+    batch._putLogData('parent')
+    batch._put('record', 'value')
+    batch._put('change', 'record')
+    batch._put('_update_seq', '1')
+    await batch._writeAsync()
+  } finally {
+    await batch.close()
+  }
+
+  const [update] = await Array.fromAsync(db.updates({ since }))
+  t.equal(update.seq, since, 'seq is the inclusive batch start')
+  t.equal(update.rows.length / 4, 4, 'log data is visible as a fourth row')
+  t.equal(update.nextSeq, since + 3, 'next seq counts only sequence-consuming writes')
+
+  done()
+})
+
 test('updates next seq includes operations filtered out by column', async function (t) {
   const db = testCommon.factory()
   await db.open({
