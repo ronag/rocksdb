@@ -496,12 +496,13 @@ test('seeded concurrent operations drain before repeated close and reopen', asyn
       if (round % 2 === 0) writes.push(db.flushWAL({ sync: true }))
 
       const closing = db.close()
-      const [iteratorResults, readResults] = await Promise.all([
+      const results = await Promise.all([
         Promise.all(iterators.map(({ promise }) => promise)),
         Promise.all(reads),
         Promise.all(writes),
         closing
       ])
+      const [iteratorResults, readResults] = results
 
       for (let index = 0; index < iteratorResults.length; index++) {
         assert.deepEqual(iteratorResults[index], iterators[index].expected,
