@@ -27,6 +27,7 @@ const kPendingClose = Symbol('pendingClose')
 const kReferenceResource = Symbol('referenceResource')
 const kCleanupResources = Symbol('cleanupResources')
 const kGetManyAsync = Symbol('getManyAsync')
+const kGetManySync = Symbol('getManySync')
 const kBatchAsync = Symbol('batchAsync')
 const kWithRef = Symbol('withRef')
 
@@ -258,6 +259,18 @@ function prepareRawGetManyOptions(options, packed?) {
   }
 }
 
+// Raw getMany entry points carry their settlement controls on the options
+// object rather than as positional arguments. allowPartial stays undefined when
+// unset so the shared core can still infer it from bounded-read options (a
+// positive timeout or any highWaterMarkBytes). exposePacked defaults to true so
+// unsafe callers keep receiving the packed-mode discriminator on their results.
+function readRawGetManyControls(options) {
+  if ((typeof options === 'object' && options !== null) || typeof options === 'function') {
+    return { allowPartial: options.allowPartial, exposePacked: options.exposePacked ?? true }
+  }
+  return { allowPartial: undefined, exposePacked: true }
+}
+
 function convertRawGetManyResult(result, valueEncoding) {
   if (!isJavaScriptEncoding(valueEncoding)) return result
 
@@ -460,13 +473,22 @@ class RocksLevel extends AbstractLevel<any, any, any> {
 
   async _get(key, options) {
     const values = await this[kWithRef](() =>
-      this._getManyAsync([key], options ?? kEmpty, undefined, false, false, false)
+      this[kGetManyAsync](
+        [key],
+        options ?? kEmpty,
+        fromCallback(undefined, kPromise),
+        false,
+        false,
+        false
+      )
     )
     return values[0]
   }
 
   _getMany(keys, options) {
-    return this[kWithRef](() => this._getManyAsync(keys, options, undefined, false, false, false))
+    return this[kWithRef](() =>
+      this[kGetManyAsync](keys, options, fromCallback(undefined, kPromise), false, false, false)
+    )
   }
 
   // Supported unsafe user-space read. The database must already be open and
@@ -475,13 +497,14 @@ class RocksLevel extends AbstractLevel<any, any, any> {
   // encoded keys and own option reentrancy and error observation. Raw database
   // reads may overlap one another. Native admission copies key bytes and this
   // wrapper snapshots result-conversion options before returning.
-  _getManyAsync(keys, options, callback, allowPartial, packed, exposePacked = true) {
+  _getManyAsync(keys, options, callback) {
     if (DEBUG) {
       assert.strictEqual(this.status, 'open', 'unsafe _getManyAsync() requires an open database')
     }
 
     callback = fromCallback(callback, kPromise)
-    return this[kGetManyAsync](keys, options, callback, allowPartial, packed, exposePacked)
+    const { allowPartial, exposePacked } = readRawGetManyControls(options)
+    return this[kGetManyAsync](keys, options, callback, allowPartial, undefined, exposePacked)
   }
 
   [kGetManyAsync](keys, options, callback, allowPartial, packed, exposePacked) {
@@ -576,18 +599,42 @@ class RocksLevel extends AbstractLevel<any, any, any> {
 
   // Synchronous counterpart to _getManyAsync(). It has the same open-database,
   // encoded-input and no-close invariants and may block the JavaScript event
-  // loop. Returned values and packed arenas own their backing bytes.
+  // loop, and honours the same allowPartial / packed / exposePacked options.
+  // Returned values and packed arenas own their backing bytes.
   _getManySync(keys, options?) {
     if (DEBUG) {
       assert.strictEqual(this.status, 'open', 'unsafe _getManySync() requires an open database')
     }
 
+    const { allowPartial, exposePacked } = readRawGetManyControls(options)
+    return this[kGetManySync](keys, options, allowPartial, undefined, exposePacked)
+  }
+
+  [kGetManySync](keys, options, allowPartial, packed, exposePacked) {
     if (keys.some((key) => typeof key === 'string')) {
       keys = keys.map((key) => (typeof key === 'string' ? Buffer.from(key) : key))
     }
 
-    const prepared = prepareRawGetManyOptions(options)
-    const packed = prepared.packed
+    let bindingOptions = options
+    if (allowPartial == null) {
+      allowPartial = false
+      if ((typeof options === 'object' && options !== null) || typeof options === 'function') {
+        bindingOptions = new Proxy(options, {
+          get(target, property) {
+            const value = Reflect.get(target, property, target)
+            if (property === 'timeout' && typeof value === 'number' && value > 0) {
+              allowPartial = true
+            } else if (property === 'highWaterMarkBytes' && value != null) {
+              allowPartial = true
+            }
+            return value
+          },
+        })
+      }
+    }
+
+    const prepared = prepareRawGetManyOptions(bindingOptions, packed)
+    packed = prepared.packed
     const getMany =
       packed === true
         ? binding.db_get_many_packed_sync
@@ -596,8 +643,36 @@ class RocksLevel extends AbstractLevel<any, any, any> {
           : binding.db_get_many_sync
     const nativeResult = getMany(this[kContext], keys, prepared.bindingOptions)
     const packedResult = !Array.isArray(nativeResult)
+
+    let incomplete = false
+    if (packedResult) {
+      for (let i = 0; i < nativeResult.statuses.length; i++) {
+        if (nativeResult.statuses[i] === 2) {
+          incomplete = true
+          break
+        }
+      }
+    } else {
+      for (let i = 0; i < nativeResult.length; i++) {
+        if (nativeResult[i] === null) {
+          incomplete = true
+          break
+        }
+      }
+    }
+
     const result = convertRawGetManyResult(nativeResult, prepared.valueEncoding)
-    return setPackedResult(result, packedResult)
+
+    if (incomplete && !allowPartial) {
+      const message =
+        keys.length === 1
+          ? 'Multi-get stopped before the value was read'
+          : 'Multi-get stopped before every value was read'
+      throw new ModuleError(message, { code: 'LEVEL_ABORTED' })
+    }
+
+    if (exposePacked) setPackedResult(result, packedResult)
+    return result
   }
 
   _del(key, options) {

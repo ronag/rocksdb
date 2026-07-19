@@ -416,21 +416,69 @@ test('raw bounded getMany preserves partial markers', async function (t) {
 
     const completeOnlyError = await rejection(db._getManyAsync(
       ['found', 'missing', 'partial'],
-      { highWaterMarkBytes: 0, packed: false },
-      undefined,
-      false
+      { highWaterMarkBytes: 0, packed: false, allowPartial: false }
     ))
     t.equal(completeOnlyError.code, 'LEVEL_ABORTED', 'explicit complete-only reads reject partial results')
 
     const explicitPartialRows = await db._getManyAsync(
       ['found', 'missing', 'partial'],
-      { highWaterMarkBytes: 0, packed: false },
-      undefined,
-      true
+      { highWaterMarkBytes: 0, packed: false, allowPartial: true }
     )
     t.equal(explicitPartialRows[2], null, 'explicit partial reads preserve incomplete markers')
   } finally {
     binding.db_get_many = dbGetMany
+    await db.close()
+  }
+  t.end()
+})
+
+test('raw sync getMany honours the same allowPartial / exposePacked options', async function (t) {
+  const db = testCommon.factory()
+  await db.open()
+  const dbGetManySync = binding.db_get_many_sync
+
+  try {
+    binding.db_get_many_sync = (context, keys, options) => {
+      // Reading the bound drives the same allowPartial inference as the async
+      // path. Native returns already-decoded values for a JavaScript encoding.
+      const bound = options.highWaterMarkBytes
+      if (bound != null) t.equal(bound, 0, 'stub observes the native bound')
+      const value = options.valueEncoding === 'utf8' ? 'value' : Buffer.from('value')
+      return [value, undefined, null]
+    }
+
+    // A bounded read infers allowPartial, so incomplete slots stay as null.
+    const inferred = db._getManySync(['found', 'missing', 'partial'], {
+      highWaterMarkBytes: 0,
+      packed: false
+    })
+    t.equal(inferred[0].toString(), 'value', 'found values remain buffers')
+    t.equal(inferred[1], undefined, 'missing keys remain undefined')
+    t.equal(inferred[2], null, 'inferred partial reads keep incomplete markers')
+    t.equal(inferred.packed, false, 'sync exposes the packed discriminator by default')
+
+    // allowPartial:false turns an incomplete slot into a thrown LEVEL_ABORTED.
+    t.throws(
+      () => db._getManySync(['found', 'missing', 'partial'], {
+        highWaterMarkBytes: 0,
+        packed: false,
+        allowPartial: false
+      }),
+      (err) => err && err.code === 'LEVEL_ABORTED',
+      'explicit complete-only sync reads throw on incomplete slots'
+    )
+
+    // exposePacked:false drops the discriminator for a JavaScript encoding.
+    const bare = db._getManySync(['found', 'missing', 'partial'], {
+      valueEncoding: 'utf8',
+      allowPartial: true,
+      exposePacked: false
+    })
+    t.equal(Object.hasOwn(bare, 'packed'), false, 'exposePacked:false omits the discriminator')
+    t.equal(bare[0], 'value', 'found values decode with the requested encoding')
+    t.equal(bare[2], null, 'explicit partial sync reads keep incomplete markers')
+  } finally {
+    binding.db_get_many_sync = dbGetManySync
     await db.close()
   }
   t.end()
