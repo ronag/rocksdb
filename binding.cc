@@ -3531,6 +3531,9 @@ static napi_status GetPackedIteratorKeyInput(napi_env env,
     result.count = static_cast<uint32_t>(count);
   }
 
+  if (result.count > (std::numeric_limits<size_t>::max() - 1) / result.fieldsPerRow) {
+    return PackedIteratorKeyInputError(env, "Packed getMany input count exceeds the platform limit");
+  }
   const auto expectedOffsets = static_cast<size_t>(result.count) * result.fieldsPerRow + 1;
   if (result.offsetsLength != expectedOffsets) {
     return PackedIteratorKeyInputError(env, "Packed getMany input offsets do not match its row layout");
