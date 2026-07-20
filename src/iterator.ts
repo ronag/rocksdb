@@ -185,6 +185,7 @@ function emptyPackedResult(iterator) {
     values: iterator[kValues],
     finished: true,
     limited: false,
+    lastKey: undefined,
   }
 }
 
@@ -281,6 +282,7 @@ function convertIteratorResult(iterator, result) {
     rows,
     finished: result.finished,
     limited: result.limited,
+    lastKey: result.lastKey,
   }
 }
 
@@ -765,7 +767,7 @@ class Iterator extends AbstractIterator<any, any, any> {
     const finished = this[kFinished] && this[kPosition] >= this[kCache].length
     const limited = !finished && rows.length >= size * 2
 
-    return { rows, finished, limited }
+    return { rows, finished, limited, lastKey: undefined }
   }
 
   // Read already-encoded rows without public count/end bookkeeping. Returned
@@ -795,7 +797,10 @@ class Iterator extends AbstractIterator<any, any, any> {
     }
 
     if (this[kFinished]) {
-      const result = packed === true ? emptyPackedResult(this) : { rows: [], finished: true }
+      const result =
+        packed === true
+          ? emptyPackedResult(this)
+          : { rows: [], finished: true, lastKey: undefined }
       return setPackedResult(convertIteratorResult(this, result), packed === true)
     }
 
@@ -856,7 +861,10 @@ class Iterator extends AbstractIterator<any, any, any> {
         const result = this._nextvCached(size)
         this._deferNextResult(callback, null, result, false, unsafe)
       } else if (this[kFinished]) {
-        const result = packed === true ? emptyPackedResult(this) : { rows: [], finished: true }
+        const result =
+          packed === true
+            ? emptyPackedResult(this)
+            : { rows: [], finished: true, lastKey: undefined }
         this._deferNextResult(callback, null, result, packed === true, unsafe)
       } else {
         const nextv =

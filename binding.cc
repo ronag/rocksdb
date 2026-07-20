@@ -1976,6 +1976,8 @@ class Iterator final : public BaseIterator, public std::enable_shared_from_this<
     struct State {
       std::vector<rocksdb::PinnableSlice> keys;
       std::vector<rocksdb::PinnableSlice> values;
+      rocksdb::PinnableSlice lastKey;
+      bool hasLastKey = false;
       rocksdb::PinnableSlice packedData;
       std::vector<uint32_t> offsets;
       size_t count = 0;
@@ -2076,10 +2078,14 @@ class Iterator final : public BaseIterator, public std::enable_shared_from_this<
             // exhaust its budget on non-matching rows and return fewer (or zero)
             // matches than exist.
             if (keyFilter_ && !re2::RE2::PartialMatch(CurrentKey().ToStringView(), *keyFilter_)) {
+              state.lastKey.PinSelf(CurrentKey());
+              state.hasLastKey = true;
               continue;
             }
 
             if (valueFilter_ && !re2::RE2::PartialMatch(CurrentValue().ToStringView(), *valueFilter_)) {
+              state.lastKey.PinSelf(CurrentKey());
+              state.hasLastKey = true;
               continue;
             }
 
@@ -2090,6 +2096,9 @@ class Iterator final : public BaseIterator, public std::enable_shared_from_this<
               state.limited = true;
               break;
             }
+
+            state.lastKey.PinSelf(CurrentKey());
+            state.hasLastKey = true;
 
             if (!state.modeDecided) {
               state.packed = ShouldAutoPackCurrent();
@@ -2159,6 +2168,13 @@ class Iterator final : public BaseIterator, public std::enable_shared_from_this<
           napi_value limited;
           NAPI_STATUS_RETURN(napi_get_boolean(env, state.limited, &limited));
 
+          napi_value lastKey;
+          if (state.hasLastKey) {
+            NAPI_STATUS_RETURN(Convert(env, std::move(state.lastKey), Encoding::Buffer, lastKey, true));
+          } else {
+            NAPI_STATUS_RETURN(napi_get_undefined(env, &lastKey));
+          }
+
           if (state.packed) {
             state.packedData.PinSelf();
 
@@ -2195,6 +2211,7 @@ class Iterator final : public BaseIterator, public std::enable_shared_from_this<
             NAPI_STATUS_RETURN(napi_set_named_property(env, *result, "values", values));
             NAPI_STATUS_RETURN(napi_set_named_property(env, *result, "finished", finished));
             NAPI_STATUS_RETURN(napi_set_named_property(env, *result, "limited", limited));
+            NAPI_STATUS_RETURN(napi_set_named_property(env, *result, "lastKey", lastKey));
 
             return napi_ok;
           }
@@ -2228,6 +2245,7 @@ class Iterator final : public BaseIterator, public std::enable_shared_from_this<
           NAPI_STATUS_RETURN(napi_set_named_property(env, *result, "rows", rows));
           NAPI_STATUS_RETURN(napi_set_named_property(env, *result, "finished", finished));
           NAPI_STATUS_RETURN(napi_set_named_property(env, *result, "limited", limited));
+          NAPI_STATUS_RETURN(napi_set_named_property(env, *result, "lastKey", lastKey));
 
           return napi_ok;
         }));
@@ -2261,6 +2279,8 @@ class Iterator final : public BaseIterator, public std::enable_shared_from_this<
     NAPI_STATUS_THROWS(napi_get_boolean(env, false, &limited));
 
     napi_value rows = nullptr;
+    rocksdb::PinnableSlice lastKey;
+    bool hasLastKey = false;
     rocksdb::PinnableSlice packedData;
     std::vector<uint32_t> offsets;
     bool packed = mode == PackedMode::Packed;
@@ -2318,10 +2338,14 @@ class Iterator final : public BaseIterator, public std::enable_shared_from_this<
       // Apply the key/value filters BEFORE charging the user `limit`, so `limit`
       // counts matched (emitted) rows, not rows merely scanned and discarded.
       if (keyFilter_ && !re2::RE2::PartialMatch(CurrentKey().ToStringView(), *keyFilter_)) {
+        lastKey.PinSelf(CurrentKey());
+        hasLastKey = true;
         continue;
       }
 
       if (valueFilter_ && !re2::RE2::PartialMatch(CurrentValue().ToStringView(), *valueFilter_)) {
+        lastKey.PinSelf(CurrentKey());
+        hasLastKey = true;
         continue;
       }
 
@@ -2332,6 +2356,9 @@ class Iterator final : public BaseIterator, public std::enable_shared_from_this<
         NAPI_STATUS_THROWS(napi_get_boolean(env, true, &limited));
         break;
       }
+
+      lastKey.PinSelf(CurrentKey());
+      hasLastKey = true;
 
       if (!modeDecided) {
         packed = ShouldAutoPackCurrent();
@@ -2433,6 +2460,14 @@ class Iterator final : public BaseIterator, public std::enable_shared_from_this<
     }
     NAPI_STATUS_THROWS(napi_set_named_property(env, ret, "finished", finished));
     NAPI_STATUS_THROWS(napi_set_named_property(env, ret, "limited", limited));
+
+    napi_value lastKeyValue;
+    if (hasLastKey) {
+      NAPI_STATUS_THROWS(Convert(env, std::move(lastKey), Encoding::Buffer, lastKeyValue, true));
+    } else {
+      NAPI_STATUS_THROWS(napi_get_undefined(env, &lastKeyValue));
+    }
+    NAPI_STATUS_THROWS(napi_set_named_property(env, ret, "lastKey", lastKeyValue));
     return ret;
   }
 };
