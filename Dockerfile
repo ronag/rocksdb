@@ -1,11 +1,15 @@
-# Build on the oldest official Node 26 Debian image. The binding and bundled
-# RocksDB both target C++20, which Bullseye's GCC 10 supports, and the older
-# toolchain keeps the generic npm prebuild usable on older Linux distributions.
-FROM node:26.4.0-bullseye@sha256:547115894d02507bae039a4eecdc0feb1ce337d7e7dcda5cd19d521bb29da4d3 AS build
+# Build on the Node 26 Debian Bookworm image. The binding and bundled RocksDB
+# both target C++20, which Bookworm's GCC 12 supports. Its glibc 2.36 /
+# libstdc++ (GCC 12) symbols are the ABI baseline the generic npm prebuild
+# targets, enforced by scripts/check-linux-prebuild.js.
+FROM node:26.4.0-bookworm@sha256:6000864d78f7f7e4f1a832c014fc7ff50dc95c60c665c7b722281e3dc5b58dfd AS build
 
+# Bookworm's CMake 3.25 already satisfies RE2's 3.22 minimum, so the distro
+# package is used directly instead of a pinned upstream tarball.
 RUN apt-get update && apt-get install -y \
   build-essential \
   ccache \
+  cmake \
   git \
   python3 \
   curl \
@@ -13,18 +17,6 @@ RUN apt-get update && apt-get install -y \
   make \
   libssl-dev \
   && rm -rf /var/lib/apt/lists/*
-
-# Bullseye's CMake 3.18 is older than RE2's 3.22 minimum. Install the pinned
-# upstream Kitware binary without changing the distro or runtime ABI baseline.
-ARG CMAKE_VERSION=3.22.6
-ARG CMAKE_SHA256=09e1b34026c406c5bf4d1b053eadb3a8519cb360e37547ebf4b70ab766d94fbc
-RUN curl -fsSL \
-    "https://github.com/Kitware/CMake/releases/download/v$CMAKE_VERSION/cmake-$CMAKE_VERSION-linux-x86_64.tar.gz" \
-    -o /tmp/cmake.tar.gz \
-  && echo "$CMAKE_SHA256  /tmp/cmake.tar.gz" | sha256sum --check - \
-  && tar -xzf /tmp/cmake.tar.gz --strip-components=1 -C /usr/local \
-  && rm /tmp/cmake.tar.gz \
-  && cmake --version
 
 WORKDIR /rocks-level
 
@@ -63,9 +55,8 @@ RUN npm install --ignore-scripts
 
 COPY . .
 
-# Exercise the real forced-source install path on Bullseye. The rocksdb gyp
-# target generates its audited GCC 10 compatibility header before compilation,
-# so npm consumers and prebuild generation cannot take different paths.
+# Exercise the real forced-source install path on Bookworm, so npm consumers
+# and prebuild generation cannot take different paths.
 RUN --mount=type=cache,target=/ccache,id=rocks-level-ccache,sharing=locked \
     --mount=type=bind,from=ccache,target=/ccache-seed,ro \
     cp -an /ccache-seed/. /ccache/ 2>/dev/null || true; \

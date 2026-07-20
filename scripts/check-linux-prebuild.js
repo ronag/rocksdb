@@ -6,13 +6,15 @@ const path = require('node:path')
 const { execFileSync } = require('node:child_process')
 const { persistentPrefixDir } = require('./deps-prefix.js')
 
-// Project-audited portability ceilings, intentionally stricter than the
-// Bullseye toolchain defaults. Keeping these explicit turns a future compiler
-// or dependency upgrade into a reviewed compatibility decision.
+// Bookworm toolchain ABI ceilings: the newest symbol versions the base
+// image's glibc 2.36 and GCC 12 libstdc++ can emit. The published prebuild
+// must not require anything newer, so bumping the base image to a distro with
+// a higher baseline stays a reviewed compatibility decision rather than a
+// silent portability regression.
 const ABI_LIMITS = {
-  GLIBC: '2.30',
-  GLIBCXX: '3.4.26',
-  CXXABI: '1.3.11'
+  GLIBC: '2.36',
+  GLIBCXX: '3.4.30',
+  CXXABI: '1.3.13'
 }
 
 const ALLOWED_DYNAMIC_LIBRARIES = new Set([

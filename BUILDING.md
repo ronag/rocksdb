@@ -30,18 +30,10 @@ Builds a portable x86-64 prebuild inside Docker (see [Dockerfile](Dockerfile))
 and exports it to `prebuilds/linux-x64`. This requires Docker with BuildKit's
 `type=local` output support; `build.sh` enables BuildKit explicitly and exports
 the final scratch artifact stage without creating a temporary container. The
-build image is based on the official Node 26 Bullseye variant. The Linux binding
-uses the same C++20 language level as the bundled RocksDB, which GCC 10 supports.
-The build rejects artifacts that require symbols newer than Bullseye's
+build image is based on the official Node 26 Bookworm variant. The Linux binding
+uses the same C++20 language level as the bundled RocksDB, which GCC 12 supports.
+The build rejects artifacts that require symbols newer than Bookworm's
 glibc/libstdc++ ABI.
-
-GCC 10 lacks one C++20 `using enum` feature used by the vendored RocksDB
-header. The RocksDB gyp target generates an exact-match compatibility overlay
-that qualifies those three enum values instead, without modifying the vendored
-source. This Linux-only action runs for Docker, npm source installs and
-prebuildify. Its test and build both fail if the single expected source block
-drifts, so an upstream change must be reviewed rather than patched
-approximately. Darwin and Windows continue to include the original header.
 
 Uses the local Docker daemon; point `DOCKER_HOST=ssh://user@host` at a remote
 amd64 host to avoid emulation on Apple Silicon. CPU tuning remains available
@@ -62,11 +54,11 @@ host even when `DOCKER_HOST` points at a remote builder. Exporting is
 best-effort and never fails a release. Override the location with
 `ROCKS_LEVEL_CCACHE_DIR`.
 
-The base image digest, CMake tarball checksum, RocksDB submodule and native
-dependency commits are pinned, and the resulting ABI and CPU baseline are
-checked. This is not a byte-for-byte reproducible build: Bullseye packages
-still resolve through mutable `apt` repositories, and this package has no
-tracked npm lockfile, so `npm install` resolves an unpinned dependency graph.
+The base image digest, RocksDB submodule and native dependency commits are
+pinned, and the resulting ABI and CPU baseline are checked. This is not a
+byte-for-byte reproducible build: Bookworm packages still resolve through
+mutable `apt` repositories, and this package has no tracked npm lockfile, so
+`npm install` resolves an unpinned dependency graph.
 
 ## macOS
 

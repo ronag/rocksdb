@@ -114,7 +114,7 @@ test('Linux prebuild base is pinned to the audited amd64 image manifest', functi
 
   t.equal(
     from,
-    'node:26.4.0-bullseye@sha256:547115894d02507bae039a4eecdc0feb1ce337d7e7dcda5cd19d521bb29da4d3'
+    'node:26.4.0-bookworm@sha256:6000864d78f7f7e4f1a832c014fc7ff50dc95c60c665c7b722281e3dc5b58dfd'
   )
   t.match(
     dockerfile,
