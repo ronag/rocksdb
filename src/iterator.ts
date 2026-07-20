@@ -176,11 +176,13 @@ function packedCacheError() {
   })
 }
 
-function emptyPackedResult() {
+function emptyPackedResult(iterator) {
   return {
     buffer: Buffer.alloc(0),
     offsets: new Uint32Array([0]),
     count: 0,
+    keys: iterator[kKeys],
+    values: iterator[kValues],
     finished: true,
     limited: false,
   }
@@ -793,7 +795,7 @@ class Iterator extends AbstractIterator<any, any, any> {
     }
 
     if (this[kFinished]) {
-      const result = packed === true ? emptyPackedResult() : { rows: [], finished: true }
+      const result = packed === true ? emptyPackedResult(this) : { rows: [], finished: true }
       return setPackedResult(convertIteratorResult(this, result), packed === true)
     }
 
@@ -854,7 +856,7 @@ class Iterator extends AbstractIterator<any, any, any> {
         const result = this._nextvCached(size)
         this._deferNextResult(callback, null, result, false, unsafe)
       } else if (this[kFinished]) {
-        const result = packed === true ? emptyPackedResult() : { rows: [], finished: true }
+        const result = packed === true ? emptyPackedResult(this) : { rows: [], finished: true }
         this._deferNextResult(callback, null, result, packed === true, unsafe)
       } else {
         const nextv =

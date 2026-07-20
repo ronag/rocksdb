@@ -392,6 +392,13 @@ expectType<Promise<RocksPackedIteratorResult | RocksRawIteratorResult<Buffer, Bu
 )
 expectType<RocksPackedIteratorResult>(iterator._nextvSync(10, { packed: true }))
 expectType<Promise<RocksPackedIteratorResult>>(iterator._nextvAsync(10, { packed: true }))
+const packedIteratorKeys = iterator._nextvSync(10, { packed: true })
+expectType<RocksPackedGetManyResult | RocksRawGetManyResult<'buffer', false, false>>(
+  db._getManySync(packedIteratorKeys)
+)
+expectType<Promise<RocksPackedGetManyResult | RocksRawGetManyResult<'buffer', false, false>>>(
+  db._getManyAsync(packedIteratorKeys)
+)
 expectType<RocksPackedIteratorResult | RocksRawIteratorResult<Buffer, Buffer>>(
   iterator._nextvSync(10, { packed: booleanFlag })
 )
@@ -498,9 +505,17 @@ const valuesOnlyIterator = db._iterator({
   valueEncoding: 'buffer',
 })
 expectType<
-  Promise<RocksPackedIteratorResult | RocksRawIteratorResult<string, Buffer, false, true>>
+  Promise<
+    | RocksPackedIteratorResult<false, true>
+    | RocksRawIteratorResult<string, Buffer, false, true>
+  >
 >(valuesOnlyIterator._nextvAsync(10))
-expectType<Promise<RocksPackedIteratorResult>>(valuesOnlyIterator._nextvAsync(10, { packed: true }))
+const packedValuesOnly = valuesOnlyIterator._nextvAsync(10, { packed: true })
+expectType<Promise<RocksPackedIteratorResult<false, true>>>(packedValuesOnly)
+packedValuesOnly.then((input) => {
+  // @ts-expect-error Packed getMany input must contain iterator keys
+  db._getManySync(input)
+})
 
 const keysOnlyIterator = db._iterator({
   keys: true,
@@ -509,9 +524,16 @@ const keysOnlyIterator = db._iterator({
   valueEncoding: 'utf8',
 })
 expectType<
-  Promise<RocksPackedIteratorResult | RocksRawIteratorResult<Buffer, string, true, false>>
+  Promise<
+    | RocksPackedIteratorResult<true, false>
+    | RocksRawIteratorResult<Buffer, string, true, false>
+  >
 >(keysOnlyIterator._nextvAsync(10))
-expectType<RocksPackedIteratorResult>(keysOnlyIterator._nextvSync(10, { packed: true }))
+const packedKeysOnly = keysOnlyIterator._nextvSync(10, { packed: true })
+expectType<RocksPackedIteratorResult<true, false>>(packedKeysOnly)
+expectType<RocksPackedGetManyResult | RocksRawGetManyResult<'buffer', false, false>>(
+  db._getManySync(packedKeysOnly)
+)
 
 const noFieldsRawIterator = db._iterator({
   keys: false,
@@ -520,9 +542,14 @@ const noFieldsRawIterator = db._iterator({
   valueEncoding: 'slice',
 })
 expectType<
-  Promise<RocksPackedIteratorResult | RocksRawIteratorResult<string, Slice, false, false>>
+  Promise<
+    | RocksPackedIteratorResult<false, false>
+    | RocksRawIteratorResult<string, Slice, false, false>
+  >
 >(noFieldsRawIterator._nextvAsync(10))
-expectType<RocksPackedIteratorResult>(noFieldsRawIterator._nextvSync(10, { packed: true }))
+expectType<RocksPackedIteratorResult<false, false>>(
+  noFieldsRawIterator._nextvSync(10, { packed: true })
+)
 
 const batch = db.batch()
 // @ts-expect-error Standard chained-batch write callbacks were removed by abstract-level v3

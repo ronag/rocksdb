@@ -31,6 +31,8 @@ test('packed nextv returns one byte arena and cumulative field offsets', async f
   const first = await iterator._nextvAsync(2, { packed: true })
 
   t.equal(first.packed, true, 'async result exposes the selected packed mode')
+  t.equal(first.keys, true, 'async result describes its key fields')
+  t.equal(first.values, true, 'async result describes its value fields')
   t.equal(first.count, 2, 'reports logical row count')
   t.same(first.offsets, new Uint32Array([0, 1, 4, 5, 8]),
     'offsets delimit alternating key/value fields')
@@ -44,6 +46,10 @@ test('packed nextv returns one byte arena and cumulative field offsets', async f
   t.equal(second.finished, true, 'reports natural exhaustion')
   t.equal(second.limited, false, 'natural exhaustion is not a limit')
 
+  const exhausted = await iterator._nextvAsync(2, { packed: true })
+  t.equal(exhausted.keys, true, 'an exhausted packed result retains its key layout')
+  t.equal(exhausted.values, true, 'an exhausted packed result retains its value layout')
+
   const retained = second.buffer
   await iterator.close()
   t.equal(retained.byteLength, 2049, 'arena remains owned after iterator close')
@@ -56,6 +62,8 @@ test('packed nextv supports synchronous reads', async function (t) {
   const result = iterator._nextvSync(2, { packed: true })
 
   t.equal(result.packed, true, 'sync result exposes the selected packed mode')
+  t.equal(result.keys, true, 'sync result describes its key fields')
+  t.equal(result.values, true, 'sync result describes its value fields')
   t.equal(result.count, 2, 'reports logical row count')
   t.same(result.offsets, new Uint32Array([0, 1, 4, 5, 8]),
     'sync offsets delimit alternating key/value fields')
@@ -193,6 +201,8 @@ test('packed nextv stores only enabled fields', async function (t) {
         const prefix = `${readName} ${modeName} ${layout.name}`
 
         t.equal(result.packed, true, `${prefix} selects packed mode`)
+        t.equal(result.keys, layout.options.keys, `${prefix} describes its key fields`)
+        t.equal(result.values, layout.options.values, `${prefix} describes its value fields`)
         t.notOk('rows' in result, `${prefix} preserves the arena shape`)
         t.equal(result.count, 3, `${prefix} preserves the logical row count`)
         t.equal(result.offsets.length, layout.expected.length + 1,

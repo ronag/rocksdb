@@ -153,6 +153,14 @@ Packed `getMany` results contain:
 - `statuses`: one status per key (`0` value, `1` not found, `2` incomplete)
 - `count`: number of requested keys
 
+Packed iterator results additionally expose `keys` and `values` booleans that
+describe the fields stored for each row. A packed `_nextvSync()` or
+`_nextvAsync()` result whose `keys` field is `true` can be passed directly to
+`_getManySync()` or `_getManyAsync()`. The multi-get reads the first field of
+each row as its key and skips interleaved value fields. Async multi-get snapshots
+the packed key fields before returning, so the caller can immediately reuse or
+release the iterator arena.
+
 The raw methods additionally support JavaScript conversion for `slice`, `utf8`
 and its `utf-8` alias. This behavior is intentionally not added to the
 AbstractLevel encoding manifest. It is only exposed by `_getManySync()`,
