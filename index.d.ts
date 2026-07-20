@@ -878,6 +878,7 @@ export interface RocksUpdatesOptions<
 
 export interface RocksUpdate<K = Buffer | string, V = Buffer | string> {
   readonly seq: number
+  readonly nextSeq: number
   readonly rows: Array<'put' | 'del' | 'merge' | 'data' | 'clear' | K | V | null>
 }
 

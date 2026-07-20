@@ -4954,13 +4954,18 @@ NAPI_METHOD(updates_next) {
         if (state.batchResult.writeBatchPtr != nullptr) {
           napi_value rows;
           napi_value sequence;
+          napi_value nextSequence;
 
           NAPI_STATUS_RETURN(updates->Iterate(env, *state.batchResult.writeBatchPtr, &rows));
           NAPI_STATUS_RETURN(napi_create_int64(env, state.batchResult.sequence, &sequence));
+          NAPI_STATUS_RETURN(napi_create_int64(
+              env, state.batchResult.sequence + state.batchResult.writeBatchPtr->Count(),
+              &nextSequence));
 
           NAPI_STATUS_RETURN(napi_create_object(env, result));
           NAPI_STATUS_RETURN(napi_set_named_property(env, *result, "rows", rows));
           NAPI_STATUS_RETURN(napi_set_named_property(env, *result, "seq", sequence));
+          NAPI_STATUS_RETURN(napi_set_named_property(env, *result, "nextSeq", nextSequence));
         }
 
         return napi_ok;
