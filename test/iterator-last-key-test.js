@@ -84,3 +84,39 @@ test('raw packed and unpacked iterator reads expose encoded lastKey', async func
   await db.close()
   t.end()
 })
+
+test('raw reads return safe lastKey boundaries while draining the public prefetch cache', async function (t) {
+  const db = testCommon.factory()
+  await db.open()
+
+  const batch = db.batch()
+  for (let index = 0; index < 20; index++) {
+    const key = `key${String(index).padStart(2, '0')}`
+    batch.put(key, `value${index}`)
+  }
+  await batch.write()
+
+  for (const [name, read] of [
+    ['sync', (iterator, size) => iterator._nextvSync(size, { packed: false })],
+    ['async', (iterator, size) => iterator._nextvAsync(size, { packed: false })]
+  ]) {
+    const iterator = db.iterator()
+    await iterator.next()
+    await iterator.next()
+    t.ok(iterator.cached > 0, `${name} precondition: public next prefetched rows`)
+
+    const partial = await read(iterator, 3)
+    t.same(partial.rows.filter((_, index) => index % 2 === 0), ['key02', 'key03', 'key04'],
+      `${name} returns the requested cached rows`)
+    t.same(partial.lastKey, Buffer.from('key04'),
+      `${name} encodes the last key of a partial cache drain`)
+
+    const remainder = await read(iterator, 100)
+    t.same(remainder.lastKey, Buffer.from('key19'),
+      `${name} preserves the native scan boundary when draining the cache`)
+    await iterator.close()
+  }
+
+  await db.close()
+  t.end()
+})
