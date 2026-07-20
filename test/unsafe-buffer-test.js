@@ -104,8 +104,8 @@ test('packed iterator arena survives iterator close and forced GC', async functi
     for (let index = 0; index < 4; index++) global.gc()
   }
 
-  const valueStart = result.offsets[1]
-  const valueEnd = result.offsets[2]
+  const valueStart = result.values[0]
+  const valueEnd = valueStart + result.values[1]
   t.equal(result.count, 1, 'retained one packed row')
   t.ok(result.buffer.subarray(valueStart, valueEnd).equals(expected),
     'external packed arena remains valid after close and GC')

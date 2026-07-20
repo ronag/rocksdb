@@ -447,17 +447,12 @@ export interface RocksPackedIteratorResult<
   Values extends boolean = true,
 > {
   readonly packed: true
-  /** Whether each packed row contains a key field. */
-  readonly keys: Keys
-  /** Whether each packed row contains a value field after its key field. */
-  readonly values: Values
+  /** `[byteOffset, byteLength]` pairs for packed keys, or undefined when keys are disabled. */
+  readonly keys: Keys extends true ? Uint32Array : undefined
+  /** `[byteOffset, byteLength]` pairs for packed values, or undefined when values are disabled. */
+  readonly values: Values extends true ? Uint32Array : undefined
   /** Concatenated raw key/value bytes for this batch. */
   readonly buffer: Buffer
-  /**
-   * Cumulative field boundaries, starting at zero. Fields are stored in
-   * key-then-value order according to the iterator's keys/values options.
-   */
-  readonly offsets: Uint32Array
   readonly count: number
   readonly finished: boolean
   readonly limited: boolean
@@ -480,9 +475,11 @@ export interface RocksPackedGetManyResult {
   readonly count: number
 }
 
-/** A packed iterator batch whose row layout includes encoded keys. */
-export type RocksPackedGetManyInput<Values extends boolean = boolean> =
-  RocksPackedIteratorResult<true, Values>
+/** A packed byte arena and `[byteOffset, byteLength]` pairs identifying its encoded keys. */
+export interface RocksPackedGetManyInput {
+  readonly offsets: Uint32Array
+  readonly buffer: Buffer
+}
 
 export type RocksRawGetManyValues<
   E extends RocksRawEncoding,

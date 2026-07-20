@@ -6,10 +6,11 @@ const testCommon = require('./common')
 
 let db
 
-function fields (result) {
+function fields (result, offsets) {
   const fields = []
-  for (let index = 0; index + 1 < result.offsets.length; index++) {
-    fields.push(result.buffer.subarray(result.offsets[index], result.offsets[index + 1]))
+  for (let index = 0; index < offsets.length; index += 2) {
+    const offset = offsets[index]
+    fields.push(result.buffer.subarray(offset, offset + offsets[index + 1]))
   }
   return fields
 }
@@ -26,18 +27,18 @@ test('setUp packed iterator database', async function (t) {
   t.end()
 })
 
-test('packed nextv returns one byte arena and cumulative field offsets', async function (t) {
+test('packed nextv returns one byte arena and separate field offsets', async function (t) {
   const iterator = db._iterator({ keyEncoding: 'buffer', valueEncoding: 'buffer' })
   const first = await iterator._nextvAsync(2, { packed: true })
 
   t.equal(first.packed, true, 'async result exposes the selected packed mode')
-  t.equal(first.keys, true, 'async result describes its key fields')
-  t.equal(first.values, true, 'async result describes its value fields')
+  t.same(first.keys, new Uint32Array([0, 1, 4, 1]), 'async result locates its key fields')
+  t.same(first.values, new Uint32Array([1, 3, 5, 3]), 'async result locates its value fields')
   t.equal(first.count, 2, 'reports logical row count')
-  t.same(first.offsets, new Uint32Array([0, 1, 4, 5, 8]),
-    'offsets delimit alternating key/value fields')
-  t.same(fields(first), [Buffer.from('a'), Buffer.from('one'), Buffer.from('b'), Buffer.from('two')],
-    'arena reconstructs the original rows')
+  t.same(fields(first, first.keys), [Buffer.from('a'), Buffer.from('b')],
+    'key offsets reconstruct the original keys')
+  t.same(fields(first, first.values), [Buffer.from('one'), Buffer.from('two')],
+    'value offsets reconstruct the original values')
   t.equal(first.finished, false, 'count cap leaves the iterator open')
   t.equal(first.limited, true, 'count cap is reported as limited')
 
@@ -47,8 +48,8 @@ test('packed nextv returns one byte arena and cumulative field offsets', async f
   t.equal(second.limited, false, 'natural exhaustion is not a limit')
 
   const exhausted = await iterator._nextvAsync(2, { packed: true })
-  t.equal(exhausted.keys, true, 'an exhausted packed result retains its key layout')
-  t.equal(exhausted.values, true, 'an exhausted packed result retains its value layout')
+  t.same(exhausted.keys, new Uint32Array(), 'an exhausted packed result retains its key table')
+  t.same(exhausted.values, new Uint32Array(), 'an exhausted packed result retains its value table')
 
   const retained = second.buffer
   await iterator.close()
@@ -62,13 +63,13 @@ test('packed nextv supports synchronous reads', async function (t) {
   const result = iterator._nextvSync(2, { packed: true })
 
   t.equal(result.packed, true, 'sync result exposes the selected packed mode')
-  t.equal(result.keys, true, 'sync result describes its key fields')
-  t.equal(result.values, true, 'sync result describes its value fields')
+  t.same(result.keys, new Uint32Array([0, 1, 4, 1]), 'sync result locates its key fields')
+  t.same(result.values, new Uint32Array([1, 3, 5, 3]), 'sync result locates its value fields')
   t.equal(result.count, 2, 'reports logical row count')
-  t.same(result.offsets, new Uint32Array([0, 1, 4, 5, 8]),
-    'sync offsets delimit alternating key/value fields')
-  t.same(fields(result), [Buffer.from('a'), Buffer.from('one'), Buffer.from('b'), Buffer.from('two')],
-    'sync arena reconstructs the original rows')
+  t.same(fields(result, result.keys), [Buffer.from('a'), Buffer.from('b')],
+    'sync key offsets reconstruct the original keys')
+  t.same(fields(result, result.values), [Buffer.from('one'), Buffer.from('two')],
+    'sync value offsets reconstruct the original values')
   t.equal(result.finished, false, 'count cap leaves the iterator open')
   t.equal(result.limited, true, 'count cap is reported as limited')
 
@@ -162,7 +163,8 @@ test('packed nextv stores only enabled fields', async function (t) {
         keyEncoding: 'buffer',
         valueEncoding: 'slice'
       },
-      expected: [Buffer.from('a'), Buffer.from('b'), Buffer.from('c')]
+      expectedKeys: [Buffer.from('a'), Buffer.from('b'), Buffer.from('c')],
+      expectedValues: undefined
     },
     {
       name: 'values-only',
@@ -172,7 +174,8 @@ test('packed nextv stores only enabled fields', async function (t) {
         keyEncoding: 'utf8',
         valueEncoding: 'buffer'
       },
-      expected: [Buffer.from('one'), Buffer.from('two'), Buffer.alloc(2048, 0x63)]
+      expectedKeys: undefined,
+      expectedValues: [Buffer.from('one'), Buffer.from('two'), Buffer.alloc(2048, 0x63)]
     },
     {
       name: 'no-fields',
@@ -182,7 +185,8 @@ test('packed nextv stores only enabled fields', async function (t) {
         keyEncoding: 'utf8',
         valueEncoding: 'slice'
       },
-      expected: []
+      expectedKeys: undefined,
+      expectedValues: undefined
     }
   ]
 
@@ -201,13 +205,18 @@ test('packed nextv stores only enabled fields', async function (t) {
         const prefix = `${readName} ${modeName} ${layout.name}`
 
         t.equal(result.packed, true, `${prefix} selects packed mode`)
-        t.equal(result.keys, layout.options.keys, `${prefix} describes its key fields`)
-        t.equal(result.values, layout.options.values, `${prefix} describes its value fields`)
+        if (layout.expectedKeys) {
+          t.same(fields(result, result.keys), layout.expectedKeys, `${prefix} stores key fields`)
+        } else {
+          t.equal(result.keys, undefined, `${prefix} omits its key table`)
+        }
+        if (layout.expectedValues) {
+          t.same(fields(result, result.values), layout.expectedValues, `${prefix} stores value fields`)
+        } else {
+          t.equal(result.values, undefined, `${prefix} omits its value table`)
+        }
         t.notOk('rows' in result, `${prefix} preserves the arena shape`)
         t.equal(result.count, 3, `${prefix} preserves the logical row count`)
-        t.equal(result.offsets.length, layout.expected.length + 1,
-          `${prefix} emits one boundary per enabled field plus the origin`)
-        t.same(fields(result), layout.expected, `${prefix} stores enabled fields without placeholders`)
         t.equal(result.finished, true, `${prefix} reports exhaustion`)
         t.equal(result.limited, false, `${prefix} is not count-limited`)
         await iterator.close()
@@ -230,7 +239,9 @@ test('default auto packing ignores disabled field sizes', async function (t) {
     const keys = autoDb._iterator({ keys: true, values: false })
     const keyResult = await read(keys)
     t.equal(keyResult.packed, true, `${name} ignores a disabled large value`)
-    t.same(fields(keyResult), [Buffer.from('small-key')], `${name} packs only the enabled key`)
+    t.same(fields(keyResult, keyResult.keys), [Buffer.from('small-key')],
+      `${name} packs only the enabled key`)
+    t.equal(keyResult.values, undefined, `${name} omits disabled value offsets`)
     await keys.close()
 
     const values = autoDb._iterator({ keys: false, values: true })
@@ -243,7 +254,8 @@ test('default auto packing ignores disabled field sizes', async function (t) {
     const none = autoDb._iterator({ keys: false, values: false })
     const noneResult = await read(none)
     t.equal(noneResult.packed, true, `${name} packs a no-field row`)
-    t.same(noneResult.offsets, new Uint32Array([0]), `${name} emits only the origin boundary`)
+    t.equal(noneResult.keys, undefined, `${name} omits disabled key offsets`)
+    t.equal(noneResult.values, undefined, `${name} omits disabled value offsets`)
     t.equal(noneResult.count, 1, `${name} retains the no-field logical row count`)
     await none.close()
   }
