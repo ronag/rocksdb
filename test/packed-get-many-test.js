@@ -48,28 +48,42 @@ test('getMany sync and async accept packed iterator batches', async function (t)
   await db.open()
   await db.batch([
     { type: 'put', key: Buffer.from('a'), value: Buffer.from('one') },
-    { type: 'put', key: Buffer.from('b'), value: Buffer.from('two') }
+    { type: 'put', key: Buffer.from('b'), value: Buffer.from('two') },
+    { type: 'put', key: Buffer.from('one'), value: Buffer.from('record-a') },
+    { type: 'put', key: Buffer.from('two'), value: Buffer.from('record-b') }
   ])
 
-  const syncIterator = db._iterator({ keyEncoding: 'buffer', valueEncoding: 'buffer' })
+  const syncIterator = db._iterator({
+    lt: Buffer.from('c'),
+    keyEncoding: 'buffer',
+    valueEncoding: 'buffer'
+  })
   const syncKeys = syncIterator._nextvSync(10, { packed: true })
-  t.equal(syncKeys.keys, true, 'default packed input reports key fields')
-  t.equal(syncKeys.values, true, 'default packed input reports interleaved value fields')
-  t.same(db._getManySync(syncKeys, { packed: false }), [Buffer.from('one'), Buffer.from('two')],
-    'sync getMany reads every key and skips interleaved iterator values')
+  t.same(syncKeys.keys, new Uint32Array([0, 1, 4, 1]), 'default packed input locates key fields')
+  t.same(syncKeys.values, new Uint32Array([1, 3, 5, 3]),
+    'default packed input locates interleaved value fields')
+  t.same(db._getManySync({ offsets: syncKeys.keys, buffer: syncKeys.buffer }, { packed: false }),
+    [Buffer.from('one'), Buffer.from('two')],
+    'sync getMany reads fields selected by the key table')
+  const syncValues = { offsets: syncKeys.values, buffer: syncKeys.buffer }
+  t.same(db._getManySync(syncValues, { packed: false }),
+    [Buffer.from('record-a'), Buffer.from('record-b')],
+    'selecting the value offset table makes iterator values the multi-get keys')
   await syncIterator.close()
 
   const asyncIterator = db._iterator({
+    lt: Buffer.from('c'),
     keys: true,
     values: false,
     keyEncoding: 'buffer',
     valueEncoding: 'buffer'
   })
   const asyncKeys = await asyncIterator._nextvAsync(10, { packed: true })
-  t.equal(asyncKeys.keys, true, 'keys-only packed input reports key fields')
-  t.equal(asyncKeys.values, false, 'keys-only packed input omits value fields')
+  t.same(asyncKeys.keys, new Uint32Array([0, 1, 1, 1]),
+    'keys-only packed input locates key fields')
+  t.equal(asyncKeys.values, undefined, 'keys-only packed input omits value offsets')
 
-  const pending = db._getManyAsync(asyncKeys, { packed: false })
+  const pending = db._getManyAsync({ offsets: asyncKeys.keys, buffer: asyncKeys.buffer }, { packed: false })
   asyncKeys.buffer.fill(0x78)
   t.same(await pending, [Buffer.from('one'), Buffer.from('two')],
     'async getMany snapshots packed key fields before returning')
@@ -77,35 +91,50 @@ test('getMany sync and async accept packed iterator batches', async function (t)
 
   const emptyIterator = db._iterator({ keys: true, values: false })
   const emptyKeys = emptyIterator._nextvSync(0, { packed: true })
-  t.same(db._getManySync(emptyKeys, { packed: false }), [], 'an empty packed batch is valid input')
+  t.same(db._getManySync({ offsets: emptyKeys.keys, buffer: emptyKeys.buffer }, { packed: false }), [],
+    'an empty packed batch is valid input')
   await emptyIterator.close()
 
   await db.close()
   t.end()
 })
 
-test('getMany rejects packed iterator batches without keys or with invalid layouts', async function (t) {
+test('getMany accepts iterator value offsets and rejects invalid layouts', async function (t) {
   const db = testCommon.factory({ keyEncoding: 'buffer', valueEncoding: 'buffer' })
   await db.open()
   await db.put(Buffer.from('a'), Buffer.from('one'))
 
-  const valuesIterator = db._iterator({ keys: false, values: true })
+  await db.put(Buffer.from('one'), Buffer.from('record-a'))
+
+  const valuesIterator = db._iterator({ lte: Buffer.from('a'), keys: false, values: true })
   const values = valuesIterator._nextvSync(1, { packed: true })
-  t.throws(() => db._getManySync(values, { packed: false }), /must include iterator keys/,
+  t.throws(() => db._getManySync(values, { packed: false }), /offsets must be a Uint32Array/,
     'sync rejects a values-only iterator batch')
   const valuesError = await db._getManyAsync(values, { packed: false }).then(() => null, (err) => err)
-  t.match(valuesError.message, /must include iterator keys/,
+  t.match(valuesError.message, /offsets must be a Uint32Array/,
     'async rejects a values-only iterator batch')
+  const remappedValues = { offsets: values.values, buffer: values.buffer }
+  t.same(db._getManySync(remappedValues, { packed: false }), [Buffer.from('record-a')],
+    'a values-only batch becomes valid input when its offset table is remapped')
   await valuesIterator.close()
 
   const keysIterator = db._iterator({ keys: true, values: false })
   const keys = keysIterator._nextvSync(1, { packed: true })
-  const malformed = { ...keys, offsets: new Uint32Array([0]) }
-  t.throws(() => db._getManySync(malformed, { packed: false }), /offsets do not match/,
+  const malformed = { offsets: new Uint32Array([0]), buffer: keys.buffer }
+  t.throws(() => db._getManySync(malformed, { packed: false }), /offset-length pairs/,
     'sync validates packed row metadata before reading')
   const layoutError = await db._getManyAsync(malformed, { packed: false }).then(() => null, (err) => err)
-  t.match(layoutError.message, /offsets do not match/,
+  t.match(layoutError.message, /offset-length pairs/,
     'async validates packed row metadata before queueing work')
+
+  const wrongType = { offsets: new Int32Array([0, 1]), buffer: keys.buffer }
+  t.throws(() => db._getManySync(wrongType, { packed: false }), /offsets must be a Uint32Array/,
+    'sync rejects signed offset tables')
+
+  const outside = { offsets: new Uint32Array([keys.buffer.byteLength, 1]), buffer: keys.buffer }
+  const outsideError = await db._getManyAsync(outside, { packed: false }).then(() => null, (err) => err)
+  t.match(outsideError.message, /offsets are outside its buffer/,
+    'async validates every selected field against the arena')
   await keysIterator.close()
 
   await db.close()

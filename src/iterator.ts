@@ -180,10 +180,9 @@ function packedCacheError() {
 function emptyPackedResult(iterator) {
   return {
     buffer: Buffer.alloc(0),
-    offsets: new Uint32Array([0]),
     count: 0,
-    keys: iterator[kKeys],
-    values: iterator[kValues],
+    keys: iterator[kKeys] ? new Uint32Array() : undefined,
+    values: iterator[kValues] ? new Uint32Array() : undefined,
     finished: true,
     limited: false,
     lastKey: undefined,
@@ -262,11 +261,11 @@ function convertIteratorResult(iterator, result) {
   const convertValue = iterator[kValues] && isJavaScriptEncoding(iterator[kValueEncoding])
   if (!convertKey && !convertValue) return result
 
-  let offsetIndex = 0
   const rows: any[] = []
-  const read = (encoding) => {
-    const start = result.offsets[offsetIndex++]
-    const length = result.offsets[offsetIndex] - start
+  const read = (offsets, index, encoding) => {
+    const layoutIndex = index * 2
+    const start = offsets[layoutIndex]
+    const length = offsets[layoutIndex + 1]
     if (encoding === 'slice') return new Slice(result.buffer, start, length)
     if (encoding === 'utf8' || encoding === 'utf-8') {
       return result.buffer.toString('utf8', start, start + length)
@@ -275,8 +274,8 @@ function convertIteratorResult(iterator, result) {
   }
 
   for (let index = 0; index < result.count; index++) {
-    rows.push(iterator[kKeys] ? read(iterator[kKeyEncoding]) : undefined)
-    rows.push(iterator[kValues] ? read(iterator[kValueEncoding]) : undefined)
+    rows.push(iterator[kKeys] ? read(result.keys, index, iterator[kKeyEncoding]) : undefined)
+    rows.push(iterator[kValues] ? read(result.values, index, iterator[kValueEncoding]) : undefined)
   }
 
   return {

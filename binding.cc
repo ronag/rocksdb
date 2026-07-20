@@ -1861,6 +1861,17 @@ static napi_status GetIteratorOptions(napi_env env,
   return napi_ok;
 }
 
+static napi_status ConvertPackedFieldOffsets(napi_env env,
+                                             const std::vector<uint32_t>& offsets,
+                                             napi_value* result) {
+  void* data = nullptr;
+  napi_value buffer;
+  NAPI_STATUS_RETURN(napi_create_arraybuffer(env, offsets.size() * sizeof(uint32_t), &data, &buffer));
+  std::copy(offsets.begin(), offsets.end(), static_cast<uint32_t*>(data));
+  NAPI_STATUS_RETURN(napi_create_typedarray(env, napi_uint32_array, offsets.size(), buffer, 0, result));
+  return napi_ok;
+}
+
 class Iterator final : public BaseIterator, public std::enable_shared_from_this<Iterator> {
   Reference databaseContext_;
   const bool keys_;
@@ -1979,7 +1990,8 @@ class Iterator final : public BaseIterator, public std::enable_shared_from_this<
       rocksdb::PinnableSlice lastKey;
       bool hasLastKey = false;
       rocksdb::PinnableSlice packedData;
-      std::vector<uint32_t> offsets;
+      std::vector<uint32_t> keyOffsets;
+      std::vector<uint32_t> valueOffsets;
       size_t count = 0;
       size_t bytes = 0;
       bool finished = false;
@@ -2025,9 +2037,8 @@ class Iterator final : public BaseIterator, public std::enable_shared_from_this<
           state.packed = mode == PackedMode::Packed;
           state.modeDecided = mode != PackedMode::Auto;
           if (state.packed) {
-            const auto fieldsPerRow = static_cast<size_t>(keys_) + static_cast<size_t>(values_);
-            state.offsets.reserve(initialCapacity * fieldsPerRow + 1);
-            state.offsets.push_back(0);
+            if (keys_) state.keyOffsets.reserve(initialCapacity * 2);
+            if (values_) state.valueOffsets.reserve(initialCapacity * 2);
             state.packedData.GetSelf()->reserve(std::min<size_t>(highWaterMarkBytes_, initialCapacity * 128));
           } else if (state.modeDecided) {
             state.keys.reserve(initialCapacity);
@@ -2104,9 +2115,8 @@ class Iterator final : public BaseIterator, public std::enable_shared_from_this<
               state.packed = ShouldAutoPackCurrent();
               state.modeDecided = true;
               if (state.packed) {
-                const auto fieldsPerRow = static_cast<size_t>(keys_) + static_cast<size_t>(values_);
-                state.offsets.reserve(initialCapacity * fieldsPerRow + 1);
-                state.offsets.push_back(0);
+                if (keys_) state.keyOffsets.reserve(initialCapacity * 2);
+                if (values_) state.valueOffsets.reserve(initialCapacity * 2);
                 state.packedData.GetSelf()->reserve(
                     std::min<size_t>(highWaterMarkBytes_, initialCapacity * 128));
               } else {
@@ -2116,22 +2126,23 @@ class Iterator final : public BaseIterator, public std::enable_shared_from_this<
             }
 
             if (state.packed) {
-              const auto append = [&](const rocksdb::Slice& value) {
+              const auto append = [&](const rocksdb::Slice& value, std::vector<uint32_t>& offsets) {
                 auto* data = state.packedData.GetSelf();
                 if (value.size() > std::numeric_limits<uint32_t>::max() - data->size()) {
                   return rocksdb::Status::InvalidArgument("Packed iterator result exceeds 4 GiB");
                 }
+                offsets.push_back(static_cast<uint32_t>(data->size()));
+                offsets.push_back(static_cast<uint32_t>(value.size()));
                 data->append(value.data(), value.size());
                 state.bytes += value.size();
-                state.offsets.push_back(static_cast<uint32_t>(data->size()));
                 return rocksdb::Status::OK();
               };
 
               if (keys_) {
-                ROCKS_STATUS_RETURN(append(CurrentKey()));
+                ROCKS_STATUS_RETURN(append(CurrentKey(), state.keyOffsets));
               }
               if (values_) {
-                ROCKS_STATUS_RETURN(append(CurrentValue()));
+                ROCKS_STATUS_RETURN(append(CurrentValue(), state.valueOffsets));
               }
             } else if (keys_ && values_) {
               rocksdb::PinnableSlice k;
@@ -2184,28 +2195,25 @@ class Iterator final : public BaseIterator, public std::enable_shared_from_this<
             // instead of copying the whole arena a second time.
             NAPI_STATUS_RETURN(Convert(env, std::move(state.packedData), Encoding::Buffer, buffer, true));
 
-            void* offsetsData = nullptr;
-            napi_value offsetsBuffer;
-            NAPI_STATUS_RETURN(
-                napi_create_arraybuffer(env, state.offsets.size() * sizeof(uint32_t), &offsetsData, &offsetsBuffer));
-            std::copy(state.offsets.begin(), state.offsets.end(), static_cast<uint32_t*>(offsetsData));
-
-            napi_value offsets;
-            NAPI_STATUS_RETURN(
-                napi_create_typedarray(env, napi_uint32_array, state.offsets.size(), offsetsBuffer, 0, &offsets));
-
             napi_value count;
             NAPI_STATUS_RETURN(napi_create_uint32(env, static_cast<uint32_t>(state.count), &count));
 
             napi_value keys;
-            NAPI_STATUS_RETURN(napi_get_boolean(env, keys_, &keys));
+            if (keys_) {
+              NAPI_STATUS_RETURN(ConvertPackedFieldOffsets(env, state.keyOffsets, &keys));
+            } else {
+              NAPI_STATUS_RETURN(napi_get_undefined(env, &keys));
+            }
 
             napi_value values;
-            NAPI_STATUS_RETURN(napi_get_boolean(env, values_, &values));
+            if (values_) {
+              NAPI_STATUS_RETURN(ConvertPackedFieldOffsets(env, state.valueOffsets, &values));
+            } else {
+              NAPI_STATUS_RETURN(napi_get_undefined(env, &values));
+            }
 
             NAPI_STATUS_RETURN(napi_create_object(env, result));
             NAPI_STATUS_RETURN(napi_set_named_property(env, *result, "buffer", buffer));
-            NAPI_STATUS_RETURN(napi_set_named_property(env, *result, "offsets", offsets));
             NAPI_STATUS_RETURN(napi_set_named_property(env, *result, "count", count));
             NAPI_STATUS_RETURN(napi_set_named_property(env, *result, "keys", keys));
             NAPI_STATUS_RETURN(napi_set_named_property(env, *result, "values", values));
@@ -2282,14 +2290,14 @@ class Iterator final : public BaseIterator, public std::enable_shared_from_this<
     rocksdb::PinnableSlice lastKey;
     bool hasLastKey = false;
     rocksdb::PinnableSlice packedData;
-    std::vector<uint32_t> offsets;
+    std::vector<uint32_t> keyOffsets;
+    std::vector<uint32_t> valueOffsets;
     bool packed = mode == PackedMode::Packed;
     bool modeDecided = mode != PackedMode::Auto;
     if (packed) {
       const auto initialCapacity = std::min<size_t>(count, 4096);
-      const auto fieldsPerRow = static_cast<size_t>(keys_) + static_cast<size_t>(values_);
-      offsets.reserve(initialCapacity * fieldsPerRow + 1);
-      offsets.push_back(0);
+      if (keys_) keyOffsets.reserve(initialCapacity * 2);
+      if (values_) valueOffsets.reserve(initialCapacity * 2);
       packedData.GetSelf()->reserve(std::min<size_t>(highWaterMarkBytes_, initialCapacity * 128));
     } else if (modeDecided) {
       NAPI_STATUS_THROWS(napi_create_array(env, &rows));
@@ -2365,9 +2373,8 @@ class Iterator final : public BaseIterator, public std::enable_shared_from_this<
         modeDecided = true;
         if (packed) {
           const auto initialCapacity = std::min<size_t>(count, 4096);
-          const auto fieldsPerRow = static_cast<size_t>(keys_) + static_cast<size_t>(values_);
-          offsets.reserve(initialCapacity * fieldsPerRow + 1);
-          offsets.push_back(0);
+          if (keys_) keyOffsets.reserve(initialCapacity * 2);
+          if (values_) valueOffsets.reserve(initialCapacity * 2);
           packedData.GetSelf()->reserve(std::min<size_t>(highWaterMarkBytes_, initialCapacity * 128));
         } else {
           NAPI_STATUS_THROWS(napi_create_array(env, &rows));
@@ -2375,22 +2382,23 @@ class Iterator final : public BaseIterator, public std::enable_shared_from_this<
       }
 
       if (packed) {
-        const auto append = [&](const rocksdb::Slice& value) {
+        const auto append = [&](const rocksdb::Slice& value, std::vector<uint32_t>& offsets) {
           auto* data = packedData.GetSelf();
           if (value.size() > std::numeric_limits<uint32_t>::max() - data->size()) {
             return rocksdb::Status::InvalidArgument("Packed iterator result exceeds 4 GiB");
           }
+          offsets.push_back(static_cast<uint32_t>(data->size()));
+          offsets.push_back(static_cast<uint32_t>(value.size()));
           data->append(value.data(), value.size());
           bytes += value.size();
-          offsets.push_back(static_cast<uint32_t>(data->size()));
           return rocksdb::Status::OK();
         };
 
         if (keys_) {
-          ROCKS_STATUS_THROWS_NAPI(append(CurrentKey()));
+          ROCKS_STATUS_THROWS_NAPI(append(CurrentKey(), keyOffsets));
         }
         if (values_) {
-          ROCKS_STATUS_THROWS_NAPI(append(CurrentValue()));
+          ROCKS_STATUS_THROWS_NAPI(append(CurrentValue(), valueOffsets));
         }
       } else {
         napi_value key;
@@ -2428,27 +2436,24 @@ class Iterator final : public BaseIterator, public std::enable_shared_from_this<
       napi_value buffer;
       NAPI_STATUS_THROWS(Convert(env, std::move(packedData), Encoding::Buffer, buffer, true));
 
-      void* offsetsData = nullptr;
-      napi_value offsetsBuffer;
-      NAPI_STATUS_THROWS(
-          napi_create_arraybuffer(env, offsets.size() * sizeof(uint32_t), &offsetsData, &offsetsBuffer));
-      std::copy(offsets.begin(), offsets.end(), static_cast<uint32_t*>(offsetsData));
-
-      napi_value offsetsValue;
-      NAPI_STATUS_THROWS(
-          napi_create_typedarray(env, napi_uint32_array, offsets.size(), offsetsBuffer, 0, &offsetsValue));
-
       napi_value countValue;
       NAPI_STATUS_THROWS(napi_create_uint32(env, static_cast<uint32_t>(rowCount), &countValue));
 
       napi_value keysValue;
-      NAPI_STATUS_THROWS(napi_get_boolean(env, keys_, &keysValue));
+      if (keys_) {
+        NAPI_STATUS_THROWS(ConvertPackedFieldOffsets(env, keyOffsets, &keysValue));
+      } else {
+        NAPI_STATUS_THROWS(napi_get_undefined(env, &keysValue));
+      }
 
       napi_value valuesValue;
-      NAPI_STATUS_THROWS(napi_get_boolean(env, values_, &valuesValue));
+      if (values_) {
+        NAPI_STATUS_THROWS(ConvertPackedFieldOffsets(env, valueOffsets, &valuesValue));
+      } else {
+        NAPI_STATUS_THROWS(napi_get_undefined(env, &valuesValue));
+      }
 
       NAPI_STATUS_THROWS(napi_set_named_property(env, ret, "buffer", buffer));
-      NAPI_STATUS_THROWS(napi_set_named_property(env, ret, "offsets", offsetsValue));
       NAPI_STATUS_THROWS(napi_set_named_property(env, ret, "count", countValue));
       NAPI_STATUS_THROWS(napi_set_named_property(env, ret, "keys", keysValue));
       NAPI_STATUS_THROWS(napi_set_named_property(env, ret, "values", valuesValue));
@@ -3475,62 +3480,25 @@ static napi_status ConvertPackedGetManyResult(napi_env env, PackedGetManyResult&
   return napi_ok;
 }
 
-struct PackedIteratorKeyInput {
+struct PackedGetManyInput {
   const char* data = nullptr;
   size_t dataLength = 0;
   const uint32_t* offsets = nullptr;
   size_t offsetsLength = 0;
-  uint32_t count = 0;
-  size_t fieldsPerRow = 0;
+
+  size_t size() const { return offsetsLength / 2; }
 };
 
-static napi_status PackedIteratorKeyInputError(napi_env env, const char* message) {
+static napi_status PackedGetManyInputError(napi_env env, const char* message) {
   NAPI_STATUS_RETURN(napi_throw_type_error(env, nullptr, message));
   return napi_pending_exception;
 }
 
-static napi_status GetPackedIteratorKeyInput(napi_env env,
-                                             napi_value input,
-                                             PackedIteratorKeyInput& result) {
+static napi_status GetPackedGetManyInput(napi_env env, napi_value input, PackedGetManyInput& result) {
   napi_valuetype inputType;
   NAPI_STATUS_RETURN(napi_typeof(env, input, &inputType));
   if (inputType != napi_object) {
-    return PackedIteratorKeyInputError(env, "Packed getMany input must be an object");
-  }
-
-  bool keys = false;
-  {
-    napi_value value;
-    NAPI_STATUS_RETURN(napi_get_named_property(env, input, "keys", &value));
-    if (napi_get_value_bool(env, value, &keys) != napi_ok) {
-      return PackedIteratorKeyInputError(env, "Packed getMany input keys must be a boolean");
-    }
-  }
-  if (!keys) {
-    return PackedIteratorKeyInputError(env, "Packed getMany input must include iterator keys");
-  }
-
-  bool values = false;
-  {
-    napi_value value;
-    NAPI_STATUS_RETURN(napi_get_named_property(env, input, "values", &value));
-    if (napi_get_value_bool(env, value, &values) != napi_ok) {
-      return PackedIteratorKeyInputError(env, "Packed getMany input values must be a boolean");
-    }
-  }
-  result.fieldsPerRow = values ? 2 : 1;
-
-  {
-    napi_value value;
-    NAPI_STATUS_RETURN(napi_get_named_property(env, input, "buffer", &value));
-    bool isBuffer = false;
-    NAPI_STATUS_RETURN(napi_is_buffer(env, value, &isBuffer));
-    if (!isBuffer) {
-      return PackedIteratorKeyInputError(env, "Packed getMany input buffer must be a Buffer");
-    }
-    void* data = nullptr;
-    NAPI_STATUS_RETURN(napi_get_buffer_info(env, value, &data, &result.dataLength));
-    result.data = static_cast<const char*>(data);
+    return PackedGetManyInputError(env, "Packed getMany input must be an object");
   }
 
   {
@@ -3539,54 +3507,43 @@ static napi_status GetPackedIteratorKeyInput(napi_env env,
     bool isTypedArray = false;
     NAPI_STATUS_RETURN(napi_is_typedarray(env, value, &isTypedArray));
     if (!isTypedArray) {
-      return PackedIteratorKeyInputError(env, "Packed getMany input offsets must be a Uint32Array");
+      return PackedGetManyInputError(env, "Packed getMany input offsets must be a Uint32Array");
     }
-
     napi_typedarray_type type;
     void* data = nullptr;
     napi_value arrayBuffer;
     size_t byteOffset = 0;
-    NAPI_STATUS_RETURN(napi_get_typedarray_info(env, value, &type, &result.offsetsLength, &data,
-                                                &arrayBuffer, &byteOffset));
+    NAPI_STATUS_RETURN(
+        napi_get_typedarray_info(env, value, &type, &result.offsetsLength, &data, &arrayBuffer, &byteOffset));
     if (type != napi_uint32_array) {
-      return PackedIteratorKeyInputError(env, "Packed getMany input offsets must be a Uint32Array");
+      return PackedGetManyInputError(env, "Packed getMany input offsets must be a Uint32Array");
     }
     result.offsets = static_cast<const uint32_t*>(data);
   }
 
   {
     napi_value value;
-    NAPI_STATUS_RETURN(napi_get_named_property(env, input, "count", &value));
-    double count = 0;
-    if (napi_get_value_double(env, value, &count) != napi_ok || !std::isfinite(count) ||
-        std::trunc(count) != count || count < 0 ||
-        count > static_cast<double>(std::numeric_limits<uint32_t>::max())) {
-      return PackedIteratorKeyInputError(env, "Packed getMany input count must be a uint32");
+    NAPI_STATUS_RETURN(napi_get_named_property(env, input, "buffer", &value));
+    bool isBuffer = false;
+    NAPI_STATUS_RETURN(napi_is_buffer(env, value, &isBuffer));
+    if (!isBuffer) {
+      return PackedGetManyInputError(env, "Packed getMany input buffer must be a Buffer");
     }
-    result.count = static_cast<uint32_t>(count);
+    void* data = nullptr;
+    NAPI_STATUS_RETURN(napi_get_buffer_info(env, value, &data, &result.dataLength));
+    result.data = static_cast<const char*>(data);
   }
 
-  if (result.count > (std::numeric_limits<size_t>::max() - 1) / result.fieldsPerRow) {
-    return PackedIteratorKeyInputError(env, "Packed getMany input count exceeds the platform limit");
-  }
-  const auto expectedOffsets = static_cast<size_t>(result.count) * result.fieldsPerRow + 1;
-  if (result.offsetsLength != expectedOffsets) {
-    return PackedIteratorKeyInputError(env, "Packed getMany input offsets do not match its row layout");
-  }
-  if (result.offsets[0] != 0) {
-    return PackedIteratorKeyInputError(env, "Packed getMany input offsets must start at zero");
+  if (result.offsetsLength % 2 != 0) {
+    return PackedGetManyInputError(env, "Packed getMany input offsets must contain offset-length pairs");
   }
 
-  uint32_t previous = 0;
-  for (size_t index = 0; index < result.offsetsLength; ++index) {
-    const auto offset = result.offsets[index];
-    if (offset < previous || offset > result.dataLength) {
-      return PackedIteratorKeyInputError(env, "Packed getMany input offsets are outside its buffer");
+  for (size_t index = 0; index < result.offsetsLength; index += 2) {
+    const auto offset = static_cast<size_t>(result.offsets[index]);
+    const auto length = static_cast<size_t>(result.offsets[index + 1]);
+    if (offset > result.dataLength || length > result.dataLength - offset) {
+      return PackedGetManyInputError(env, "Packed getMany input offsets are outside its buffer");
     }
-    previous = offset;
-  }
-  if (previous != result.dataLength) {
-    return PackedIteratorKeyInputError(env, "Packed getMany input offsets do not cover its buffer");
   }
 
   return napi_ok;
@@ -3609,15 +3566,15 @@ static napi_status GetBorrowedGetManyKeys(napi_env env,
     return napi_ok;
   }
 
-  PackedIteratorKeyInput packed;
-  NAPI_STATUS_RETURN(GetPackedIteratorKeyInput(env, input, packed));
-  result.resize(packed.count);
+  PackedGetManyInput packed;
+  NAPI_STATUS_RETURN(GetPackedGetManyInput(env, input, packed));
+  result.resize(packed.size());
   const auto* data = packed.data == nullptr ? "" : packed.data;
-  for (uint32_t index = 0; index < packed.count; ++index) {
-    const auto fieldIndex = static_cast<size_t>(index) * packed.fieldsPerRow;
-    const auto start = packed.offsets[fieldIndex];
-    const auto end = packed.offsets[fieldIndex + 1];
-    result[index] = rocksdb::Slice(data + start, end - start);
+  for (size_t index = 0; index < packed.size(); ++index) {
+    const auto layoutIndex = index * 2;
+    const auto offset = packed.offsets[layoutIndex];
+    const auto length = packed.offsets[layoutIndex + 1];
+    result[index] = rocksdb::Slice(data + offset, length);
   }
   return napi_ok;
 }
@@ -3661,25 +3618,28 @@ static napi_status GetOwnedGetManyKeys(napi_env env, napi_value input, OwnedGetM
     return napi_ok;
   }
 
-  PackedIteratorKeyInput packed;
-  NAPI_STATUS_RETURN(GetPackedIteratorKeyInput(env, input, packed));
+  PackedGetManyInput packed;
+  NAPI_STATUS_RETURN(GetPackedGetManyInput(env, input, packed));
   result.packed = true;
-  result.packedOffsets.reserve(static_cast<size_t>(packed.count) + 1);
+  result.packedOffsets.reserve(packed.size() + 1);
   result.packedOffsets.push_back(0);
 
   size_t keyBytes = 0;
-  for (uint32_t index = 0; index < packed.count; ++index) {
-    const auto fieldIndex = static_cast<size_t>(index) * packed.fieldsPerRow;
-    keyBytes += packed.offsets[fieldIndex + 1] - packed.offsets[fieldIndex];
+  for (size_t index = 0; index < packed.size(); ++index) {
+    const auto length = static_cast<size_t>(packed.offsets[index * 2 + 1]);
+    if (length > std::numeric_limits<uint32_t>::max() - keyBytes) {
+      return PackedGetManyInputError(env, "Packed getMany keys exceed 4 GiB");
+    }
+    keyBytes += length;
   }
   result.packedData.reserve(keyBytes);
 
   const auto* data = packed.data == nullptr ? "" : packed.data;
-  for (uint32_t index = 0; index < packed.count; ++index) {
-    const auto fieldIndex = static_cast<size_t>(index) * packed.fieldsPerRow;
-    const auto start = packed.offsets[fieldIndex];
-    const auto end = packed.offsets[fieldIndex + 1];
-    result.packedData.append(data + start, end - start);
+  for (size_t index = 0; index < packed.size(); ++index) {
+    const auto layoutIndex = index * 2;
+    const auto offset = packed.offsets[layoutIndex];
+    const auto length = packed.offsets[layoutIndex + 1];
+    result.packedData.append(data + offset, length);
     result.packedOffsets.push_back(static_cast<uint32_t>(result.packedData.size()));
   }
 

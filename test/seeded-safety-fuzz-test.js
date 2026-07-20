@@ -216,26 +216,26 @@ function decodeIteratorPage (result, context) {
   }
 
   assert.ok(Buffer.isBuffer(result.buffer), `${context}: arena is a Buffer`)
-  assert.ok(result.offsets instanceof Uint32Array, `${context}: offsets are Uint32Array`)
-  assert.equal(result.offsets.length, result.count * 2 + 1, `${context}: field offsets`)
-  assert.equal(result.offsets[0], 0, `${context}: first offset`)
+  assert.ok(result.keys instanceof Uint32Array, `${context}: keys are Uint32Array`)
+  assert.ok(result.values instanceof Uint32Array, `${context}: values are Uint32Array`)
+  assert.equal(result.keys.length, result.count * 2, `${context}: key layouts`)
+  assert.equal(result.values.length, result.count * 2, `${context}: value layouts`)
 
   const entries = []
   for (let row = 0; row < result.count; row++) {
-    const keyIndex = row * 2
-    const valueIndex = keyIndex + 1
-    assert.ok(result.offsets[keyIndex] <= result.offsets[valueIndex],
-      `${context}: key offset ${row}`)
-    assert.ok(result.offsets[valueIndex] <= result.offsets[valueIndex + 1],
-      `${context}: value offset ${row}`)
+    const layoutIndex = row * 2
+    const keyOffset = result.keys[layoutIndex]
+    const keyLength = result.keys[layoutIndex + 1]
+    const valueOffset = result.values[layoutIndex]
+    const valueLength = result.values[layoutIndex + 1]
+    assert.ok(keyOffset + keyLength <= result.buffer.length, `${context}: key layout ${row}`)
+    assert.ok(valueOffset + valueLength <= result.buffer.length, `${context}: value layout ${row}`)
     entries.push([
-      Buffer.from(result.buffer.subarray(result.offsets[keyIndex], result.offsets[valueIndex])),
-      Buffer.from(result.buffer.subarray(result.offsets[valueIndex], result.offsets[valueIndex + 1]))
+      Buffer.from(result.buffer.subarray(keyOffset, keyOffset + keyLength)),
+      Buffer.from(result.buffer.subarray(valueOffset, valueOffset + valueLength))
     ])
   }
 
-  assert.equal(result.offsets[result.offsets.length - 1], result.buffer.length,
-    `${context}: final offset equals arena size`)
   return entries
 }
 
@@ -652,9 +652,9 @@ test('raw async resources survive forced GC and finalizers release snapshots and
 
       for (const result of iteratorResults) {
         assert.ok(result.count > 0)
-        assert.equal(result.buffer.subarray(result.offsets[0], result.offsets[1]).toString(),
+        assert.equal(result.buffer.subarray(result.keys[0], result.keys[0] + result.keys[1]).toString(),
           'seed-000')
-        assert.ok(result.buffer.subarray(result.offsets[1], result.offsets[2])
+        assert.ok(result.buffer.subarray(result.values[0], result.values[0] + result.values[1])
           .equals(Buffer.alloc(2048, 0)))
       }
       for (const result of getManyResults) {

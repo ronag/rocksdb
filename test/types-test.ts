@@ -395,11 +395,13 @@ expectType<RocksPackedIteratorResult>(iterator._nextvSync(10, { packed: true }))
 expectType<Promise<RocksPackedIteratorResult>>(iterator._nextvAsync(10, { packed: true }))
 const packedIteratorKeys = iterator._nextvSync(10, { packed: true })
 expectType<Buffer | undefined>(packedIteratorKeys.lastKey)
+expectType<Uint32Array>(packedIteratorKeys.keys)
+expectType<Uint32Array>(packedIteratorKeys.values)
 expectType<RocksPackedGetManyResult | RocksRawGetManyResult<'buffer', false, false>>(
-  db._getManySync(packedIteratorKeys)
+  db._getManySync({ offsets: packedIteratorKeys.keys, buffer: packedIteratorKeys.buffer })
 )
 expectType<Promise<RocksPackedGetManyResult | RocksRawGetManyResult<'buffer', false, false>>>(
-  db._getManyAsync(packedIteratorKeys)
+  db._getManyAsync({ offsets: packedIteratorKeys.keys, buffer: packedIteratorKeys.buffer })
 )
 expectType<RocksPackedIteratorResult | RocksRawIteratorResult<Buffer, Buffer>>(
   iterator._nextvSync(10, { packed: booleanFlag })
@@ -515,8 +517,13 @@ expectType<
 const packedValuesOnly = valuesOnlyIterator._nextvAsync(10, { packed: true })
 expectType<Promise<RocksPackedIteratorResult<false, true>>>(packedValuesOnly)
 packedValuesOnly.then((input) => {
-  // @ts-expect-error Packed getMany input must contain iterator keys
+  expectType<undefined>(input.keys)
+  expectType<Uint32Array>(input.values)
+  // @ts-expect-error Packed getMany input must contain an offsets table
   db._getManySync(input)
+  expectType<RocksPackedGetManyResult | RocksRawGetManyResult<'buffer', false, false>>(
+    db._getManySync({ offsets: input.values, buffer: input.buffer })
+  )
 })
 
 const keysOnlyIterator = db._iterator({
@@ -533,8 +540,10 @@ expectType<
 >(keysOnlyIterator._nextvAsync(10))
 const packedKeysOnly = keysOnlyIterator._nextvSync(10, { packed: true })
 expectType<RocksPackedIteratorResult<true, false>>(packedKeysOnly)
+expectType<Uint32Array>(packedKeysOnly.keys)
+expectType<undefined>(packedKeysOnly.values)
 expectType<RocksPackedGetManyResult | RocksRawGetManyResult<'buffer', false, false>>(
-  db._getManySync(packedKeysOnly)
+  db._getManySync({ offsets: packedKeysOnly.keys, buffer: packedKeysOnly.buffer })
 )
 
 const noFieldsRawIterator = db._iterator({
@@ -552,6 +561,9 @@ expectType<
 expectType<RocksPackedIteratorResult<false, false>>(
   noFieldsRawIterator._nextvSync(10, { packed: true })
 )
+const packedNoFields = noFieldsRawIterator._nextvSync(10, { packed: true })
+expectType<undefined>(packedNoFields.keys)
+expectType<undefined>(packedNoFields.values)
 
 const batch = db.batch()
 // @ts-expect-error Standard chained-batch write callbacks were removed by abstract-level v3
