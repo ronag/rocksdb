@@ -124,6 +124,38 @@ make('updates excludes log data from the next sequence', async function (db, t, 
   done()
 })
 
+test('updates resumes after a log-data-only WAL batch', async function (t) {
+  const db = testCommon.factory()
+  try {
+    await db.open()
+
+    const batch = db.batch()
+    try {
+      batch._putLogData('only-log-data')
+      await batch._writeAsync()
+    } finally {
+      await batch.close()
+    }
+    await db.put('after', '1')
+
+    const updates = await Array.fromAsync(db.updates({ since: 0 }))
+    t.equal(updates.length, 2, 'includes the log-only batch and following write')
+
+    const [logOnly, following] = updates
+    t.equal(logOnly.rows[0], 'data', 'first update contains only log data')
+    t.equal(logOnly.nextSeq, logOnly.seq, 'log data does not consume a sequence')
+    t.equal(following.seq, logOnly.nextSeq, 'following write starts at the same sequence')
+
+    const resumed = await Array.fromAsync(db.updates({ since: logOnly.nextSeq }))
+    t.equal(resumed.length, 1, 'exclusive resume skips the log-only WAL batch')
+    t.equal(resumed[0].rows[0], 'put', 'resume yields the following write')
+    t.equal(resumed[0].rows[1], 'after', 'following write key matches')
+  } finally {
+    await db.close()
+  }
+  t.end()
+})
+
 test('updates next seq includes operations filtered out by column', async function (t) {
   const db = testCommon.factory()
   await db.open({
