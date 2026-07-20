@@ -158,39 +158,41 @@ test('updates resumes after a log-data-only WAL batch', async function (t) {
 
 test('updates next seq includes operations filtered out by column', async function (t) {
   const db = testCommon.factory()
-  await db.open({
-    columns: { default: {}, visible: {}, hidden: {} }
-  })
+  try {
+    await db.open({
+      columns: { default: {}, visible: {}, hidden: {} }
+    })
 
-  const since = db.sequence + 1
-  const visible = db.columns.visible
-  const hidden = db.columns.hidden
-  await db.batch([
-    { type: 'put', key: 'visible', value: '1', column: visible },
-    { type: 'put', key: 'hidden', value: '2', column: hidden },
-    { type: 'put', key: 'default', value: '3' }
-  ])
+    const since = db.sequence + 1
+    const visible = db.columns.visible
+    const hidden = db.columns.hidden
+    await db.batch([
+      { type: 'put', key: 'visible', value: '1', column: visible },
+      { type: 'put', key: 'hidden', value: '2', column: hidden },
+      { type: 'put', key: 'default', value: '3' }
+    ])
 
-  const updates = []
-  for await (const update of db.updates({ since, column: visible })) {
-    updates.push(update)
+    const updates = []
+    for await (const update of db.updates({ since, column: visible })) {
+      updates.push(update)
+    }
+
+    t.equal(updates.length, 1, 'has one visible update batch')
+    const [update] = updates
+    t.equal(update.rows.length, 4, 'rows include only the selected column')
+    t.equal(update.rows[1], 'visible', 'selected column row is returned')
+    t.equal(update.nextSeq, update.seq + 3, 'next seq includes hidden column operations')
+
+    await db.put('after', '4', { column: visible })
+    const resumed = []
+    for await (const next of db.updates({ since: update.nextSeq, column: visible })) {
+      resumed.push(next)
+    }
+    t.equal(resumed.length, 1, 'exclusive resume skips the filtered multi-column batch')
+    t.equal(resumed[0].seq, update.nextSeq, 'resume starts at the following write')
+  } finally {
+    await db.close()
   }
-
-  t.equal(updates.length, 1, 'has one visible update batch')
-  const [update] = updates
-  t.equal(update.rows.length, 4, 'rows include only the selected column')
-  t.equal(update.rows[1], 'visible', 'selected column row is returned')
-  t.equal(update.nextSeq, update.seq + 3, 'next seq includes hidden column operations')
-
-  await db.put('after', '4', { column: visible })
-  const resumed = []
-  for await (const next of db.updates({ since: update.nextSeq, column: visible })) {
-    resumed.push(next)
-  }
-  t.equal(resumed.length, 1, 'exclusive resume skips the filtered multi-column batch')
-  t.equal(resumed[0].seq, update.nextSeq, 'resume starts at the following write')
-
-  await db.close()
   t.end()
 })
 
