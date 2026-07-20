@@ -43,6 +43,75 @@ test('packed getMany sync and async preserve values, empty values and misses', a
   t.end()
 })
 
+test('getMany sync and async accept packed iterator batches', async function (t) {
+  const db = testCommon.factory({ keyEncoding: 'buffer', valueEncoding: 'buffer' })
+  await db.open()
+  await db.batch([
+    { type: 'put', key: Buffer.from('a'), value: Buffer.from('one') },
+    { type: 'put', key: Buffer.from('b'), value: Buffer.from('two') }
+  ])
+
+  const syncIterator = db._iterator({ keyEncoding: 'buffer', valueEncoding: 'buffer' })
+  const syncKeys = syncIterator._nextvSync(10, { packed: true })
+  t.equal(syncKeys.keys, true, 'default packed input reports key fields')
+  t.equal(syncKeys.values, true, 'default packed input reports interleaved value fields')
+  t.same(db._getManySync(syncKeys, { packed: false }), [Buffer.from('one'), Buffer.from('two')],
+    'sync getMany reads every key and skips interleaved iterator values')
+  await syncIterator.close()
+
+  const asyncIterator = db._iterator({
+    keys: true,
+    values: false,
+    keyEncoding: 'buffer',
+    valueEncoding: 'buffer'
+  })
+  const asyncKeys = await asyncIterator._nextvAsync(10, { packed: true })
+  t.equal(asyncKeys.keys, true, 'keys-only packed input reports key fields')
+  t.equal(asyncKeys.values, false, 'keys-only packed input omits value fields')
+
+  const pending = db._getManyAsync(asyncKeys, { packed: false })
+  asyncKeys.buffer.fill(0x78)
+  t.same(await pending, [Buffer.from('one'), Buffer.from('two')],
+    'async getMany snapshots packed key fields before returning')
+  await asyncIterator.close()
+
+  const emptyIterator = db._iterator({ keys: true, values: false })
+  const emptyKeys = emptyIterator._nextvSync(0, { packed: true })
+  t.same(db._getManySync(emptyKeys, { packed: false }), [], 'an empty packed batch is valid input')
+  await emptyIterator.close()
+
+  await db.close()
+  t.end()
+})
+
+test('getMany rejects packed iterator batches without keys or with invalid layouts', async function (t) {
+  const db = testCommon.factory({ keyEncoding: 'buffer', valueEncoding: 'buffer' })
+  await db.open()
+  await db.put(Buffer.from('a'), Buffer.from('one'))
+
+  const valuesIterator = db._iterator({ keys: false, values: true })
+  const values = valuesIterator._nextvSync(1, { packed: true })
+  t.throws(() => db._getManySync(values, { packed: false }), /must include iterator keys/,
+    'sync rejects a values-only iterator batch')
+  const valuesError = await db._getManyAsync(values, { packed: false }).then(() => null, (err) => err)
+  t.match(valuesError.message, /must include iterator keys/,
+    'async rejects a values-only iterator batch')
+  await valuesIterator.close()
+
+  const keysIterator = db._iterator({ keys: true, values: false })
+  const keys = keysIterator._nextvSync(1, { packed: true })
+  const malformed = { ...keys, offsets: new Uint32Array([0]) }
+  t.throws(() => db._getManySync(malformed, { packed: false }), /offsets do not match/,
+    'sync validates packed row metadata before reading')
+  const layoutError = await db._getManyAsync(malformed, { packed: false }).then(() => null, (err) => err)
+  t.match(layoutError.message, /offsets do not match/,
+    'async validates packed row metadata before queueing work')
+  await keysIterator.close()
+
+  await db.close()
+  t.end()
+})
+
 test('packed option does not change public get or getMany result shapes', async function (t) {
   const db = testCommon.factory({ keyEncoding: 'buffer', valueEncoding: 'buffer' })
   await db.open()

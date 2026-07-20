@@ -440,8 +440,15 @@ export interface RocksRawIteratorResult<
   readonly limited?: boolean
 }
 
-export interface RocksPackedIteratorResult {
+export interface RocksPackedIteratorResult<
+  Keys extends boolean = true,
+  Values extends boolean = true,
+> {
   readonly packed: true
+  /** Whether each packed row contains a key field. */
+  readonly keys: Keys
+  /** Whether each packed row contains a value field after its key field. */
+  readonly values: Values
   /** Concatenated raw key/value bytes for this batch. */
   readonly buffer: Buffer
   /**
@@ -468,6 +475,10 @@ export interface RocksPackedGetManyResult {
   readonly statuses: Uint8Array
   readonly count: number
 }
+
+/** A packed iterator batch whose row layout includes encoded keys. */
+export type RocksPackedGetManyInput<Values extends boolean = boolean> =
+  RocksPackedIteratorResult<true, Values>
 
 export type RocksRawGetManyValues<
   E extends RocksRawEncoding,
@@ -519,9 +530,9 @@ export type RocksIteratorReadResult<
   RocksIteratorNeedsJavaScriptRows<KRaw, VRaw, Keys, Values> extends true
     ? RocksRawIteratorResult<KRaw, VRaw, Keys, Values, RocksSelectedPacked<Packed>>
     : Packed extends true
-      ? RocksPackedIteratorResult
+      ? RocksPackedIteratorResult<Keys, Values>
       : Packed extends 'auto'
-        ? RocksPackedIteratorResult | RocksRawIteratorResult<KRaw, VRaw, Keys, Values>
+        ? RocksPackedIteratorResult<Keys, Values> | RocksRawIteratorResult<KRaw, VRaw, Keys, Values>
         : RocksRawIteratorResult<KRaw, VRaw, Keys, Values>
 
 export type RocksGetManyReadResult<
@@ -972,12 +983,12 @@ export class RocksLevel<KDefault = string, VDefault = string> extends AbstractLe
    * Promise form: omit the callback.
    */
   _getManyAsync<const O extends RocksRawGetManyOptions<RocksRawEncoding, RocksPackedReadMode> = {}>(
-    keys: readonly RocksSlice[],
+    keys: readonly RocksSlice[] | RocksPackedGetManyInput,
     options?: O & RocksRawGetManyExposePackedConstraint<O>
   ): Promise<RocksRawGetManyResultFor<O>>
   /** Callback form: the same contract, delivering the result to `callback`. */
   _getManyAsync<const O extends RocksRawGetManyOptions<RocksRawEncoding, RocksPackedReadMode> = {}>(
-    keys: readonly RocksSlice[],
+    keys: readonly RocksSlice[] | RocksPackedGetManyInput,
     options: (O & RocksRawGetManyExposePackedConstraint<O>) | undefined,
     callback: RocksPackedReadCallback<
       RocksRawGetManyResultFor<O>,
@@ -996,7 +1007,7 @@ export class RocksLevel<KDefault = string, VDefault = string> extends AbstractLe
    * disabled throws a `LEVEL_ABORTED` error rather than rejecting a promise.
    */
   _getManySync<const O extends RocksRawGetManyOptions<RocksRawEncoding, RocksPackedReadMode> = {}>(
-    keys: readonly RocksSlice[],
+    keys: readonly RocksSlice[] | RocksPackedGetManyInput,
     options?: O & RocksRawGetManyExposePackedConstraint<O>
   ): RocksRawGetManyResultFor<O>
   /**

@@ -2181,10 +2181,18 @@ class Iterator final : public BaseIterator, public std::enable_shared_from_this<
             napi_value count;
             NAPI_STATUS_RETURN(napi_create_uint32(env, static_cast<uint32_t>(state.count), &count));
 
+            napi_value keys;
+            NAPI_STATUS_RETURN(napi_get_boolean(env, keys_, &keys));
+
+            napi_value values;
+            NAPI_STATUS_RETURN(napi_get_boolean(env, values_, &values));
+
             NAPI_STATUS_RETURN(napi_create_object(env, result));
             NAPI_STATUS_RETURN(napi_set_named_property(env, *result, "buffer", buffer));
             NAPI_STATUS_RETURN(napi_set_named_property(env, *result, "offsets", offsets));
             NAPI_STATUS_RETURN(napi_set_named_property(env, *result, "count", count));
+            NAPI_STATUS_RETURN(napi_set_named_property(env, *result, "keys", keys));
+            NAPI_STATUS_RETURN(napi_set_named_property(env, *result, "values", values));
             NAPI_STATUS_RETURN(napi_set_named_property(env, *result, "finished", finished));
             NAPI_STATUS_RETURN(napi_set_named_property(env, *result, "limited", limited));
 
@@ -2406,9 +2414,17 @@ class Iterator final : public BaseIterator, public std::enable_shared_from_this<
       napi_value countValue;
       NAPI_STATUS_THROWS(napi_create_uint32(env, static_cast<uint32_t>(rowCount), &countValue));
 
+      napi_value keysValue;
+      NAPI_STATUS_THROWS(napi_get_boolean(env, keys_, &keysValue));
+
+      napi_value valuesValue;
+      NAPI_STATUS_THROWS(napi_get_boolean(env, values_, &valuesValue));
+
       NAPI_STATUS_THROWS(napi_set_named_property(env, ret, "buffer", buffer));
       NAPI_STATUS_THROWS(napi_set_named_property(env, ret, "offsets", offsetsValue));
       NAPI_STATUS_THROWS(napi_set_named_property(env, ret, "count", countValue));
+      NAPI_STATUS_THROWS(napi_set_named_property(env, ret, "keys", keysValue));
+      NAPI_STATUS_THROWS(napi_set_named_property(env, ret, "values", valuesValue));
     } else {
       if (rows == nullptr) {
         NAPI_STATUS_THROWS(napi_create_array(env, &rows));
@@ -3424,6 +3440,214 @@ static napi_status ConvertPackedGetManyResult(napi_env env, PackedGetManyResult&
   return napi_ok;
 }
 
+struct PackedIteratorKeyInput {
+  const char* data = nullptr;
+  size_t dataLength = 0;
+  const uint32_t* offsets = nullptr;
+  size_t offsetsLength = 0;
+  uint32_t count = 0;
+  size_t fieldsPerRow = 0;
+};
+
+static napi_status PackedIteratorKeyInputError(napi_env env, const char* message) {
+  NAPI_STATUS_RETURN(napi_throw_type_error(env, nullptr, message));
+  return napi_pending_exception;
+}
+
+static napi_status GetPackedIteratorKeyInput(napi_env env,
+                                             napi_value input,
+                                             PackedIteratorKeyInput& result) {
+  napi_valuetype inputType;
+  NAPI_STATUS_RETURN(napi_typeof(env, input, &inputType));
+  if (inputType != napi_object) {
+    return PackedIteratorKeyInputError(env, "Packed getMany input must be an object");
+  }
+
+  bool keys = false;
+  {
+    napi_value value;
+    NAPI_STATUS_RETURN(napi_get_named_property(env, input, "keys", &value));
+    if (napi_get_value_bool(env, value, &keys) != napi_ok) {
+      return PackedIteratorKeyInputError(env, "Packed getMany input keys must be a boolean");
+    }
+  }
+  if (!keys) {
+    return PackedIteratorKeyInputError(env, "Packed getMany input must include iterator keys");
+  }
+
+  bool values = false;
+  {
+    napi_value value;
+    NAPI_STATUS_RETURN(napi_get_named_property(env, input, "values", &value));
+    if (napi_get_value_bool(env, value, &values) != napi_ok) {
+      return PackedIteratorKeyInputError(env, "Packed getMany input values must be a boolean");
+    }
+  }
+  result.fieldsPerRow = values ? 2 : 1;
+
+  {
+    napi_value value;
+    NAPI_STATUS_RETURN(napi_get_named_property(env, input, "buffer", &value));
+    bool isBuffer = false;
+    NAPI_STATUS_RETURN(napi_is_buffer(env, value, &isBuffer));
+    if (!isBuffer) {
+      return PackedIteratorKeyInputError(env, "Packed getMany input buffer must be a Buffer");
+    }
+    void* data = nullptr;
+    NAPI_STATUS_RETURN(napi_get_buffer_info(env, value, &data, &result.dataLength));
+    result.data = static_cast<const char*>(data);
+  }
+
+  {
+    napi_value value;
+    NAPI_STATUS_RETURN(napi_get_named_property(env, input, "offsets", &value));
+    bool isTypedArray = false;
+    NAPI_STATUS_RETURN(napi_is_typedarray(env, value, &isTypedArray));
+    if (!isTypedArray) {
+      return PackedIteratorKeyInputError(env, "Packed getMany input offsets must be a Uint32Array");
+    }
+
+    napi_typedarray_type type;
+    void* data = nullptr;
+    napi_value arrayBuffer;
+    size_t byteOffset = 0;
+    NAPI_STATUS_RETURN(napi_get_typedarray_info(env, value, &type, &result.offsetsLength, &data,
+                                                &arrayBuffer, &byteOffset));
+    if (type != napi_uint32_array) {
+      return PackedIteratorKeyInputError(env, "Packed getMany input offsets must be a Uint32Array");
+    }
+    result.offsets = static_cast<const uint32_t*>(data);
+  }
+
+  {
+    napi_value value;
+    NAPI_STATUS_RETURN(napi_get_named_property(env, input, "count", &value));
+    double count = 0;
+    if (napi_get_value_double(env, value, &count) != napi_ok || !std::isfinite(count) ||
+        std::trunc(count) != count || count < 0 ||
+        count > static_cast<double>(std::numeric_limits<uint32_t>::max())) {
+      return PackedIteratorKeyInputError(env, "Packed getMany input count must be a uint32");
+    }
+    result.count = static_cast<uint32_t>(count);
+  }
+
+  const auto expectedOffsets = static_cast<size_t>(result.count) * result.fieldsPerRow + 1;
+  if (result.offsetsLength != expectedOffsets) {
+    return PackedIteratorKeyInputError(env, "Packed getMany input offsets do not match its row layout");
+  }
+  if (result.offsets[0] != 0) {
+    return PackedIteratorKeyInputError(env, "Packed getMany input offsets must start at zero");
+  }
+
+  uint32_t previous = 0;
+  for (size_t index = 0; index < result.offsetsLength; ++index) {
+    const auto offset = result.offsets[index];
+    if (offset < previous || offset > result.dataLength) {
+      return PackedIteratorKeyInputError(env, "Packed getMany input offsets are outside its buffer");
+    }
+    previous = offset;
+  }
+  if (previous != result.dataLength) {
+    return PackedIteratorKeyInputError(env, "Packed getMany input offsets do not cover its buffer");
+  }
+
+  return napi_ok;
+}
+
+static napi_status GetBorrowedGetManyKeys(napi_env env,
+                                          napi_value input,
+                                          std::vector<rocksdb::Slice>& result) {
+  bool isArray = false;
+  NAPI_STATUS_RETURN(napi_is_array(env, input, &isArray));
+  if (isArray) {
+    uint32_t count = 0;
+    NAPI_STATUS_RETURN(napi_get_array_length(env, input, &count));
+    result.resize(count);
+    for (uint32_t index = 0; index < count; ++index) {
+      napi_value key;
+      NAPI_STATUS_RETURN(napi_get_element(env, input, index, &key));
+      NAPI_STATUS_RETURN(GetValue(env, key, result[index]));
+    }
+    return napi_ok;
+  }
+
+  PackedIteratorKeyInput packed;
+  NAPI_STATUS_RETURN(GetPackedIteratorKeyInput(env, input, packed));
+  result.resize(packed.count);
+  const auto* data = packed.data == nullptr ? "" : packed.data;
+  for (uint32_t index = 0; index < packed.count; ++index) {
+    const auto fieldIndex = static_cast<size_t>(index) * packed.fieldsPerRow;
+    const auto start = packed.offsets[fieldIndex];
+    const auto end = packed.offsets[fieldIndex + 1];
+    result[index] = rocksdb::Slice(data + start, end - start);
+  }
+  return napi_ok;
+}
+
+struct OwnedGetManyKeys {
+  std::vector<std::string> array;
+  std::string packedData;
+  std::vector<uint32_t> packedOffsets;
+  bool packed = false;
+
+  size_t size() const { return packed ? packedOffsets.size() - 1 : array.size(); }
+
+  std::vector<rocksdb::Slice> slices() const {
+    std::vector<rocksdb::Slice> result;
+    result.reserve(size());
+    if (packed) {
+      for (size_t index = 0; index + 1 < packedOffsets.size(); ++index) {
+        const auto start = packedOffsets[index];
+        const auto end = packedOffsets[index + 1];
+        result.emplace_back(packedData.data() + start, end - start);
+      }
+    } else {
+      for (const auto& key : array) result.emplace_back(key);
+    }
+    return result;
+  }
+};
+
+static napi_status GetOwnedGetManyKeys(napi_env env, napi_value input, OwnedGetManyKeys& result) {
+  bool isArray = false;
+  NAPI_STATUS_RETURN(napi_is_array(env, input, &isArray));
+  if (isArray) {
+    uint32_t count = 0;
+    NAPI_STATUS_RETURN(napi_get_array_length(env, input, &count));
+    result.array.resize(count);
+    for (uint32_t index = 0; index < count; ++index) {
+      napi_value key;
+      NAPI_STATUS_RETURN(napi_get_element(env, input, index, &key));
+      NAPI_STATUS_RETURN(GetValue(env, key, result.array[index]));
+    }
+    return napi_ok;
+  }
+
+  PackedIteratorKeyInput packed;
+  NAPI_STATUS_RETURN(GetPackedIteratorKeyInput(env, input, packed));
+  result.packed = true;
+  result.packedOffsets.reserve(static_cast<size_t>(packed.count) + 1);
+  result.packedOffsets.push_back(0);
+
+  size_t keyBytes = 0;
+  for (uint32_t index = 0; index < packed.count; ++index) {
+    const auto fieldIndex = static_cast<size_t>(index) * packed.fieldsPerRow;
+    keyBytes += packed.offsets[fieldIndex + 1] - packed.offsets[fieldIndex];
+  }
+  result.packedData.reserve(keyBytes);
+
+  const auto* data = packed.data == nullptr ? "" : packed.data;
+  for (uint32_t index = 0; index < packed.count; ++index) {
+    const auto fieldIndex = static_cast<size_t>(index) * packed.fieldsPerRow;
+    const auto start = packed.offsets[fieldIndex];
+    const auto end = packed.offsets[fieldIndex + 1];
+    result.packedData.append(data + start, end - start);
+    result.packedOffsets.push_back(static_cast<uint32_t>(result.packedData.size()));
+  }
+
+  return napi_ok;
+}
+
 static napi_value db_get_many_sync_impl(napi_env env, napi_callback_info info, const PackedMode mode) {
   NAPI_ARGV(3);
 
@@ -3432,9 +3656,6 @@ static napi_value db_get_many_sync_impl(napi_env env, napi_callback_info info, c
   NAPI_STATUS_THROWS(GetDatabase(env, argv[0], database, &reference));
   std::shared_ptr<DatabaseOperation> databaseOperation;
   NAPI_STATUS_THROWS(BeginDatabaseOperation(env, database, reference, databaseOperation));
-
-  uint32_t count;
-  NAPI_STATUS_THROWS(napi_get_array_length(env, argv[1], &count));
 
   rocksdb::ColumnFamilyHandle* column = database->db->DefaultColumnFamily();
   NAPI_STATUS_THROWS(GetColumnProperty(env, argv[2], database, column));
@@ -3453,17 +3674,12 @@ static napi_value db_get_many_sync_impl(napi_env env, napi_callback_info info, c
   }
 
   std::vector<rocksdb::Slice> keys;
-  keys.resize(count);
+  NAPI_STATUS_THROWS(GetBorrowedGetManyKeys(env, argv[1], keys));
+  const auto count = static_cast<uint32_t>(keys.size());
   std::vector<rocksdb::Status> statuses;
   statuses.resize(count);
   std::vector<rocksdb::PinnableSlice> values;
   values.resize(count);
-
-  for (uint32_t n = 0; n < count; n++) {
-    napi_value element;
-    NAPI_STATUS_THROWS(napi_get_element(env, argv[1], n, &element));
-    NAPI_STATUS_THROWS(GetValue(env, element, keys[n]));
-  }
 
   rocksdb::ReadOptions readOptions;
   readOptions.deadline =
@@ -3542,9 +3758,6 @@ static napi_value db_get_many_impl(napi_env env, napi_callback_info info, const 
   std::shared_ptr<DatabaseOperation> databaseOperation;
   NAPI_STATUS_THROWS(BeginDatabaseOperation(env, database, reference, databaseOperation));
 
-  uint32_t count;
-  NAPI_STATUS_THROWS(napi_get_array_length(env, argv[1], &count));
-
   rocksdb::ColumnFamilyHandle* column = database->db->DefaultColumnFamily();
   NAPI_STATUS_THROWS(GetColumnProperty(env, argv[2], database, column));
 
@@ -3563,16 +3776,12 @@ static napi_value db_get_many_impl(napi_env env, napi_callback_info info, const 
 
   auto callback = argv[3];
 
-  std::vector<std::string> ownedKeys(count);
-
-  for (uint32_t n = 0; n < count; n++) {
-    napi_value element;
-    NAPI_STATUS_THROWS(napi_get_element(env, argv[1], n, &element));
-    // Async work must not borrow Buffer or SliceLike storage. The caller can
-    // mutate or release the original objects as soon as this method returns.
-    // Snapshot every key on the JS thread regardless of output options.
-    NAPI_STATUS_THROWS(GetValue(env, element, ownedKeys[n]));
-  }
+  // Async work must not borrow Buffer, SliceLike or packed-arena storage. The
+  // caller can mutate or release the original input as soon as this method
+  // returns, so snapshot array keys or the packed key fields on the JS thread.
+  OwnedGetManyKeys ownedKeys;
+  NAPI_STATUS_THROWS(GetOwnedGetManyKeys(env, argv[1], ownedKeys));
+  const auto count = static_cast<uint32_t>(ownedKeys.size());
 
   rocksdb::ReadOptions readOptions;
   readOptions.deadline =
@@ -3612,11 +3821,7 @@ static napi_value db_get_many_impl(napi_env env, napi_callback_info info, const 
         // copy and raw db_close cannot tear down the cache first.
         (void)databaseOperation;
 
-        std::vector<rocksdb::Slice> keys;
-        keys.reserve(ownedKeys.size());
-        for (const auto& key : ownedKeys) {
-          keys.emplace_back(key);
-        }
+        const auto keys = ownedKeys.slices();
 
         state.statuses.resize(count);
         state.values.resize(count);

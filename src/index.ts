@@ -550,6 +550,7 @@ class RocksLevel extends AbstractLevel<any, any, any> {
         try {
           const indexes: number[] = []
           const packedResult = !Array.isArray(val)
+          const resultCount = packedResult ? val.statuses.length : val.length
           if (packedResult) {
             for (let i = 0; i < val.statuses.length; i++) {
               if (val.statuses[i] === 2) indexes.push(i)
@@ -568,7 +569,7 @@ class RocksLevel extends AbstractLevel<any, any, any> {
             completionPacked = packedResult
           } else if (!allowPartial) {
             const message =
-              keys.length === 1
+              resultCount === 1
                 ? 'Multi-get stopped before the value was read'
                 : 'Multi-get stopped before every value was read'
             completionError = new ModuleError(message, {
@@ -611,7 +612,7 @@ class RocksLevel extends AbstractLevel<any, any, any> {
   }
 
   [kGetManySync](keys, options, allowPartial, packed, exposePacked) {
-    if (keys.some((key) => typeof key === 'string')) {
+    if (Array.isArray(keys) && keys.some((key) => typeof key === 'string')) {
       keys = keys.map((key) => (typeof key === 'string' ? Buffer.from(key) : key))
     }
 
@@ -665,7 +666,7 @@ class RocksLevel extends AbstractLevel<any, any, any> {
 
     if (incomplete && !allowPartial) {
       const message =
-        keys.length === 1
+        (packedResult ? nativeResult.statuses.length : nativeResult.length) === 1
           ? 'Multi-get stopped before the value was read'
           : 'Multi-get stopped before every value was read'
       throw new ModuleError(message, { code: 'LEVEL_ABORTED' })
