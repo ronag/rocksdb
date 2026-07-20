@@ -19,6 +19,7 @@ const kInitCallbacks = Symbol('initCallbacks')
 const kInitError = Symbol('initError')
 const kInitialTarget = Symbol('initialTarget')
 const kCache = Symbol('cache')
+const kCacheLastKey = Symbol('cacheLastKey')
 const kFinished = Symbol('finished')
 const kFirst = Symbol('first')
 const kPosition = Symbol('position')
@@ -185,6 +186,7 @@ function emptyPackedResult(iterator) {
     values: iterator[kValues],
     finished: true,
     limited: false,
+    lastKey: undefined,
   }
 }
 
@@ -281,7 +283,15 @@ function convertIteratorResult(iterator, result) {
     rows,
     finished: result.finished,
     limited: result.limited,
+    lastKey: result.lastKey,
   }
+}
+
+function encodeCachedKey(key) {
+  if (typeof key === 'string') return Buffer.from(key)
+  if (Buffer.isBuffer(key)) return copyBytesFrom(key)
+  if (key instanceof Slice) return copyBytesFrom(key.buffer, key.byteOffset, key.byteLength)
+  return undefined
 }
 
 class Iterator extends AbstractIterator<any, any, any> {
@@ -314,6 +324,7 @@ class Iterator extends AbstractIterator<any, any, any> {
 
       this[kFirst] = true
       this[kCache] = kEmpty
+      this[kCacheLastKey] = undefined
       this[kFinished] = false
       this[kPosition] = 0
       this[kNativeBusy] = false
@@ -458,6 +469,7 @@ class Iterator extends AbstractIterator<any, any, any> {
         this[kInitialTarget] = initialTarget
         this[kFirst] = true
         this[kCache] = kEmpty
+        this[kCacheLastKey] = undefined
         this[kFinished] = false
         this[kPosition] = 0
         return
@@ -542,6 +554,7 @@ class Iterator extends AbstractIterator<any, any, any> {
     if (this[kPosition] < this[kCache].length) {
       const key = this[kCache][this[kPosition]++]
       const val = this[kCache][this[kPosition]++]
+      if (this[kPosition] >= this[kCache].length) this[kCacheLastKey] = undefined
       process.nextTick(callback, null, key, val)
     } else if (this[kFinished]) {
       process.nextTick(callback)
@@ -576,6 +589,7 @@ class Iterator extends AbstractIterator<any, any, any> {
         try {
           result = convertIteratorResult(this, result)
           this[kCache] = result.rows
+          this[kCacheLastKey] = result.rows.length === 0 ? undefined : result.lastKey
           this[kFinished] = result.finished
           this[kPosition] = 0
         } catch (err) {
@@ -666,6 +680,7 @@ class Iterator extends AbstractIterator<any, any, any> {
 
     this[kFirst] = true
     this[kCache] = kEmpty
+    this[kCacheLastKey] = undefined
     this[kFinished] = false
     this[kPosition] = 0
 
@@ -693,6 +708,7 @@ class Iterator extends AbstractIterator<any, any, any> {
     const discardedCount = (this[kCache].length - this[kPosition]) / 2
     this[kFirst] = true
     this[kCache] = kEmpty
+    this[kCacheLastKey] = undefined
     this[kFinished] = false
     this[kPosition] = 0
 
@@ -725,6 +741,7 @@ class Iterator extends AbstractIterator<any, any, any> {
       const reset = () => {
         this[kFirst] = true
         this[kCache] = kEmpty
+        this[kCacheLastKey] = undefined
         this[kFinished] = false
         this[kPosition] = 0
       }
@@ -764,8 +781,15 @@ class Iterator extends AbstractIterator<any, any, any> {
 
     const finished = this[kFinished] && this[kPosition] >= this[kCache].length
     const limited = !finished && rows.length >= size * 2
+    const drained = this[kPosition] >= this[kCache].length
+    const lastKey = drained
+      ? this[kCacheLastKey]
+      : this[kKeys]
+        ? encodeCachedKey(rows[rows.length - 2])
+        : undefined
+    if (drained) this[kCacheLastKey] = undefined
 
-    return { rows, finished, limited }
+    return { rows, finished, limited, lastKey }
   }
 
   // Read already-encoded rows without public count/end bookkeeping. Returned
@@ -795,7 +819,10 @@ class Iterator extends AbstractIterator<any, any, any> {
     }
 
     if (this[kFinished]) {
-      const result = packed === true ? emptyPackedResult(this) : { rows: [], finished: true }
+      const result =
+        packed === true
+          ? emptyPackedResult(this)
+          : { rows: [], finished: true, lastKey: undefined }
       return setPackedResult(convertIteratorResult(this, result), packed === true)
     }
 
@@ -856,7 +883,10 @@ class Iterator extends AbstractIterator<any, any, any> {
         const result = this._nextvCached(size)
         this._deferNextResult(callback, null, result, false, unsafe)
       } else if (this[kFinished]) {
-        const result = packed === true ? emptyPackedResult(this) : { rows: [], finished: true }
+        const result =
+          packed === true
+            ? emptyPackedResult(this)
+            : { rows: [], finished: true, lastKey: undefined }
         this._deferNextResult(callback, null, result, packed === true, unsafe)
       } else {
         const nextv =
@@ -947,6 +977,7 @@ class Iterator extends AbstractIterator<any, any, any> {
 
   [kCloseNative]() {
     this[kCache] = kEmpty
+    this[kCacheLastKey] = undefined
 
     if (this[kContext]) {
       binding.iterator_close_sync(this[kContext])

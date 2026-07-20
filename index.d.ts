@@ -438,6 +438,8 @@ export interface RocksRawIteratorResult<
   readonly rows: Array<RocksRows<K, V, Keys, Values>>
   readonly finished: boolean
   readonly limited?: boolean
+  /** Last encoded key safely consumed by this read, or undefined if no safe boundary is available. */
+  readonly lastKey: Buffer | undefined
 }
 
 export interface RocksPackedIteratorResult<
@@ -459,6 +461,8 @@ export interface RocksPackedIteratorResult<
   readonly count: number
   readonly finished: boolean
   readonly limited: boolean
+  /** Last encoded key safely consumed by this read, or undefined if no safe boundary is available. */
+  readonly lastKey: Buffer | undefined
 }
 
 export interface RocksPackedGetManyResult {
@@ -873,6 +877,8 @@ export interface RocksQueryResult<
   readonly rows: Array<RocksRows<K, V, Keys, Values>>
   readonly finished: boolean
   readonly limited: boolean
+  /** Last encoded key safely consumed by the query, or undefined if no key was consumed. */
+  readonly lastKey: Buffer | undefined
 }
 
 export interface RocksUpdatesOptions<

@@ -367,6 +367,7 @@ expectTrue<Equal<Awaited<typeof annotatedBoundedValues>, Array<string | undefine
 
 const query = db.querySync({ gte: slice, lt: Buffer.from('z') })
 expectType<Array<Buffer>>(query.rows)
+expectType<Buffer | undefined>(query.lastKey)
 expectType<Array<string>>(db.querySync({ keyEncoding: 'utf8', valueEncoding: 'utf8' }).rows)
 expectType<Array<string>>(db.querySync({ keyEncoding: 'utf-8', valueEncoding: 'utf-8' }).rows)
 expectType<
@@ -393,6 +394,7 @@ expectType<Promise<RocksPackedIteratorResult | RocksRawIteratorResult<Buffer, Bu
 expectType<RocksPackedIteratorResult>(iterator._nextvSync(10, { packed: true }))
 expectType<Promise<RocksPackedIteratorResult>>(iterator._nextvAsync(10, { packed: true }))
 const packedIteratorKeys = iterator._nextvSync(10, { packed: true })
+expectType<Buffer | undefined>(packedIteratorKeys.lastKey)
 expectType<RocksPackedGetManyResult | RocksRawGetManyResult<'buffer', false, false>>(
   db._getManySync(packedIteratorKeys)
 )
