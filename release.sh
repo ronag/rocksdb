@@ -89,11 +89,17 @@ echo "Checking release prebuild manifest..."
 # platform directories or native files abort before versioning or publishing.
 node scripts/check-release-prebuilds.js
 
-read -r -p "Version bump (patch/minor/major): " BUMP
+# Accept the version bump either as the first argument or interactively. It may
+# be a keyword (patch/minor/major) or an explicit semver version (e.g. 1.2.3).
+BUMP="$1"
+if [ -z "$BUMP" ]; then
+  read -r -p "Version bump (patch/minor/major or explicit version): " BUMP
+fi
 case "$BUMP" in
   patch | minor | major) ;;
+  [0-9]*.[0-9]*.[0-9]*) ;;
   *)
-    echo "Invalid bump: '$BUMP' (expected patch, minor or major)" >&2
+    echo "Invalid version: '$BUMP' (expected patch, minor, major or an explicit version like 1.2.3)" >&2
     exit 1
     ;;
 esac
