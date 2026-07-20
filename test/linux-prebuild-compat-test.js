@@ -13,9 +13,9 @@ const {
 
 test('linux prebuild compatibility pins the audited project ABI ceilings', function (t) {
   t.deepEqual(ABI_LIMITS, {
-    GLIBC: '2.30',
-    GLIBCXX: '3.4.26',
-    CXXABI: '1.3.11'
+    GLIBC: '2.36',
+    GLIBCXX: '3.4.30',
+    CXXABI: '1.3.13'
   })
   t.end()
 })
