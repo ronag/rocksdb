@@ -5,6 +5,11 @@ set -euo pipefail
 # use linux/amd64 even on arm64 hosts (e.g. Apple Silicon under emulation).
 PLATFORM=linux/amd64
 TARGET_DIR=prebuilds/linux-x64
+# Persistent ccache location on the host. The Docker build seeds its cache
+# mount from here and, on success, we export the updated cache back into it so
+# subsequent releases start warm. Living under /tmp keeps it off the repo tree
+# and lets it survive `docker builder prune`.
+CCACHE_HOST_DIR="${ROCKS_LEVEL_CCACHE_DIR:-/tmp/rocks-level-ccache}"
 STAGE_DIR=
 BACKUP_ROOT=
 BACKUP_DIR=
@@ -86,6 +91,10 @@ git submodule update --init
 mkdir -p prebuilds
 STAGE_DIR=$(mktemp -d "prebuilds/.linux-x64.XXXXXX")
 
+# The Dockerfile seeds its ccache mount from this bind context, so it must
+# exist (empty is fine on the very first build).
+mkdir -p "$CCACHE_HOST_DIR"
+
 echo "Building and exporting prebuild..."
 # JOBS caps build parallelism for the memory-heavy rocksdb compile (default 8,
 # see Dockerfile). Lower it (e.g. JOBS=4 ./build.sh) on a memory-constrained
@@ -95,6 +104,7 @@ BUILD_ARGS=(
   --platform "$PLATFORM"
   --target artifact
   --output "type=local,dest=$STAGE_DIR"
+  --build-context "ccache=$CCACHE_HOST_DIR"
 )
 if [ -n "${JOBS:-}" ]; then
   BUILD_ARGS+=(--build-arg "JOBS=$JOBS")
@@ -133,5 +143,27 @@ if ! cleanup_resources; then
   exit 1
 fi
 trap - EXIT INT TERM
+
+# Export the Docker build's updated compiler cache back to the host. This is a
+# pure optimization for the next release, so it must never fail a release whose
+# artifact is already built, validated, and installed above.
+echo "Exporting compiler cache to $CCACHE_HOST_DIR..."
+CCACHE_EXPORT_DIR=$(mktemp -d "${TMPDIR:-/tmp}/rocks-level-ccache-out.XXXXXX") || CCACHE_EXPORT_DIR=
+if [ -n "$CCACHE_EXPORT_DIR" ]; then
+  if DOCKER_BUILDKIT=1 docker build \
+      --platform "$PLATFORM" \
+      --target ccache-artifact \
+      --build-context "ccache=$CCACHE_HOST_DIR" \
+      --output "type=local,dest=$CCACHE_EXPORT_DIR" \
+      . \
+    && cp -a "$CCACHE_EXPORT_DIR/." "$CCACHE_HOST_DIR/"; then
+    :
+  else
+    echo "Warning: could not export compiler cache to $CCACHE_HOST_DIR; continuing." >&2
+  fi
+  rm -rf "$CCACHE_EXPORT_DIR"
+else
+  echo "Warning: could not create a temp dir for compiler cache export; continuing." >&2
+fi
 
 echo "All done!"

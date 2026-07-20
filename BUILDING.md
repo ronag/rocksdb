@@ -52,6 +52,16 @@ for private, hardware-controlled deployments:
 Do not publish that tuned artifact as the generic npm prebuild. `release.sh`
 always clears `ROCKS_LEVEL_MARCH` for its Linux build.
 
+To keep repeated releases fast, the Docker build routes every compiler
+invocation through `ccache` (on a BuildKit cache mount) and persists that cache
+to `/tmp/rocks-level-ccache` on the host: `build.sh` seeds the mount from that
+directory before building and exports the updated cache back to it afterward.
+The cache therefore survives image rebuilds and `docker builder prune`, and —
+because seeding and exporting happen on the client side — it stays on the local
+host even when `DOCKER_HOST` points at a remote builder. Exporting is
+best-effort and never fails a release. Override the location with
+`ROCKS_LEVEL_CCACHE_DIR`.
+
 The base image digest, CMake tarball checksum, RocksDB submodule and native
 dependency commits are pinned, and the resulting ABI and CPU baseline are
 checked. This is not a byte-for-byte reproducible build: Bullseye packages

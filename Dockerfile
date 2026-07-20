@@ -5,6 +5,7 @@ FROM node:26.4.0-bullseye@sha256:547115894d02507bae039a4eecdc0feb1ce337d7e7dcda5
 
 RUN apt-get update && apt-get install -y \
   build-essential \
+  ccache \
   git \
   python3 \
   curl \
@@ -38,12 +39,24 @@ ARG JOBS=8
 #   ROCKS_LEVEL_MARCH=znver2 ./build.sh
 ARG ROCKS_LEVEL_MARCH=
 
+# Route every compiler invocation (cmake for the deps, node-gyp for the addon)
+# through ccache. Debian's ccache package ships masquerade symlinks in
+# /usr/lib/ccache; prepending it to PATH transparently caches gcc/g++/cc/c++.
+# The cache lives on a BuildKit cache mount at CCACHE_DIR, which build.sh seeds
+# from and exports back to /tmp on the host so it persists across releases.
+ENV PATH="/usr/lib/ccache:${PATH}"
+ENV CCACHE_DIR=/ccache
+ENV CCACHE_MAXSIZE=2G
+
 # Build abseil/re2/zstd before copying package metadata so the expensive native
 # dependency layer survives both source edits and package-only changes. These
 # scripts use only Node built-ins; npm dependencies are installed afterward for
 # the addon build.
 COPY scripts/build-deps.js scripts/deps-prefix.js ./scripts/
-RUN ROCKS_LEVEL_MARCH="$ROCKS_LEVEL_MARCH" JOBS="$JOBS" node scripts/build-deps.js
+RUN --mount=type=cache,target=/ccache,id=rocks-level-ccache,sharing=locked \
+    --mount=type=bind,from=ccache,target=/ccache-seed,ro \
+    cp -an /ccache-seed/. /ccache/ 2>/dev/null || true; \
+    ROCKS_LEVEL_MARCH="$ROCKS_LEVEL_MARCH" JOBS="$JOBS" node scripts/build-deps.js
 
 COPY package.json ./
 RUN npm install --ignore-scripts
@@ -53,7 +66,10 @@ COPY . .
 # Exercise the real forced-source install path on Bullseye. The rocksdb gyp
 # target generates its audited GCC 10 compatibility header before compilation,
 # so npm consumers and prebuild generation cannot take different paths.
-RUN ROCKS_LEVEL_MARCH="$ROCKS_LEVEL_MARCH" JOBS="$JOBS" MAKEFLAGS="-j$JOBS" \
+RUN --mount=type=cache,target=/ccache,id=rocks-level-ccache,sharing=locked \
+    --mount=type=bind,from=ccache,target=/ccache-seed,ro \
+    cp -an /ccache-seed/. /ccache/ 2>/dev/null || true; \
+    ROCKS_LEVEL_MARCH="$ROCKS_LEVEL_MARCH" JOBS="$JOBS" MAKEFLAGS="-j$JOBS" \
     npm_config_build_from_source=true node scripts/install.js
 
 # The addon uses the stable Node-API and node-gyp built it for this image's
@@ -77,3 +93,14 @@ RUN npm run test-prebuild
 # exporter, avoiding a temporary daemon container and its lifetime hazards.
 FROM scratch AS artifact
 COPY --from=build /rocks-level/prebuilds/linux-x64/@nxtedition+rocksdb.node /@nxtedition+rocksdb.node
+
+# Dump the compiler cache so build.sh can export it back to /tmp on the host.
+# Cache-mount contents live in the builder, not in any layer, so a RUN must
+# copy them into a normal path before a scratch stage can export them. This
+# reuses the fully cached `build` stage, so only the copy below runs.
+FROM build AS ccache-dump
+RUN --mount=type=cache,target=/ccache,id=rocks-level-ccache,sharing=locked \
+    mkdir -p /ccache-out && cp -a /ccache/. /ccache-out/ 2>/dev/null || true
+
+FROM scratch AS ccache-artifact
+COPY --from=ccache-dump /ccache-out /
