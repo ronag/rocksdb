@@ -76,6 +76,11 @@ for argument in "$@"; do target=$argument; done
 if [ "\${FAKE_RM_TARGET_FAIL:-}" = "1" ] && [ "$target" = "prebuilds/linux-x64" ]; then
   exit 42
 fi
+if [ "\${FAKE_RM_CACHE_FAIL:-}" = "1" ]; then
+  case "$target" in
+    */.ccache-download.*) exit 42 ;;
+  esac
+fi
 exec /bin/rm "$@"
 `)
   executable(path.join(bin, 'docker'), `#!/bin/bash
@@ -109,6 +114,11 @@ case "$target" in
     case "\${FAKE_DOCKER_CACHE_MODE:-success}" in
       fail)
         exit 42
+        ;;
+      term-after-output)
+        printf 'compiler cache\n' > "$destination/cache-entry"
+        kill -TERM "$PPID"
+        exit 143
         ;;
       *)
         printf 'compiler cache\n' > "$destination/cache-entry"
@@ -309,6 +319,43 @@ test('compiler cache download failure does not fail an installed prebuild', func
         .readdirSync(path.join(context.root, '.cache'))
         .some((entry) => entry.startsWith('.ccache-download.')),
       'the failed cache download is removed'
+    )
+  } finally {
+    fs.rmSync(context.root, { recursive: true, force: true })
+  }
+
+  t.end()
+})
+
+test('compiler cache cleanup failure does not fail an installed prebuild', function (t) {
+  const context = fixture()
+
+  try {
+    const { result } = runBuild(context, { FAKE_RM_CACHE_FAIL: '1' })
+
+    t.equal(result.status, 0, 'the completed prebuild remains successful')
+    t.match(result.stderr, /could not remove compiler cache download directory/)
+    t.ok(
+      fs.readdirSync(path.join(context.root, '.cache')).some((entry) => entry.startsWith('.ccache-download.')),
+      'the failed cleanup leaves an identifiable download directory'
+    )
+  } finally {
+    fs.rmSync(context.root, { recursive: true, force: true })
+  }
+
+  t.end()
+})
+
+test('compiler cache download is removed when the build is interrupted', function (t) {
+  const context = fixture()
+
+  try {
+    const { result } = runBuild(context, { FAKE_DOCKER_CACHE_MODE: 'term-after-output' })
+
+    t.notEqual(result.status, 0, 'the interrupted build does not report success')
+    t.notOk(
+      fs.readdirSync(path.join(context.root, '.cache')).some((entry) => entry.startsWith('.ccache-download.')),
+      'the interrupted cache download is removed'
     )
   } finally {
     fs.rmSync(context.root, { recursive: true, force: true })

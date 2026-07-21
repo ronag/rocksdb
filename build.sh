@@ -9,6 +9,7 @@ TARGET_DIR=prebuilds/linux-x64
 # builder is active and downloads the updated cache after a successful build,
 # so switching between local and remote Docker hosts keeps the build warm.
 CCACHE_LOCAL_DIR="${ROCKS_LEVEL_CCACHE_DIR:-.cache/ccache}"
+CCACHE_DOWNLOAD_DIR=
 STAGE_DIR=
 BACKUP_ROOT=
 BACKUP_DIR=
@@ -68,9 +69,26 @@ cleanup_resources() {
   return "$cleanup_status"
 }
 
+cleanup_cache_download() {
+  if [ -z "$CCACHE_DOWNLOAD_DIR" ]; then
+    return 0
+  fi
+
+  if { [ -e "$CCACHE_DOWNLOAD_DIR" ] || [ -L "$CCACHE_DOWNLOAD_DIR" ]; } && \
+      ! rm -rf "$CCACHE_DOWNLOAD_DIR"; then
+    echo "Warning: could not remove compiler cache download directory $CCACHE_DOWNLOAD_DIR; continuing." >&2
+    return 1
+  fi
+
+  CCACHE_DOWNLOAD_DIR=
+}
+
 on_exit() {
   local status=$?
   trap - EXIT INT TERM
+  if ! cleanup_cache_download; then
+    :
+  fi
   if ! cleanup_resources && [ "$status" -eq 0 ]; then
     status=1
   fi
@@ -141,7 +159,6 @@ if ! cleanup_resources; then
   trap - EXIT INT TERM
   exit 1
 fi
-trap - EXIT INT TERM
 
 # Download the Docker builder's updated compiler cache into the project. This
 # is a pure optimization for the next release, so it must never fail a release
@@ -160,9 +177,13 @@ if [ -n "$CCACHE_DOWNLOAD_DIR" ]; then
   else
     echo "Warning: could not download compiler cache to $CCACHE_LOCAL_DIR; continuing." >&2
   fi
-  rm -rf "$CCACHE_DOWNLOAD_DIR"
 else
   echo "Warning: could not create a local compiler cache download directory; continuing." >&2
 fi
+
+if ! cleanup_cache_download; then
+  :
+fi
+trap - EXIT INT TERM
 
 echo "All done!"
