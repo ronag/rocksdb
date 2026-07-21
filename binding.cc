@@ -3401,6 +3401,8 @@ static bool HasGetManyUnsafe(const uint32_t unsafe, const GetManyUnsafe flag) {
 }
 
 static napi_status GetGetManyUnsafe(napi_env env, napi_value options, uint32_t& result) {
+  result = 0;
+
   napi_valuetype optionsType;
   NAPI_STATUS_RETURN(napi_typeof(env, options, &optionsType));
   if (optionsType == napi_undefined || optionsType == napi_null) return napi_ok;
