@@ -143,6 +143,38 @@ test('packed getMany arena survives database close and forced GC', async functio
   t.end()
 })
 
+test('auto-unpacked unsafe buffer view survives database close and forced GC', async function (t) {
+  if (!global.gc) {
+    t.pass('forced-GC variant runs through test/gc.js')
+    t.end()
+    return
+  }
+
+  let db = testCommon.factory({ keyEncoding: 'buffer', valueEncoding: 'buffer' })
+  await db.open()
+
+  let source = Buffer.alloc(4 * 1024, 0x4d)
+  await db.put(Buffer.from('auto-unpacked'), source)
+  source = null
+
+  let result = await db._getManyAsync([Buffer.from('auto-unpacked')], {
+    packed: 'auto',
+    unsafe: RocksGetManyUnsafe.OUTPUT
+  })
+  t.ok(Array.isArray(result), 'auto exposes the ordinary value array')
+  const retained = result[0]
+  result = null
+
+  await db.close()
+  db = null
+  for (let index = 0; index < 4; index++) global.gc()
+
+  t.equal(retained.byteLength, 4 * 1024, 'retained view preserves its length')
+  t.ok(retained.every((byte) => byte === 0x4d),
+    'retained view preserves the auto-packed arena bytes after close and GC')
+  t.end()
+})
+
 test('async getMany snapshots key buffers through forced GC', async function (t) {
   if (!global.gc) {
     t.pass('forced-GC variant runs through test/gc.js')

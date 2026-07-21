@@ -135,12 +135,12 @@ row in the batch, avoiding a second pass or a whole-batch copy.
 
 Raw `getMany` calls using `packed: 'auto'` return an ordinary value array by
 default, unpacking a selected native arena into buffer views when necessary.
-Set `exposePacked: true` to preserve the selected native representation and add
-its `packed` discriminator. For buffer output, explicit `packed: true` always
-returns an arena; `exposePacked` only controls its discriminator. `slice`-,
-`utf8`- and `utf-8`-encoded results are always arrays. Raw iterator results
-continue to expose the discriminator. Async callbacks receive the selected
-native mode as their third argument regardless of `exposePacked`:
+For buffer output, set `exposePacked: true` to preserve the selected native
+representation and add its `packed` discriminator. Explicit `packed: true`
+always returns an arena; `exposePacked` only controls its discriminator.
+`slice`-, `utf8`- and `utf-8`-encoded results are always arrays. Raw iterator
+results continue to expose the discriminator. Async callbacks receive the
+selected native mode as their third argument regardless of `exposePacked`:
 
 ```js
 db._getManyAsync(keys, { valueEncoding: 'buffer', exposePacked: true }, (err, result, packed) => {

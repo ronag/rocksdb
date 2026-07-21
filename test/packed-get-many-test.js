@@ -448,6 +448,37 @@ test('packed getMany reports bounded partial reads', async function (t) {
   t.end()
 })
 
+test('auto getMany unpacks bounded partial reads for sync and async callers', async function (t) {
+  const db = testCommon.factory({ keyEncoding: 'buffer', valueEncoding: 'buffer' })
+  await db.open()
+  const value = Buffer.alloc(1024, 0x78)
+  const keys = ['a', 'b', 'c']
+  await db.batch(keys.map((key) => ({ type: 'put', key, value })))
+
+  for (const [name, read] of [
+    ['sync', (options) => db._getManySync(keys, options)],
+    ['async', (options) => db._getManyAsync(keys, options)]
+  ]) {
+    const options = {
+      packed: 'auto',
+      highWaterMarkBytes: 0,
+      allowPartial: true
+    }
+    const exposed = await read({ ...options, exposePacked: true })
+    t.equal(exposed.packed, true, `${name} bounded auto selects the packed native path`)
+    t.ok(exposed.statuses.includes(2), `${name} exposed result contains incomplete statuses`)
+
+    const result = await read(options)
+    t.ok(Array.isArray(result), `${name} bounded auto returns the ordinary value array`)
+    t.equal(result.length, keys.length, `${name} bounded auto preserves logical result count`)
+    t.ok(result.some(Buffer.isBuffer), `${name} bounded auto preserves completed values`)
+    t.ok(result.includes(null), `${name} bounded auto maps incomplete statuses to null`)
+  }
+
+  await db.close()
+  t.end()
+})
+
 test('packed getMany arena remains valid after database close and GC', async function (t) {
   const db = testCommon.factory({ keyEncoding: 'buffer', valueEncoding: 'buffer' })
   await db.open()
