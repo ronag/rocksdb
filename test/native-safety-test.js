@@ -163,6 +163,9 @@ test('stale native batches reject every mutation after reopen', async function (
 
   for (const [name, mutate] of [
     ['put', () => binding.batch_put(batch, Buffer.from('key'), Buffer.from('value'), {})],
+    ['append many', () => binding.batch_append_many(batch, [
+      Buffer.from('key'), Buffer.from('value')
+    ], {})],
     ['put log data', () => binding.batch_put_log_data(batch, Buffer.from('data'))],
     ['delete', () => binding.batch_del(batch, Buffer.from('key'), {})],
     ['merge', () => binding.batch_merge(batch, Buffer.from('key'), Buffer.from('value'), {})]

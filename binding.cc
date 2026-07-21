@@ -1197,6 +1197,105 @@ struct NativeBatch final {
   rocksdb::WriteBatch batch;
 };
 
+static napi_status GetOwnedBatchAppendString(napi_env env, napi_value from, std::string& to) {
+  bool isBuffer = false;
+  NAPI_STATUS_RETURN(napi_is_buffer(env, from, &isBuffer));
+
+  if (isBuffer) {
+    char* data = nullptr;
+    size_t length = 0;
+    NAPI_STATUS_RETURN(napi_get_buffer_info(env, from, reinterpret_cast<void**>(&data), &length));
+    if (length == 0) {
+      to.clear();
+    } else {
+      to.assign(data, length);
+    }
+    return napi_ok;
+  }
+
+  napi_valuetype type;
+  NAPI_STATUS_RETURN(napi_typeof(env, from, &type));
+  if (type == napi_string) return GetString(env, from, to);
+  if (type != napi_object) return napi_invalid_arg;
+
+  int64_t offset = 0;
+  {
+    napi_value property;
+    NAPI_STATUS_RETURN(napi_get_named_property(env, from, "byteOffset", &property));
+    NAPI_STATUS_RETURN(GetIntegerValue(env, property, offset));
+  }
+
+  int64_t length = 0;
+  {
+    napi_value property;
+    NAPI_STATUS_RETURN(napi_get_named_property(env, from, "byteLength", &property));
+    NAPI_STATUS_RETURN(GetIntegerValue(env, property, length));
+  }
+
+  napi_value backing;
+  NAPI_STATUS_RETURN(napi_get_named_property(env, from, "buffer", &backing));
+  char* data = nullptr;
+  size_t backingLength = 0;
+  NAPI_STATUS_RETURN(
+      napi_get_buffer_info(env, backing, reinterpret_cast<void**>(&data), &backingLength));
+
+  if (offset < 0 || length < 0 || static_cast<uint64_t>(offset) > backingLength ||
+      static_cast<uint64_t>(length) > backingLength - static_cast<uint64_t>(offset)) {
+    return napi_invalid_arg;
+  }
+
+  if (length == 0) {
+    to.clear();
+  } else {
+    to.assign(data + offset, static_cast<size_t>(length));
+  }
+  return napi_ok;
+}
+
+struct BatchAppendEntry {
+  std::string key;
+  std::string value;
+  bool isDelete = false;
+};
+
+class BatchSavePoint final {
+ public:
+  explicit BatchSavePoint(rocksdb::WriteBatch& batch) : batch_(batch), count_(batch.Count()) {
+    batch_.SetSavePoint();
+  }
+
+  BatchSavePoint(const BatchSavePoint&) = delete;
+  BatchSavePoint& operator=(const BatchSavePoint&) = delete;
+
+  ~BatchSavePoint() noexcept {
+    if (!active_) return;
+
+    const auto status = batch_.RollbackToSavePoint();
+    assert(status.ok());
+    assert(batch_.Count() == count_);
+  }
+
+  rocksdb::Status Rollback() {
+    const auto status = batch_.RollbackToSavePoint();
+    if (status.ok()) {
+      active_ = false;
+      assert(batch_.Count() == count_);
+    }
+    return status;
+  }
+
+  rocksdb::Status Commit() {
+    const auto status = batch_.PopSavePoint();
+    if (status.ok()) active_ = false;
+    return status;
+  }
+
+ private:
+  rocksdb::WriteBatch& batch_;
+  const uint32_t count_;
+  bool active_ = true;
+};
+
 static napi_status GetBatch(napi_env env, napi_value value, std::shared_ptr<NativeBatch>& result) {
   return GetResourceExternal(env, value, kBatchReferenceTag, result);
 }
@@ -1223,6 +1322,7 @@ struct BatchEntry {
 
 #if defined(ROCKS_LEVEL_TEST_FAULTS)
 static std::atomic<bool> gFailBatchIteratorAfterFirstRow{false};
+static std::atomic<bool> gFailBatchAppendManyAfterFirstOperation{false};
 #endif
 
 struct BatchIterator : public rocksdb::WriteBatch::Handler {
@@ -4903,6 +5003,88 @@ NAPI_METHOD(batch_del) {
   return 0;
 }
 
+NAPI_METHOD(batch_append_many) {
+  NAPI_ARGV(3);
+
+  std::shared_ptr<NativeBatch> batch;
+  NAPI_STATUS_THROWS(GetBatch(env, argv[0], batch));
+  Database* database = batch->reference->database.get();
+  std::shared_ptr<DatabaseOperation> databaseOperation;
+  NAPI_STATUS_THROWS(BeginDatabaseOperation(env, database, batch->reference, databaseOperation));
+  NAPI_STATUS_THROWS(ValidateBatch(env, batch, batch->reference));
+
+  bool isArray = false;
+  NAPI_STATUS_THROWS(napi_is_array(env, argv[1], &isArray));
+  if (!isArray) {
+    napi_throw_type_error(env, nullptr, "Batch entries must be an array");
+    return nullptr;
+  }
+
+  uint32_t length = 0;
+  NAPI_STATUS_THROWS(napi_get_array_length(env, argv[1], &length));
+  if ((length & 1U) != 0) {
+    napi_throw_range_error(env, nullptr, "Batch entries must contain alternating key/value pairs");
+    return nullptr;
+  }
+
+  std::vector<BatchAppendEntry> entries;
+  entries.reserve(length / 2);
+  for (uint32_t index = 0; index < length; index += 2) {
+    napi_value keyValue;
+    NAPI_STATUS_THROWS(napi_get_element(env, argv[1], index, &keyValue));
+
+    BatchAppendEntry entry;
+    NAPI_STATUS_THROWS(GetOwnedBatchAppendString(env, keyValue, entry.key));
+
+    napi_value valueValue;
+    NAPI_STATUS_THROWS(napi_get_element(env, argv[1], index + 1, &valueValue));
+    napi_valuetype valueType;
+    NAPI_STATUS_THROWS(napi_typeof(env, valueValue, &valueType));
+    entry.isDelete = valueType == napi_null;
+    if (!entry.isDelete) {
+      NAPI_STATUS_THROWS(GetOwnedBatchAppendString(env, valueValue, entry.value));
+    }
+
+    entries.push_back(std::move(entry));
+  }
+
+  rocksdb::ColumnFamilyHandle* column = nullptr;
+  NAPI_STATUS_THROWS(GetColumnProperty(env, argv[2], database, column, false));
+
+  std::lock_guard lock(batch->mutex);
+  const auto count = batch->batch.Count();
+  if (entries.size() > std::numeric_limits<uint32_t>::max() - count) {
+    napi_throw_range_error(env, "LEVEL_BATCH_TOO_LARGE", "Batch operation count exceeds the RocksDB limit");
+    return nullptr;
+  }
+
+  BatchSavePoint savePoint(batch->batch);
+  for (size_t index = 0; index < entries.size(); ++index) {
+    const auto& entry = entries[index];
+    const rocksdb::Slice key(entry.key);
+    rocksdb::Status status;
+    if (entry.isDelete) {
+      status = column ? batch->batch.Delete(column, key) : batch->batch.Delete(key);
+    } else {
+      const rocksdb::Slice value(entry.value);
+      status = column ? batch->batch.Put(column, key, value) : batch->batch.Put(key, value);
+    }
+    if (!status.ok()) {
+      const auto rollbackStatus = savePoint.Rollback();
+      ROCKS_STATUS_THROWS_NAPI(rollbackStatus.ok() ? status : rollbackStatus);
+    }
+
+#if defined(ROCKS_LEVEL_TEST_FAULTS)
+    if (index == 0 && gFailBatchAppendManyAfterFirstOperation.exchange(false, std::memory_order_relaxed)) {
+      throw std::runtime_error("Injected batch append-many failure");
+    }
+#endif
+  }
+
+  ROCKS_STATUS_THROWS_NAPI(savePoint.Commit());
+  return nullptr;
+}
+
 NAPI_METHOD(batch_merge) {
   NAPI_ARGV(4);
 
@@ -5661,6 +5843,11 @@ NAPI_METHOD(test_fail_batch_iterator_once) {
   gFailBatchIteratorAfterFirstRow.store(true, std::memory_order_relaxed);
   return nullptr;
 }
+
+NAPI_METHOD(test_fail_batch_append_many_once) {
+  gFailBatchAppendManyAfterFirstOperation.store(true, std::memory_order_relaxed);
+  return nullptr;
+}
 #endif
 
 NAPI_INIT() {
@@ -5723,6 +5910,7 @@ NAPI_INIT() {
   NAPI_EXPORT_FUNCTION(batch_put_parts);
   NAPI_EXPORT_FUNCTION(batch_put_log_data);
   NAPI_EXPORT_FUNCTION(batch_del);
+  NAPI_EXPORT_FUNCTION(batch_append_many);
   NAPI_EXPORT_FUNCTION(batch_clear);
   NAPI_EXPORT_FUNCTION(batch_write);
   NAPI_EXPORT_FUNCTION(batch_write_sync);
@@ -5744,5 +5932,6 @@ NAPI_INIT() {
   NAPI_EXPORT_FUNCTION(test_method_exception);
   NAPI_EXPORT_FUNCTION(test_complete_exception);
   NAPI_EXPORT_FUNCTION(test_fail_batch_iterator_once);
+  NAPI_EXPORT_FUNCTION(test_fail_batch_append_many_once);
 #endif
 }

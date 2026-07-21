@@ -39,6 +39,7 @@ export type RocksSlice = RocksFormat
 export type RocksSlicePart = Buffer | SliceLike
 export type RocksSliceParts = readonly RocksSlicePart[]
 export type RocksBatchSlice = RocksSlicePart | RocksSliceParts
+export type RocksBatchAppendManyEntries = readonly (RocksSlice | null)[]
 export type RocksNativeEncoding = 'buffer' | 'view' | 'utf8' | 'utf-8'
 export type RocksNativeValue = string | Buffer
 export type RocksDecoded<E extends RocksNativeEncoding> = E extends 'utf8' | 'utf-8'
@@ -818,6 +819,13 @@ export interface RocksChainedBatch<TDatabase, KDefault, VDefault> extends Abstra
   _putLogData(blob: RocksSlice): void
   /** Append an encoded delete to an idle, open batch; native code copies the key. */
   _del(key: RocksSlice, options?: RocksColumnOperationOptions): void
+  /**
+   * Append alternating encoded key/value pairs to an idle, open batch in exact
+   * order. A null value deletes its preceding key. The shared column option is
+   * resolved once, every input is copied before return, and any failure leaves
+   * the batch unchanged.
+   */
+  _appendMany(entries: RocksBatchAppendManyEntries, options?: RocksColumnOperationOptions): void
   /** Append an encoded merge to an idle, open batch; native code copies both inputs. */
   _merge(key: RocksSlice, value: RocksSlice, options?: RocksColumnOperationOptions): void
   /**
