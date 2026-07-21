@@ -3687,10 +3687,10 @@ struct GetManyInputKeys {
 
 static napi_status GetGetManyInputKeys(napi_env env,
                                        napi_value input,
-                                       const bool unsafe,
+                                       const bool borrow,
                                        const bool retainBorrowed,
                                        GetManyInputKeys& result) {
-  if (!unsafe) return GetOwnedGetManyKeys(env, input, result.owned);
+  if (!borrow) return GetOwnedGetManyKeys(env, input, result.owned);
 
   napi_value backings = nullptr;
   bool isArray = false;
@@ -3768,10 +3768,12 @@ static napi_value db_get_many_sync_impl(napi_env env, napi_callback_info info, c
   uint32_t unsafe = 0;
   NAPI_STATUS_THROWS(GetGetManyUnsafe(env, argv[2], unsafe));
 
-  const auto unsafeInput = HasGetManyUnsafe(unsafe, GetManyUnsafe::Input);
   const auto unsafeOutput = HasGetManyUnsafe(unsafe, GetManyUnsafe::Output);
   GetManyInputKeys inputKeys;
-  NAPI_STATUS_THROWS(GetGetManyInputKeys(env, argv[1], unsafeInput, false, inputKeys));
+  // JavaScript cannot run after synchronous admission, so byte-backed keys can
+  // always be borrowed for the duration of MultiGet. Immutable strings still
+  // become native-owned copies during conversion.
+  NAPI_STATUS_THROWS(GetGetManyInputKeys(env, argv[1], true, false, inputKeys));
   const auto keys = inputKeys.slices();
   const auto count = static_cast<uint32_t>(keys.size());
   std::vector<rocksdb::Status> statuses;

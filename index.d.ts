@@ -352,11 +352,11 @@ export interface RocksRawGetManyOptions<
   Packed extends RocksPackedReadMode = RocksDefaultPackedMode<E>,
 > extends Omit<RocksReadOptions, 'unsafe'> {
   /**
-   * Bit flags controlling getMany copies. INPUT (1) permits native code to
-   * borrow encoded key storage; OUTPUT (2) permits returned byte storage to be
-   * transferred by reference. Combine both with bitwise OR. Omitted means that
-   * both inputs and outputs are copied. For backwards compatibility, `true`
-   * means OUTPUT and `false` means no flags.
+   * Bit flags controlling getMany copies. INPUT (1) permits async native code
+   * to borrow encoded key storage; sync reads always borrow byte-backed keys.
+   * OUTPUT (2) permits returned byte storage to be transferred by reference.
+   * Combine both with bitwise OR. For backwards compatibility, `true` means
+   * OUTPUT and `false` means no flags.
    */
   unsafe?: boolean | RocksGetManyUnsafe
   valueEncoding?: [Packed] extends [false] ? E : E & ('buffer' | RocksJavaScriptEncoding)

@@ -813,6 +813,7 @@ test('getMany unsafe uses INPUT and OUTPUT bit flags', async function (t) {
   const db = testCommon.factory({ keyEncoding: 'buffer', valueEncoding: 'buffer' })
   await db.open()
   await db.put(Buffer.from('key'), Buffer.from('value'))
+  await db.put(Buffer.from('jey'), Buffer.from('borrowed'))
 
   t.equal(RocksGetManyUnsafe.INPUT, 1, 'exports the INPUT flag')
   t.equal(RocksGetManyUnsafe.OUTPUT, 2, 'exports the OUTPUT flag')
@@ -831,11 +832,26 @@ test('getMany unsafe uses INPUT and OUTPUT bit flags', async function (t) {
   t.equal(
     db._getManySync(['key'], {
       valueEncoding: 'buffer',
-      packed: false,
-      unsafe: RocksGetManyUnsafe.INPUT
+      packed: false
     })[0].toString(),
     'value',
-    'sync INPUT keeps accepting immutable string keys'
+    'sync getMany keeps accepting immutable string keys'
+  )
+  const borrowedSyncKey = Buffer.from('key')
+  const borrowedSyncKeys = [borrowedSyncKey, Buffer.from('key')]
+  Object.defineProperty(borrowedSyncKeys, 1, {
+    get () {
+      borrowedSyncKey[0] = 0x6a
+      return Buffer.from('key')
+    }
+  })
+  t.equal(
+    db._getManySync(borrowedSyncKeys, {
+      valueEncoding: 'buffer',
+      packed: false
+    })[0].toString(),
+    'borrowed',
+    'sync getMany always borrows byte-backed inputs'
   )
 
   t.throws(
