@@ -368,9 +368,10 @@ export interface RocksRawGetManyOptions<
    *   holds every value's bytes back-to-back, addressed by `offsets`/`statuses`.
    *   Cheaper for many small values, but only valid for `buffer`, `slice` or
    *   `utf8` output.
-   * - `'auto'` — let the addon choose per call. Buffer results are
-   *   distinguishable by shape; callbacks also report the choice, and
-   *   `exposePacked: true` adds the result discriminator.
+   * - `'auto'` — let the addon choose per call. By default, native packed
+   *   buffer results are unpacked to the ordinary value array; callbacks still
+   *   report the native choice. Set `exposePacked: true` to preserve the
+   *   selected native representation and attach its discriminator.
    *
    * Defaults to `'auto'` for `buffer`/`slice` output and `false` otherwise.
    */
@@ -394,11 +395,12 @@ export interface RocksRawGetManyOptions<
    */
   allowPartial?: boolean
   /**
-   * Whether to attach the packed-mode discriminator to the returned value.
-   * Defaults to `false`. Set `true` to attach a `packed` property. Without the
-   * property, buffer results remain distinguishable by shape: unpacked values
-   * are an array and packed values are a {@link RocksUnexposedPackedGetManyResult}.
-   * JavaScript encodings (`slice`, `utf8` and `utf-8`) always return an array.
+   * Whether to expose the native representation selected by `'auto'` and attach
+   * the packed-mode discriminator. Defaults to `false`, which converts an
+   * auto-packed buffer arena to the ordinary value array. Explicit
+   * `packed: true` still returns a {@link RocksUnexposedPackedGetManyResult}; enabling
+   * this option adds its `packed` property. JavaScript encodings (`slice`,
+   * `utf8` and `utf-8`) always return an array.
    */
   exposePacked?: boolean
 }
@@ -575,9 +577,7 @@ export type RocksUnexposedGetManyReadResult<
   ? RocksRawGetManyValues<E, AllowPartial>
   : Packed extends true
     ? RocksUnexposedPackedGetManyResult
-    : Packed extends 'auto'
-      ? RocksUnexposedPackedGetManyResult | RocksRawGetManyValues<E, AllowPartial>
-      : RocksRawGetManyValues<E, AllowPartial>
+    : RocksRawGetManyValues<E, AllowPartial>
 
 // The raw getMany entry points read their settlement controls (packed,
 // allowPartial, exposePacked) from the options object, so the returned type is

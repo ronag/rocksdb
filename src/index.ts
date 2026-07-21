@@ -268,8 +268,8 @@ function prepareRawGetManyOptions(options, packed?) {
 // object rather than as positional arguments. allowPartial stays undefined when
 // unset so the shared core can still infer it from bounded-read options (a
 // positive timeout or any highWaterMarkBytes). exposePacked defaults to false;
-// callers that need the discriminator can opt in without changing the native
-// representation selected for the read.
+// callers that need the native representation selected by auto mode and its
+// discriminator can opt in explicitly.
 function readRawGetManyControls(options) {
   if ((typeof options === 'object' && options !== null) || typeof options === 'function') {
     return { allowPartial: options.allowPartial, exposePacked: options.exposePacked ?? false }
@@ -277,17 +277,21 @@ function readRawGetManyControls(options) {
   return { allowPartial: undefined, exposePacked: false }
 }
 
-function convertRawGetManyResult(result, valueEncoding) {
-  if (!isJavaScriptEncoding(valueEncoding)) return result
-
+function convertRawGetManyResult(result, valueEncoding, unpackPacked = false) {
   const convert = (buffer, byteOffset = 0, byteLength = buffer.byteLength - byteOffset) =>
     valueEncoding === 'slice'
       ? new Slice(buffer, byteOffset, byteLength)
-      : buffer.toString('utf8', byteOffset, byteOffset + byteLength)
+      : isUtf8Encoding(valueEncoding)
+        ? buffer.toString('utf8', byteOffset, byteOffset + byteLength)
+        : buffer.subarray(byteOffset, byteOffset + byteLength)
 
   if (Array.isArray(result)) {
     if (valueEncoding !== 'slice') return result
     return result.map((value) => (Buffer.isBuffer(value) ? convert(value) : value))
+  }
+
+  if (!isJavaScriptEncoding(valueEncoding) && !(unpackPacked && valueEncoding === 'buffer')) {
+    return result
   }
 
   return Array.from(result.statuses, (status, index) => {
@@ -568,7 +572,11 @@ class RocksLevel extends AbstractLevel<any, any, any> {
             }
           }
 
-          val = convertRawGetManyResult(val, prepared.valueEncoding)
+          val = convertRawGetManyResult(
+            val,
+            prepared.valueEncoding,
+            packed === 'auto' && !exposePacked
+          )
 
           if (indexes.length === 0) {
             if (exposePacked) setPackedResult(val, packedResult)
@@ -669,7 +677,11 @@ class RocksLevel extends AbstractLevel<any, any, any> {
       }
     }
 
-    const result = convertRawGetManyResult(nativeResult, prepared.valueEncoding)
+    const result = convertRawGetManyResult(
+      nativeResult,
+      prepared.valueEncoding,
+      packed === 'auto' && !exposePacked
+    )
 
     if (incomplete && !allowPartial) {
       const message =

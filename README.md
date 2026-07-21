@@ -133,15 +133,17 @@ KiB and the unpacked representation for larger values. `getMany` selects based
 on the average size of the values it found. Iterators select based on the first
 row in the batch, avoiding a second pass or a whole-batch copy.
 
-Raw `getMany` results omit the `packed` discriminator by default. Set
-`exposePacked: true` to attach it. Buffer results remain distinguishable without
-the property because unpacked results are arrays and packed results are arena
-objects. `slice`-, `utf8`- and `utf-8`-encoded results are always arrays. Raw
-iterator results continue to expose the discriminator. Async callbacks receive
-the selected native mode as their third argument regardless of `exposePacked`:
+Raw `getMany` calls using `packed: 'auto'` return an ordinary value array by
+default, unpacking a selected native arena into buffer views when necessary.
+Set `exposePacked: true` to preserve the selected native representation and add
+its `packed` discriminator. Explicit `packed: true` always returns an arena;
+`exposePacked` only controls its discriminator. `slice`-, `utf8`- and
+`utf-8`-encoded results are always arrays. Raw iterator results continue to
+expose the discriminator. Async callbacks receive the selected native mode as
+their third argument regardless of `exposePacked`:
 
 ```js
-db._getManyAsync(keys, { valueEncoding: 'buffer' }, (err, result, packed) => {
+db._getManyAsync(keys, { valueEncoding: 'buffer', exposePacked: true }, (err, result, packed) => {
   if (err) throw err
   if (packed) consumePacked(result)
   else consumeValues(result)

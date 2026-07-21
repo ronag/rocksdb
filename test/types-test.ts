@@ -239,13 +239,9 @@ expectType<Promise<RocksUnexposedPackedGetManyResult>>(db._getManyAsync([slice],
 expectType<RocksUnexposedGetManyReadResult<'buffer', boolean, false>>(
   db._getManySync([slice], { packed: booleanFlag })
 )
-expectType<RocksUnexposedGetManyReadResult<'buffer', 'auto', false>>(
-  db._getManySync([slice], { packed: 'auto' })
-)
+expectType<RocksRawGetManyValues<'buffer', false>>(db._getManySync([slice], { packed: 'auto' }))
 const autoRawValues = db._getManyAsync([slice], { packed: 'auto' })
-expectTrue<
-  Equal<Awaited<typeof autoRawValues>, RocksUnexposedGetManyReadResult<'buffer', 'auto', false>>
->()
+expectTrue<Equal<Awaited<typeof autoRawValues>, RocksRawGetManyValues<'buffer', false>>>()
 const unexposedSliceValues = db._getManyAsync([slice], {
   packed: 'auto',
   valueEncoding: 'slice',
@@ -257,11 +253,8 @@ unexposedSliceValues.then((values) => {
 })
 db._getManyAsync([slice], { packed: 'auto' }, (err, result, packed) => {
   expectType<Error | null | undefined>(err)
-  expectTrue<
-    Equal<typeof result, RocksUnexposedGetManyReadResult<'buffer', 'auto', false> | undefined>
-  >()
+  expectTrue<Equal<typeof result, RocksRawGetManyValues<'buffer', false> | undefined>>()
   expectTrue<Equal<typeof packed, boolean | undefined>>()
-  if (result && !Array.isArray(result)) expectType<RocksUnexposedPackedGetManyResult>(result)
 })
 db._getManyAsync([slice], { packed: false, valueEncoding: 'utf8' }, (err, result, packed) => {
   expectType<Error | null | undefined>(err)
@@ -359,7 +352,7 @@ expectType<RocksRawGetManyResult<'buffer', false, false>>(
 expectType<RocksRawGetManyValues<'utf8', false>>(
   db._getManySync([slice], { valueEncoding: 'utf8' })
 )
-expectType<RocksUnexposedGetManyReadResult<'buffer', 'auto', false>>(
+expectType<RocksRawGetManyValues<'buffer', false>>(
   db._getManySync([slice], { valueEncoding: 'buffer', exposePacked: false })
 )
 // @ts-expect-error Packed getMany does not support view output
