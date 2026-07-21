@@ -3598,36 +3598,6 @@ static napi_status GetPackedGetManyInput(napi_env env,
   return napi_ok;
 }
 
-static napi_status GetBorrowedGetManyKeys(napi_env env,
-                                          napi_value input,
-                                          std::vector<rocksdb::Slice>& result) {
-  bool isArray = false;
-  NAPI_STATUS_RETURN(napi_is_array(env, input, &isArray));
-  if (isArray) {
-    uint32_t count = 0;
-    NAPI_STATUS_RETURN(napi_get_array_length(env, input, &count));
-    result.resize(count);
-    for (uint32_t index = 0; index < count; ++index) {
-      napi_value key;
-      NAPI_STATUS_RETURN(napi_get_element(env, input, index, &key));
-      NAPI_STATUS_RETURN(GetValue(env, key, result[index]));
-    }
-    return napi_ok;
-  }
-
-  PackedGetManyInput packed;
-  NAPI_STATUS_RETURN(GetPackedGetManyInput(env, input, packed));
-  result.resize(packed.size());
-  const auto* data = packed.data == nullptr ? "" : packed.data;
-  for (size_t index = 0; index < packed.size(); ++index) {
-    const auto layoutIndex = index * 2;
-    const auto offset = packed.offsets[layoutIndex];
-    const auto length = packed.offsets[layoutIndex + 1];
-    result[index] = rocksdb::Slice(data + offset, length);
-  }
-  return napi_ok;
-}
-
 struct OwnedGetManyKeys {
   std::vector<std::string> array;
   std::string packedData;
@@ -3695,7 +3665,7 @@ static napi_status GetOwnedGetManyKeys(napi_env env, napi_value input, OwnedGetM
   return napi_ok;
 }
 
-struct AsyncGetManyKeys {
+struct GetManyInputKeys {
   OwnedGetManyKeys owned;
   std::vector<rocksdb::Slice> borrowed;
   std::vector<bool> isBorrowed;
@@ -3715,10 +3685,11 @@ struct AsyncGetManyKeys {
   }
 };
 
-static napi_status GetAsyncGetManyKeys(napi_env env,
+static napi_status GetGetManyInputKeys(napi_env env,
                                        napi_value input,
                                        const bool unsafe,
-                                       AsyncGetManyKeys& result) {
+                                       const bool retainBorrowed,
+                                       GetManyInputKeys& result) {
   if (!unsafe) return GetOwnedGetManyKeys(env, input, result.owned);
 
   napi_value backings = nullptr;
@@ -3743,16 +3714,20 @@ static napi_status GetAsyncGetManyKeys(napi_env env,
       }
 
       napi_value backing;
-      NAPI_STATUS_RETURN(GetString(env, key, result.borrowed[index], &backing));
-      if (!backings) {
-        NAPI_STATUS_RETURN(napi_create_array_with_length(env, count, &backings));
+      NAPI_STATUS_RETURN(
+          GetString(env, key, result.borrowed[index], retainBorrowed ? &backing : nullptr));
+      if (retainBorrowed) {
+        if (!backings) {
+          NAPI_STATUS_RETURN(napi_create_array_with_length(env, count, &backings));
+        }
+        NAPI_STATUS_RETURN(napi_set_element(env, backings, index, backing));
       }
-      NAPI_STATUS_RETURN(napi_set_element(env, backings, index, backing));
       result.isBorrowed[index] = true;
     }
   } else {
     PackedGetManyInput packed;
-    NAPI_STATUS_RETURN(GetPackedGetManyInput(env, input, packed, &backings));
+    NAPI_STATUS_RETURN(
+        GetPackedGetManyInput(env, input, packed, retainBorrowed ? &backings : nullptr));
     result.borrowed.resize(packed.size());
     result.isBorrowed.resize(packed.size(), true);
     const auto* data = packed.data == nullptr ? "" : packed.data;
@@ -3763,7 +3738,7 @@ static napi_status GetAsyncGetManyKeys(napi_env env,
     }
   }
 
-  if (backings) {
+  if (retainBorrowed && backings) {
     result.reference = std::make_shared<Reference>();
     NAPI_STATUS_RETURN(Reference::Create(env, backings, *result.reference));
   }
@@ -3795,14 +3770,9 @@ static napi_value db_get_many_sync_impl(napi_env env, napi_callback_info info, c
 
   const auto unsafeInput = HasGetManyUnsafe(unsafe, GetManyUnsafe::Input);
   const auto unsafeOutput = HasGetManyUnsafe(unsafe, GetManyUnsafe::Output);
-  OwnedGetManyKeys ownedKeys;
-  std::vector<rocksdb::Slice> keys;
-  if (unsafeInput) {
-    NAPI_STATUS_THROWS(GetBorrowedGetManyKeys(env, argv[1], keys));
-  } else {
-    NAPI_STATUS_THROWS(GetOwnedGetManyKeys(env, argv[1], ownedKeys));
-    keys = ownedKeys.slices();
-  }
+  GetManyInputKeys inputKeys;
+  NAPI_STATUS_THROWS(GetGetManyInputKeys(env, argv[1], unsafeInput, false, inputKeys));
+  const auto keys = inputKeys.slices();
   const auto count = static_cast<uint32_t>(keys.size());
   std::vector<rocksdb::Status> statuses;
   statuses.resize(count);
@@ -3906,8 +3876,8 @@ static napi_value db_get_many_impl(napi_env env, napi_callback_info info, const 
   // Safe async work snapshots keys on the JS thread. INPUT permits borrowing
   // exact Buffer/SliceLike backings instead; retain those backings until the
   // worker completes even if the caller replaces or releases its containers.
-  AsyncGetManyKeys inputKeys;
-  NAPI_STATUS_THROWS(GetAsyncGetManyKeys(env, argv[1], unsafeInput, inputKeys));
+  GetManyInputKeys inputKeys;
+  NAPI_STATUS_THROWS(GetGetManyInputKeys(env, argv[1], unsafeInput, true, inputKeys));
   const auto count = static_cast<uint32_t>(inputKeys.size());
 
   rocksdb::ReadOptions readOptions;

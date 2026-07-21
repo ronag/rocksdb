@@ -828,6 +828,15 @@ test('getMany unsafe uses INPUT and OUTPUT bit flags', async function (t) {
     'value',
     'public getMany accepts combined flags'
   )
+  t.equal(
+    db._getManySync(['key'], {
+      valueEncoding: 'buffer',
+      packed: false,
+      unsafe: RocksGetManyUnsafe.INPUT
+    })[0].toString(),
+    'value',
+    'sync INPUT keeps accepting immutable string keys'
+  )
 
   t.throws(
     () => db._getManySync([Buffer.from('key')], { packed: true, unsafe: 4 }),
