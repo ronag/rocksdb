@@ -46,14 +46,13 @@ the GCC/Clang Zen 3 target name `znver3` and can be overridden:
 then clears the variable so the Darwin arm64 build remains portable.
 
 To keep repeated releases fast, the Docker build routes every compiler
-invocation through `ccache` (on a BuildKit cache mount) and persists that cache
-to `/tmp/rocks-level-ccache` on the host: `build.sh` seeds the mount from that
-directory before building and exports the updated cache back to it afterward.
-The cache therefore survives image rebuilds and `docker builder prune`, and —
-because seeding and exporting happen on the client side — it stays on the local
-host even when `DOCKER_HOST` points at a remote builder. Exporting is
-best-effort and never fails a release. Override the location with
-`ROCKS_LEVEL_CCACHE_DIR`.
+invocation through `ccache` on a BuildKit cache mount. `build.sh` uploads the
+gitignored project-local `.cache/ccache` directory to the active builder before
+building, then downloads the updated cache into that directory afterward. The
+cache therefore survives image rebuilds and `docker builder prune`, remains on
+the local machine when `DOCKER_HOST` points at a remote builder, and can seed
+any other builder used from the same checkout. Downloading is best-effort and
+never fails a release. Override the location with `ROCKS_LEVEL_CCACHE_DIR`.
 
 The base image digest, RocksDB submodule and native dependency commits are
 pinned, and the resulting ABI and CPU baseline are checked. This is not a

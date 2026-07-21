@@ -76,6 +76,11 @@ for argument in "$@"; do target=$argument; done
 if [ "\${FAKE_RM_TARGET_FAIL:-}" = "1" ] && [ "$target" = "prebuilds/linux-x64" ]; then
   exit 42
 fi
+if [ "\${FAKE_RM_CACHE_FAIL:-}" = "1" ]; then
+  case "$target" in
+    */.ccache-download.*) exit 42 ;;
+  esac
+fi
 exec /bin/rm "$@"
 `)
   executable(path.join(bin, 'docker'), `#!/bin/bash
@@ -98,12 +103,35 @@ while [ "$#" -gt 0 ]; do
   esac
   shift
 done
-test "$target" = artifact
 case "$output" in
   type=local,dest=*) destination=\${output#type=local,dest=} ;;
   *) exit 64 ;;
 esac
 test -d "$destination"
+
+case "$target" in
+  ccache-artifact)
+    case "\${FAKE_DOCKER_CACHE_MODE:-success}" in
+      fail)
+        exit 42
+        ;;
+      term-after-output)
+        printf 'compiler cache\n' > "$destination/cache-entry"
+        kill -TERM "$PPID"
+        exit 143
+        ;;
+      *)
+        printf 'compiler cache\n' > "$destination/cache-entry"
+        exit 0
+        ;;
+    esac
+    ;;
+  artifact)
+    ;;
+  *)
+    exit 64
+    ;;
+esac
 
 case "\${FAKE_DOCKER_BUILD_MODE:-success}" in
   fail-before-output)
@@ -183,6 +211,152 @@ test('build script exports and atomically installs only the Linux artifact', fun
     t.equal(fs.statSync(context.linux).mode & 0o777, 0o755, 'installed platform is traversable')
     t.equal(fs.readFileSync(path.join(context.darwin, addon), 'utf8'), 'darwin', 'Darwin is untouched')
     assertNoTemporaryPlatforms(t, context)
+  } finally {
+    fs.rmSync(context.root, { recursive: true, force: true })
+  }
+
+  t.end()
+})
+
+test('build script transfers the compiler cache through the project-local directory', function (t) {
+  const context = fixture()
+  const cache = path.join(context.root, '.cache', 'ccache')
+
+  try {
+    fs.mkdirSync(cache, { recursive: true })
+    fs.writeFileSync(path.join(cache, 'seed-entry'), 'seed\n')
+
+    const { log, result } = runBuild(context)
+    const commands = log.trim().split('\n')
+
+    t.equal(result.status, 0, result.stderr || 'build script succeeds')
+    t.equal(commands.length, 2, 'Docker builds the artifact and cache download stages')
+    t.ok(
+      commands.every((command) => command.includes('--build-context ccache=.cache/ccache')),
+      'both stages upload the project-local cache to the active builder'
+    )
+    t.match(
+      commands[1],
+      /--target ccache-artifact .*--output type=local,dest=\.cache\/\.ccache-download\./,
+      'the updated cache is downloaded into a project-local staging directory'
+    )
+    t.equal(
+      fs.readFileSync(path.join(cache, 'seed-entry'), 'utf8'),
+      'seed\n',
+      'prior cache entries remain'
+    )
+    t.equal(
+      fs.readFileSync(path.join(cache, 'cache-entry'), 'utf8'),
+      'compiler cache\n',
+      'the downloaded cache is installed locally'
+    )
+    t.notOk(
+      fs
+        .readdirSync(path.join(context.root, '.cache'))
+        .some((entry) => entry.startsWith('.ccache-download.')),
+      'the temporary cache download is removed'
+    )
+  } finally {
+    fs.rmSync(context.root, { recursive: true, force: true })
+  }
+
+  t.end()
+})
+
+test('build script stages downloads alongside an overridden compiler cache', function (t) {
+  const context = fixture()
+  const cacheRoot = fs.mkdtempSync(path.join(os.tmpdir(), 'rocks-level-ccache-override-'))
+  const cache = path.join(cacheRoot, 'ccache')
+
+  try {
+    const { log, result } = runBuild(context, { ROCKS_LEVEL_CCACHE_DIR: cache })
+    const commands = log.trim().split('\n')
+
+    t.equal(result.status, 0, result.stderr || 'build script succeeds')
+    t.ok(
+      commands.every((command) => command.includes(`--build-context ccache=${cache}`)),
+      'both stages upload the overridden cache directory'
+    )
+    t.ok(
+      commands[1].includes(`--output type=local,dest=${cacheRoot}/.ccache-download.`),
+      'the cache download is staged alongside the overridden directory'
+    )
+    t.equal(
+      fs.readFileSync(path.join(cache, 'cache-entry'), 'utf8'),
+      'compiler cache\n',
+      'the downloaded cache is installed in the overridden directory'
+    )
+    t.notOk(fs.existsSync(path.join(context.root, '.cache')), 'the project-local cache is not used')
+    t.notOk(
+      fs.readdirSync(cacheRoot).some((entry) => entry.startsWith('.ccache-download.')),
+      'the temporary cache download is removed'
+    )
+  } finally {
+    fs.rmSync(context.root, { recursive: true, force: true })
+    fs.rmSync(cacheRoot, { recursive: true, force: true })
+  }
+
+  t.end()
+})
+
+test('compiler cache download failure does not fail an installed prebuild', function (t) {
+  const context = fixture()
+  const cache = path.join(context.root, '.cache', 'ccache')
+
+  try {
+    fs.mkdirSync(cache, { recursive: true })
+    fs.writeFileSync(path.join(cache, 'seed-entry'), 'seed\n')
+
+    const { result } = runBuild(context, { FAKE_DOCKER_CACHE_MODE: 'fail' })
+
+    t.equal(result.status, 0, 'the completed prebuild remains successful')
+    t.equal(fs.readFileSync(path.join(context.linux, addon), 'utf8'), 'candidate\n')
+    t.equal(fs.readFileSync(path.join(cache, 'seed-entry'), 'utf8'), 'seed\n', 'the prior cache remains')
+    t.notOk(fs.existsSync(path.join(cache, 'cache-entry')), 'no partial cache entry is installed')
+    t.match(result.stderr, /could not download compiler cache/)
+    t.notOk(
+      fs
+        .readdirSync(path.join(context.root, '.cache'))
+        .some((entry) => entry.startsWith('.ccache-download.')),
+      'the failed cache download is removed'
+    )
+  } finally {
+    fs.rmSync(context.root, { recursive: true, force: true })
+  }
+
+  t.end()
+})
+
+test('compiler cache cleanup failure does not fail an installed prebuild', function (t) {
+  const context = fixture()
+
+  try {
+    const { result } = runBuild(context, { FAKE_RM_CACHE_FAIL: '1' })
+
+    t.equal(result.status, 0, 'the completed prebuild remains successful')
+    t.match(result.stderr, /could not remove compiler cache download directory/)
+    t.ok(
+      fs.readdirSync(path.join(context.root, '.cache')).some((entry) => entry.startsWith('.ccache-download.')),
+      'the failed cleanup leaves an identifiable download directory'
+    )
+  } finally {
+    fs.rmSync(context.root, { recursive: true, force: true })
+  }
+
+  t.end()
+})
+
+test('compiler cache download is removed when the build is interrupted', function (t) {
+  const context = fixture()
+
+  try {
+    const { result } = runBuild(context, { FAKE_DOCKER_CACHE_MODE: 'term-after-output' })
+
+    t.notEqual(result.status, 0, 'the interrupted build does not report success')
+    t.notOk(
+      fs.readdirSync(path.join(context.root, '.cache')).some((entry) => entry.startsWith('.ccache-download.')),
+      'the interrupted cache download is removed'
+    )
   } finally {
     fs.rmSync(context.root, { recursive: true, force: true })
   }
