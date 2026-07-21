@@ -178,7 +178,10 @@ static napi_status GetIntegerValue(napi_env env, napi_value value, T& result) {
   return napi_ok;
 }
 
-static napi_status GetString(napi_env env, napi_value from, rocksdb::Slice& to) {
+static napi_status GetString(napi_env env,
+                             napi_value from,
+                             rocksdb::Slice& to,
+                             napi_value* backing = nullptr) {
   bool isBuffer;
   NAPI_STATUS_RETURN(napi_is_buffer(env, from, &isBuffer));
 
@@ -187,6 +190,7 @@ static napi_status GetString(napi_env env, napi_value from, rocksdb::Slice& to) 
     size_t length = 0;
     NAPI_STATUS_RETURN(napi_get_buffer_info(env, from, reinterpret_cast<void**>(&buf), &length));
     to = {buf, length};
+    if (backing) *backing = from;
     return napi_ok;
   }
 
@@ -222,6 +226,7 @@ static napi_status GetString(napi_env env, napi_value from, rocksdb::Slice& to) 
     }
 
     to = {buf + pos, static_cast<size_t>(len)};
+    if (backing) *backing = value;
 
     return napi_ok;
   }

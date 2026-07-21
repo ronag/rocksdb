@@ -1,12 +1,13 @@
 'use strict'
 
-// Coverage for the zero-copy `unsafe: true` read path (util.h Convert ->
+// Coverage for the zero-copy `unsafe: OUTPUT` read path (util.h Convert ->
 // napi_create_external_buffer backed by a heap PinnableSlice freed by a
 // finalizer). It must return correct bytes and survive the backing slices being
 // retained past the next read / GC.
 
 const test = require('tape')
 const testCommon = require('./common')
+const { RocksGetManyUnsafe } = require('..')
 
 test('unsafe getMany returns correct values', async function (t) {
   const db = testCommon.factory({ keyEncoding: 'buffer', valueEncoding: 'buffer' })
@@ -28,9 +29,12 @@ test('unsafe getMany returns correct values', async function (t) {
   const unsafe = db._getManySync(keys, {
     valueEncoding: 'buffer',
     packed: false,
-    unsafe: true
+    unsafe: RocksGetManyUnsafe.OUTPUT
   })
-  const asyncUnsafe = await db._getMany(keys, { valueEncoding: 'buffer', unsafe: true })
+  const asyncUnsafe = await db._getMany(keys, {
+    valueEncoding: 'buffer',
+    unsafe: RocksGetManyUnsafe.OUTPUT
+  })
 
   t.equal(unsafe.length, n, 'returns all values')
   let ok = true
@@ -45,10 +49,14 @@ test('unsafe getMany returns correct values', async function (t) {
   const retained = db._getManySync(keys, {
     valueEncoding: 'buffer',
     packed: false,
-    unsafe: true
+    unsafe: RocksGetManyUnsafe.OUTPUT
   })
   for (let r = 0; r < 50; r++) {
-    db._getManySync(keys, { valueEncoding: 'buffer', packed: false, unsafe: true })
+    db._getManySync(keys, {
+      valueEncoding: 'buffer',
+      packed: false,
+      unsafe: RocksGetManyUnsafe.OUTPUT
+    })
   }
   if (global.gc) global.gc()
   let stillValid = true
@@ -119,7 +127,10 @@ test('packed getMany arena survives database close and forced GC', async functio
   const expected = Buffer.alloc(128 * 1024, 0x6b)
   await db.put(Buffer.from('packed-get-many'), expected)
 
-  const result = await db._getManyAsync([Buffer.from('packed-get-many')], { packed: true })
+  const result = await db._getManyAsync([Buffer.from('packed-get-many')], {
+    packed: true,
+    unsafe: RocksGetManyUnsafe.OUTPUT
+  })
   await db.close()
 
   if (global.gc) {
@@ -167,7 +178,7 @@ test('unsafe with empty values', async function (t) {
   const [val] = db._getManySync([Buffer.from('empty')], {
     valueEncoding: 'buffer',
     packed: false,
-    unsafe: true
+    unsafe: RocksGetManyUnsafe.OUTPUT
   })
   t.ok(Buffer.isBuffer(val), 'empty value returns a buffer')
   t.equal(val.length, 0, 'empty value has length 0')
@@ -200,7 +211,7 @@ test('unsafe cache-backed buffers can be collected after db close', async functi
   let value = db._getManySync([Buffer.from('cached')], {
     valueEncoding: 'buffer',
     packed: false,
-    unsafe: true,
+    unsafe: RocksGetManyUnsafe.OUTPUT,
     fillCache: true
   })[0]
   t.ok(value.equals(expected), 'read the expected cache-backed value')
