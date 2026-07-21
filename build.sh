@@ -147,7 +147,7 @@ trap - EXIT INT TERM
 # is a pure optimization for the next release, so it must never fail a release
 # whose artifact is already built, validated, and installed above.
 echo "Downloading compiler cache to $CCACHE_LOCAL_DIR..."
-CCACHE_DOWNLOAD_DIR=$(mktemp -d ".cache/.ccache-download.XXXXXX") || CCACHE_DOWNLOAD_DIR=
+CCACHE_DOWNLOAD_DIR=$(mktemp -d "$(dirname "$CCACHE_LOCAL_DIR")/.ccache-download.XXXXXX") || CCACHE_DOWNLOAD_DIR=
 if [ -n "$CCACHE_DOWNLOAD_DIR" ]; then
   if DOCKER_BUILDKIT=1 docker build \
     --platform "$PLATFORM" \

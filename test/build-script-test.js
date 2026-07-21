@@ -220,7 +220,7 @@ test('build script transfers the compiler cache through the project-local direct
     const commands = log.trim().split('\n')
 
     t.equal(result.status, 0, result.stderr || 'build script succeeds')
-    t.equal(commands.length, 2, 'Docker builds the artifact and cache export stages')
+    t.equal(commands.length, 2, 'Docker builds the artifact and cache download stages')
     t.ok(
       commands.every((command) => command.includes('--build-context ccache=.cache/ccache')),
       'both stages upload the project-local cache to the active builder'
@@ -248,6 +248,42 @@ test('build script transfers the compiler cache through the project-local direct
     )
   } finally {
     fs.rmSync(context.root, { recursive: true, force: true })
+  }
+
+  t.end()
+})
+
+test('build script stages downloads alongside an overridden compiler cache', function (t) {
+  const context = fixture()
+  const cacheRoot = fs.mkdtempSync(path.join(os.tmpdir(), 'rocks-level-ccache-override-'))
+  const cache = path.join(cacheRoot, 'ccache')
+
+  try {
+    const { log, result } = runBuild(context, { ROCKS_LEVEL_CCACHE_DIR: cache })
+    const commands = log.trim().split('\n')
+
+    t.equal(result.status, 0, result.stderr || 'build script succeeds')
+    t.ok(
+      commands.every((command) => command.includes(`--build-context ccache=${cache}`)),
+      'both stages upload the overridden cache directory'
+    )
+    t.ok(
+      commands[1].includes(`--output type=local,dest=${cacheRoot}/.ccache-download.`),
+      'the cache download is staged alongside the overridden directory'
+    )
+    t.equal(
+      fs.readFileSync(path.join(cache, 'cache-entry'), 'utf8'),
+      'compiler cache\n',
+      'the downloaded cache is installed in the overridden directory'
+    )
+    t.notOk(fs.existsSync(path.join(context.root, '.cache')), 'the project-local cache is not used')
+    t.notOk(
+      fs.readdirSync(cacheRoot).some((entry) => entry.startsWith('.ccache-download.')),
+      'the temporary cache download is removed'
+    )
+  } finally {
+    fs.rmSync(context.root, { recursive: true, force: true })
+    fs.rmSync(cacheRoot, { recursive: true, force: true })
   }
 
   t.end()
