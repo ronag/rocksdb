@@ -1,7 +1,7 @@
 #!/bin/bash
 set -euo pipefail
 
-# The published prebuild targets portable x86-64 explicitly, so the build must
+# The published prebuild targets x86-64 (Zen 3 by default), so the build must
 # use linux/amd64 even on arm64 hosts (e.g. Apple Silicon under emulation).
 PLATFORM=linux/amd64
 TARGET_DIR=prebuilds/linux-x64
@@ -98,8 +98,8 @@ mkdir -p "$CCACHE_HOST_DIR"
 echo "Building and exporting prebuild..."
 # JOBS caps build parallelism for the memory-heavy rocksdb compile (default 8,
 # see Dockerfile). Lower it (e.g. JOBS=4 ./build.sh) on a memory-constrained
-# Docker host. ROCKS_LEVEL_MARCH is deliberately opt-in: the generic npm
-# prebuild must run on baseline x64.
+# Docker host. The Dockerfile defaults ROCKS_LEVEL_MARCH to znver3; an explicitly
+# set value overrides it, including an empty value for a portable x86-64 build.
 BUILD_ARGS=(
   --platform "$PLATFORM"
   --target artifact
@@ -109,7 +109,7 @@ BUILD_ARGS=(
 if [ -n "${JOBS:-}" ]; then
   BUILD_ARGS+=(--build-arg "JOBS=$JOBS")
 fi
-if [ -n "${ROCKS_LEVEL_MARCH:-}" ]; then
+if [ "${ROCKS_LEVEL_MARCH+x}" = x ]; then
   BUILD_ARGS+=(--build-arg "ROCKS_LEVEL_MARCH=$ROCKS_LEVEL_MARCH")
 fi
 DOCKER_BUILDKIT=1 docker build "${BUILD_ARGS[@]}" .

@@ -121,6 +121,7 @@ test('Linux prebuild base is pinned to the audited amd64 image manifest', functi
     /FROM scratch AS artifact\nCOPY --from=build \/rocks-level\/prebuilds\/linux-x64\/@nxtedition\+rocksdb\.node \/@nxtedition\+rocksdb\.node/,
     'the final stage exports exactly the validated addon'
   )
+  t.match(dockerfile, /^ARG ROCKS_LEVEL_MARCH=znver3$/m, 'Linux prebuilds default to Zen 3')
   t.end()
 })
 
@@ -294,24 +295,26 @@ test('release stages and atomically installs only its known Darwin platform dire
   t.end()
 })
 
-test('release clears private CPU tuning before every public build', function (t) {
+test('release uses Zen 3 for Linux and portable tuning for Darwin', function (t) {
   const script = fs.readFileSync(path.join(__dirname, '..', 'release.sh'), 'utf8')
-  const clearTuning = script.indexOf('export ROCKS_LEVEL_MARCH=')
-  const linuxBuild = script.indexOf('./build.sh', clearTuning)
-  const darwinDependencies = script.indexOf('npm run build-deps', linuxBuild)
+  const useLinuxDefault = script.indexOf('unset ROCKS_LEVEL_MARCH')
+  const linuxBuild = script.indexOf('./build.sh', useLinuxDefault)
+  const clearTuning = script.indexOf('export ROCKS_LEVEL_MARCH=', linuxBuild)
+  const darwinDependencies = script.indexOf('npm run build-deps', clearTuning)
   const darwinBuild = script.indexOf(
     'JOBS=16 ./scripts/build-darwin-prebuild.sh "$NODE_TARGET"',
     darwinDependencies
   )
 
-  t.ok(clearTuning >= 0, 'the release environment clears CPU tuning')
-  t.ok(linuxBuild > clearTuning, 'Linux builds after tuning is cleared')
-  t.ok(darwinDependencies > linuxBuild, 'Darwin dependencies inherit the cleared value')
+  t.ok(useLinuxDefault >= 0, 'the release ignores caller tuning for Linux')
+  t.ok(linuxBuild > useLinuxDefault, 'Linux uses the Dockerfile default')
+  t.ok(clearTuning > linuxBuild, 'CPU tuning is cleared after the Linux build')
+  t.ok(darwinDependencies > clearTuning, 'Darwin dependencies inherit the cleared value')
   t.ok(darwinBuild > darwinDependencies, 'Darwin prebuild uses the portable dependencies')
   t.equal(
     (script.match(/^\s*(?:export\s+)?ROCKS_LEVEL_MARCH=/gm) || []).length,
     1,
-    'there is one release-wide tuning assignment'
+    'there is one portable tuning assignment'
   )
   t.end()
 })

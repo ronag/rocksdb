@@ -56,10 +56,9 @@ fi
 # Generate both platforms' prebuilds up front, before any version bump or
 # publish, so a build failure aborts the release with nothing changed.
 
-# Never let private CPU tuning leak into either public artifact. Exporting the
-# empty value here also covers every dependency build below, including Darwin
-# when the release shell started with ROCKS_LEVEL_MARCH set.
-export ROCKS_LEVEL_MARCH=
+# Ignore caller-specific CPU tuning for the public Linux artifact. With no
+# override, build.sh uses the Dockerfile's audited Zen 3 default.
+unset ROCKS_LEVEL_MARCH
 
 # A caller may use ROCKS_LEVEL_DEPS_PREFIX for a one-off source build. Public
 # builds must instead use the dependencies created by their pinned build path:
@@ -73,7 +72,6 @@ unset ROCKS_LEVEL_DEPS_PREFIX
 unset GYP_DEFINES
 
 echo "Building linux prebuilds (docker)..."
-# build.sh still supports explicit tuned builds outside the release flow.
 ./build.sh
 
 echo "Building darwin-arm64 prebuilds (node $NODE_TARGET)..."
@@ -81,6 +79,7 @@ echo "Building darwin-arm64 prebuilds (node $NODE_TARGET)..."
 # deps/.prefix/darwin-arm64 first with portable tuning. Generate into a staging
 # directory and atomically install only the validated known platform, preserving
 # the previous artifact if generation or installation fails.
+export ROCKS_LEVEL_MARCH=
 npm run build-deps
 JOBS=16 ./scripts/build-darwin-prebuild.sh "$NODE_TARGET"
 

@@ -18,8 +18,8 @@
 // Linux and macOS only, matching the Dockerfile/BUILDING.md-documented build.
 // Portable by default (no CPU-specific `-march`), so the end-user from-source
 // path works on any machine. Set ROCKS_LEVEL_MARCH=<arch> (e.g. znver2) to
-// tune the deps for an explicit private build. Public Linux prebuilds leave it
-// unset so they remain portable across x64 CPUs.
+// tune the deps for an explicit build. The Docker prebuild flow supplies its
+// own znver3 default for the public Linux artifact.
 //
 // The prefix carries a .stamp.json recording the exact upstream commits and
 // tuning that built it; ensure() wipes and rebuilds a prefix whose stamp

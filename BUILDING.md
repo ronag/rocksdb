@@ -26,23 +26,24 @@ npm installs both dependency sets before running `prepare` for Git installs.
 
 - `./build.sh`
 
-Builds a portable x86-64 prebuild inside Docker (see [Dockerfile](Dockerfile))
-and exports it to `prebuilds/linux-x64`. This requires Docker with BuildKit's
-`type=local` output support; `build.sh` enables BuildKit explicitly and exports
-the final scratch artifact stage without creating a temporary container. The
-build image is based on the official Node 26 Bookworm variant. The Linux binding
-uses the same C++20 language level as the bundled RocksDB, which GCC 12 supports.
-The build rejects artifacts that require symbols newer than Bookworm's
-glibc/libstdc++ ABI.
+Builds an AMD Zen 3-tuned x86-64 prebuild inside Docker (see
+[Dockerfile](Dockerfile)) and exports it to `prebuilds/linux-x64`. This requires
+Docker with BuildKit's `type=local` output support; `build.sh` enables BuildKit
+explicitly and exports the final scratch artifact stage without creating a
+temporary container. The build image is based on the official Node 26 Bookworm
+variant. The Linux binding uses the same C++20 language level as the bundled
+RocksDB, which GCC 12 supports. The build rejects artifacts that require symbols
+newer than Bookworm's glibc/libstdc++ ABI.
 
 Uses the local Docker daemon; point `DOCKER_HOST=ssh://user@host` at a remote
-amd64 host to avoid emulation on Apple Silicon. CPU tuning remains available
-for private, hardware-controlled deployments:
+amd64 host to avoid emulation on Apple Silicon. `ROCKS_LEVEL_MARCH` defaults to
+the GCC/Clang Zen 3 target name `znver3` and can be overridden:
 
 - `ROCKS_LEVEL_MARCH=znver2 ./build.sh`
+- `ROCKS_LEVEL_MARCH= ./build.sh` for a portable x86-64 artifact
 
-Do not publish that tuned artifact as the generic npm prebuild. `release.sh`
-always clears `ROCKS_LEVEL_MARCH` for its Linux build.
+`release.sh` ignores caller overrides and uses the `znver3` default for Linux,
+then clears the variable so the Darwin arm64 build remains portable.
 
 To keep repeated releases fast, the Docker build routes every compiler
 invocation through `ccache` (on a BuildKit cache mount) and persists that cache

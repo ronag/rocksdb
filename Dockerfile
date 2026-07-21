@@ -26,10 +26,10 @@ WORKDIR /rocks-level
 # emulation on an arm64 host.
 ARG JOBS=8
 
-# Generic npm prebuilds intentionally leave this empty. Private deployments
-# can opt into CPU-specific tuning with, for example,
-#   ROCKS_LEVEL_MARCH=znver2 ./build.sh
-ARG ROCKS_LEVEL_MARCH=
+# Linux prebuilds target AMD Zen 3 by default. build.sh forwards an explicitly
+# set ROCKS_LEVEL_MARCH so private builds can select another CPU or use an empty
+# value for a portable x86-64 artifact.
+ARG ROCKS_LEVEL_MARCH=znver3
 
 # Route every compiler invocation (cmake for the deps, node-gyp for the addon)
 # through ccache. Debian's ccache package ships masquerade symlinks in
@@ -72,7 +72,7 @@ RUN mkdir -p prebuilds/linux-x64 \
 
 # Reject accidental toolchain ABI drift before an artifact can leave the
 # image. The checker also verifies that dependency tuning matches the build
-# argument, preventing a cached tuned prefix from masquerading as portable.
+# argument, preventing a cached prefix with different tuning from being reused.
 RUN ROCKS_LEVEL_MARCH="$ROCKS_LEVEL_MARCH" node scripts/check-linux-prebuild.js
 
 # test-prebuild sets PREBUILDS_ONLY=1, which node-gyp-build's loader honors: it
