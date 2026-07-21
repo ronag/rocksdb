@@ -352,8 +352,9 @@ export interface RocksRawGetManyOptions<
    *   holds every value's bytes back-to-back, addressed by `offsets`/`statuses`.
    *   Cheaper for many small values, but only valid for `buffer`, `slice` or
    *   `utf8` output.
-   * - `'auto'` — let the addon choose per call and report which shape it picked
-   *   via the result's `packed` discriminator.
+   * - `'auto'` — let the addon choose per call. Buffer results are
+   *   distinguishable by shape; callbacks also report the choice, and
+   *   `exposePacked: true` adds the result discriminator.
    *
    * Defaults to `'auto'` for `buffer`/`slice` output and `false` otherwise.
    */
@@ -378,10 +379,10 @@ export interface RocksRawGetManyOptions<
   allowPartial?: boolean
   /**
    * Whether to attach the packed-mode discriminator to the returned value.
-   * Defaults to `true`. Set `false` to receive a bare decoded-value array with
-   * no `packed` property, which is only permitted alongside an explicit
-   * JavaScript `valueEncoding` (`slice`, `utf8` or `utf-8`) where the value
-   * shape is unambiguous without the discriminator.
+   * Defaults to `false`. Set `true` to attach a `packed` property. Without the
+   * property, buffer results remain distinguishable by shape: unpacked values
+   * are an array and packed values are a {@link RocksUnexposedPackedGetManyResult}.
+   * JavaScript encodings (`slice`, `utf8` and `utf-8`) always return an array.
    */
   exposePacked?: boolean
 }
@@ -475,6 +476,8 @@ export interface RocksPackedGetManyResult {
   readonly count: number
 }
 
+export type RocksUnexposedPackedGetManyResult = Omit<RocksPackedGetManyResult, 'packed'>
+
 /** A packed byte arena and `[byteOffset, byteLength]` pairs identifying its encoded keys. */
 export interface RocksPackedGetManyInput {
   readonly offsets: Uint32Array
@@ -548,6 +551,18 @@ export type RocksGetManyReadResult<
       ? RocksPackedGetManyResult | RocksRawGetManyResult<E, false, AllowPartial>
       : RocksRawGetManyResult<E, false, AllowPartial>
 
+export type RocksUnexposedGetManyReadResult<
+  E extends RocksRawEncoding,
+  Packed extends RocksPackedReadMode,
+  AllowPartial extends boolean = true,
+> = E extends RocksJavaScriptEncoding
+  ? RocksRawGetManyValues<E, AllowPartial>
+  : Packed extends true
+    ? RocksUnexposedPackedGetManyResult
+    : Packed extends 'auto'
+      ? RocksUnexposedPackedGetManyResult | RocksRawGetManyValues<E, AllowPartial>
+      : RocksRawGetManyValues<E, AllowPartial>
+
 // The raw getMany entry points read their settlement controls (packed,
 // allowPartial, exposePacked) from the options object, so the returned type is
 // derived from that object's literal properties. `const` type parameters on the
@@ -584,27 +599,28 @@ export type RocksRawGetManyBounded<O> = O extends
   { timeout: number | undefined } | { highWaterMarkBytes: number | undefined }
   ? true
   : false
-export type RocksRawGetManyExposePacked<O> = O extends { exposePacked: false } ? false : true
+export type RocksRawGetManyExposePacked<O> = O extends { exposePacked?: infer E }
+  ? [Exclude<E, undefined>] extends [boolean]
+    ? [Exclude<E, undefined>] extends [never]
+      ? false
+      : Exclude<E, undefined>
+    : false
+  : false
 // Result type for a raw getMany call described by options object O.
-export type RocksRawGetManyResultFor<O> =
-  RocksRawGetManyExposePacked<O> extends false
-    ? RocksRawGetManyValues<
-        RocksRawGetManyEncoding<O> & RocksRawEncoding,
-        RocksRawGetManyAllowPartial<O>
-      >
-    : RocksGetManyReadResult<
-        RocksRawGetManyEncoding<O> & RocksRawEncoding,
-        RocksRawGetManyPacked<O> & RocksPackedReadMode,
-        RocksRawGetManyAllowPartial<O>
-      >
-// exposePacked: false only makes sense for an explicit JavaScript encoding,
-// where the decoded values are always a plain array. Intersecting this with the
-// options parameter forces such calls to name a JavaScript valueEncoding.
-export type RocksRawGetManyExposePackedConstraint<O> = O extends { exposePacked: false }
-  ? RocksRawGetManyEncoding<O> extends RocksJavaScriptEncoding
-    ? unknown
-    : { valueEncoding: RocksJavaScriptEncoding }
-  : unknown
+export type RocksRawGetManyResultFor<
+  O,
+  ExposePacked extends boolean = RocksRawGetManyExposePacked<O>,
+> = ExposePacked extends true
+  ? RocksGetManyReadResult<
+      RocksRawGetManyEncoding<O> & RocksRawEncoding,
+      RocksRawGetManyPacked<O> & RocksPackedReadMode,
+      RocksRawGetManyAllowPartial<O>
+    >
+  : RocksUnexposedGetManyReadResult<
+      RocksRawGetManyEncoding<O> & RocksRawEncoding,
+      RocksRawGetManyPacked<O> & RocksPackedReadMode,
+      RocksRawGetManyAllowPartial<O>
+    >
 
 /**
  * Supported unsafe iterator extensions. The caller must keep the database and
@@ -987,12 +1003,12 @@ export class RocksLevel<KDefault = string, VDefault = string> extends AbstractLe
    */
   _getManyAsync<const O extends RocksRawGetManyOptions<RocksRawEncoding, RocksPackedReadMode> = {}>(
     keys: readonly RocksSlice[] | RocksPackedGetManyInput,
-    options?: O & RocksRawGetManyExposePackedConstraint<O>
+    options?: O
   ): Promise<RocksRawGetManyResultFor<O>>
   /** Callback form: the same contract, delivering the result to `callback`. */
   _getManyAsync<const O extends RocksRawGetManyOptions<RocksRawEncoding, RocksPackedReadMode> = {}>(
     keys: readonly RocksSlice[] | RocksPackedGetManyInput,
-    options: (O & RocksRawGetManyExposePackedConstraint<O>) | undefined,
+    options: O | undefined,
     callback: RocksPackedReadCallback<
       RocksRawGetManyResultFor<O>,
       RocksRawGetManyPacked<O> & RocksPackedReadMode
@@ -1011,7 +1027,7 @@ export class RocksLevel<KDefault = string, VDefault = string> extends AbstractLe
    */
   _getManySync<const O extends RocksRawGetManyOptions<RocksRawEncoding, RocksPackedReadMode> = {}>(
     keys: readonly RocksSlice[] | RocksPackedGetManyInput,
-    options?: O & RocksRawGetManyExposePackedConstraint<O>
+    options?: O
   ): RocksRawGetManyResultFor<O>
   /**
    * Construct a caller-owned raw iterator. Options are consumed before return;

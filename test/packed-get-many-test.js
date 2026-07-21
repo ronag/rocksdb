@@ -28,8 +28,8 @@ test('packed getMany sync and async preserve values, empty values and misses', a
   const expectedOffsets = new Int32Array([0, 3, -1, 0, 3, 0, 3, 5])
 
   for (const [name, result] of [
-    ['sync', db._getManySync(keys, { packed: true })],
-    ['async', await db._getManyAsync(keys, { packed: true })]
+    ['sync', db._getManySync(keys, { packed: true, exposePacked: true })],
+    ['async', await db._getManyAsync(keys, { packed: true, exposePacked: true })]
   ]) {
     t.equal(result.packed, true, `${name} exposes the selected packed mode`)
     t.equal(result.count, keys.length, `${name} reports one result per key`)
@@ -199,11 +199,13 @@ test('utf8 getMany converts unpacked and packed native values to strings', async
   for (const [name, read] of [
     ['sync', (packed, keys = ['a', 'missing', 'empty'], valueEncoding = 'utf8') => db._getManySync(keys, {
       packed,
-      valueEncoding
+      valueEncoding,
+      exposePacked: true
     })],
     ['async', (packed, keys = ['a', 'missing', 'empty'], valueEncoding = 'utf8') => db._getManyAsync(keys, {
       packed,
-      valueEncoding
+      valueEncoding,
+      exposePacked: true
     })]
   ]) {
     for (const packed of [undefined, false, true, 'auto']) {
@@ -240,11 +242,13 @@ test('slice getMany converts unpacked and packed native values to Slice objects'
   for (const [name, read] of [
     ['sync', (packed, keys = ['a', 'missing', 'empty']) => db._getManySync(keys, {
       packed,
-      valueEncoding: 'slice'
+      valueEncoding: 'slice',
+      exposePacked: true
     })],
     ['async', (packed, keys = ['a', 'missing', 'empty']) => db._getManyAsync(keys, {
       packed,
-      valueEncoding: 'slice'
+      valueEncoding: 'slice',
+      exposePacked: true
     })]
   ]) {
     for (const packed of [undefined, false, true, 'auto']) {
@@ -269,9 +273,9 @@ test('slice getMany converts unpacked and packed native values to Slice objects'
 
   const unexposed = await db._getManyAsync(
     ['a', 'missing', 'empty'],
-    { packed: 'auto', valueEncoding: 'slice', allowPartial: false, exposePacked: false }
+    { packed: 'auto', valueEncoding: 'slice', allowPartial: false }
   )
-  t.equal(Object.hasOwn(unexposed, 'packed'), false, 'async can omit the packed discriminator')
+  t.equal(Object.hasOwn(unexposed, 'packed'), false, 'async omits the packed discriminator by default')
   t.ok(unexposed[0] instanceof Slice, 'unexposed packed values remain Slice objects')
   t.equal(unexposed[1], undefined, 'unexposed packed values preserve missing keys')
   t.equal(unexposed[0].buffer, unexposed[2].buffer, 'unexposed slices still share the packed arena')
@@ -318,10 +322,10 @@ test('getMany defaults to auto packing at the 8 KiB average threshold', async fu
     const large = await read(['large'])
 
     t.notOk(Array.isArray(small), `${name} packs an 8 KiB average`)
-    t.equal(small.packed, true, `${name} identifies the packed result`)
+    t.equal(Object.hasOwn(small, 'packed'), false, `${name} omits the packed discriminator`)
     t.equal(small.buffer.byteLength, 8 * 1024, `${name} retains the packed bytes`)
     t.ok(Array.isArray(large), `${name} leaves an average above 8 KiB unpacked`)
-    t.equal(large.packed, false, `${name} identifies the unpacked result`)
+    t.equal(Object.hasOwn(large, 'packed'), false, `${name} omits the unpacked discriminator`)
     t.equal(large[0].byteLength, 8 * 1024 + 1, `${name} retains the unpacked value`)
   }
 
@@ -349,7 +353,8 @@ test('auto getMany observes valueEncoding once', async function (t) {
 
     const result = await read(options)
     t.equal(reads, 1, `${name} snapshots valueEncoding once`)
-    t.equal(result.packed, false, `${name} selects unpacked mode for the large value`)
+    t.ok(Array.isArray(result), `${name} selects unpacked mode for the large value`)
+    t.equal(Object.hasOwn(result, 'packed'), false, `${name} omits the packed discriminator`)
     t.ok(Buffer.isBuffer(result[0]), `${name} preserves the observed buffer encoding`)
   }
 
@@ -370,7 +375,7 @@ test('async getMany callback reports the selected packed mode', async function (
       })
     })
 
-    t.equal(selected, result.packed, `${packed} callback and result agree`)
+    t.equal(Object.hasOwn(result, 'packed'), false, `${packed} result omits the discriminator`)
     t.equal(selected, packed !== false, `${packed} reports the expected mode for a small value`)
   }
 

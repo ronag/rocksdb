@@ -262,13 +262,14 @@ function prepareRawGetManyOptions(options, packed?) {
 // Raw getMany entry points carry their settlement controls on the options
 // object rather than as positional arguments. allowPartial stays undefined when
 // unset so the shared core can still infer it from bounded-read options (a
-// positive timeout or any highWaterMarkBytes). exposePacked defaults to true so
-// unsafe callers keep receiving the packed-mode discriminator on their results.
+// positive timeout or any highWaterMarkBytes). exposePacked defaults to false;
+// callers that need the discriminator can opt in without changing the native
+// representation selected for the read.
 function readRawGetManyControls(options) {
   if ((typeof options === 'object' && options !== null) || typeof options === 'function') {
-    return { allowPartial: options.allowPartial, exposePacked: options.exposePacked ?? true }
+    return { allowPartial: options.allowPartial, exposePacked: options.exposePacked ?? false }
   }
-  return { allowPartial: undefined, exposePacked: true }
+  return { allowPartial: undefined, exposePacked: false }
 }
 
 function convertRawGetManyResult(result, valueEncoding) {
