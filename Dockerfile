@@ -34,8 +34,8 @@ ARG ROCKS_LEVEL_MARCH=znver3
 # Route every compiler invocation (cmake for the deps, node-gyp for the addon)
 # through ccache. Debian's ccache package ships masquerade symlinks in
 # /usr/lib/ccache; prepending it to PATH transparently caches gcc/g++/cc/c++.
-# The cache lives on a BuildKit cache mount at CCACHE_DIR, which build.sh seeds
-# from and exports back to /tmp on the host so it persists across releases.
+# The cache lives on a BuildKit cache mount at CCACHE_DIR. build.sh uploads a
+# project-local seed and downloads the updated cache after each release build.
 ENV PATH="/usr/lib/ccache:${PATH}"
 ENV CCACHE_DIR=/ccache
 ENV CCACHE_MAXSIZE=2G
@@ -85,7 +85,7 @@ RUN npm run test-prebuild
 FROM scratch AS artifact
 COPY --from=build /rocks-level/prebuilds/linux-x64/@nxtedition+rocksdb.node /@nxtedition+rocksdb.node
 
-# Dump the compiler cache so build.sh can export it back to /tmp on the host.
+# Dump the compiler cache so build.sh can download it to the local project.
 # Cache-mount contents live in the builder, not in any layer, so a RUN must
 # copy them into a normal path before a scratch stage can export them. This
 # reuses the fully cached `build` stage, so only the copy below runs.

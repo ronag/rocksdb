@@ -23,6 +23,7 @@ prebuilds/
 yarn.lock
 package-lock.json
 .nyc_output/
+# Local compiler cache and other disposable project caches.
 .cache/
 .benchmarks/
 .vscode/
