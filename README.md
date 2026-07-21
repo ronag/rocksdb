@@ -163,11 +163,35 @@ per row; a disabled field is `undefined`. Both tables address the same packed
 `buffer`, whose bytes remain in iterator key-then-value order.
 
 Either table can be passed to `_getManySync()` or `_getManyAsync()` without
-copying the arena or materializing individual buffers. For example, use iterator
-values as multi-get keys with
-`{ offsets: result.values, buffer: result.buffer }`. Async multi-get snapshots
-the selected fields before returning, so the caller can immediately reuse or
-release the iterator arena.
+materializing individual buffers. For example, use iterator values as multi-get
+keys with `{ offsets: result.values, buffer: result.buffer }`.
+
+The public and raw `getMany` options use `unsafe` as a copy-control bit mask.
+`RocksGetManyUnsafe.INPUT` (`1`) permits async reads to borrow both packed
+arenas and unpacked Buffer/SliceLike keys instead of copying them. Async reads
+retain the exact backing buffers until settlement, but the caller must not
+mutate their bytes during the read. Sync reads always borrow byte-backed keys
+because JavaScript cannot run after synchronous admission. `RocksGetManyUnsafe.OUTPUT`
+(`2`) permits both packed arenas and unpacked Buffer values to transfer
+native-owned storage instead of copying it. For backwards compatibility,
+`unsafe: true` is equivalent to `RocksGetManyUnsafe.OUTPUT`, while
+`unsafe: false` selects no flags. Combine both named flags with bitwise OR:
+
+```js
+const { RocksGetManyUnsafe } = require('@nxtedition/rocksdb')
+
+const values = await db._getManyAsync(keys, {
+  packed: false,
+  unsafe: RocksGetManyUnsafe.INPUT | RocksGetManyUnsafe.OUTPUT
+})
+```
+
+Without `INPUT`, async multi-get snapshots packed and unpacked key bytes. Sync
+multi-get always borrows byte-backed keys for the duration of the call. Without
+`OUTPUT`, returned packed arenas and unpacked Buffer values are copied. Strings
+are immutable and therefore become native-owned copies in either mode;
+cache-pinned RocksDB outputs are copied even when `OUTPUT` is set because their
+backing storage cannot safely outlive the database.
 
 The raw methods additionally support JavaScript conversion for `slice`, `utf8`
 and its `utf-8` alias. This behavior is intentionally not added to the

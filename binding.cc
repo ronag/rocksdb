@@ -3388,6 +3388,48 @@ enum class PackedGetManyStatus : uint8_t {
   Incomplete = 2,
 };
 
+enum class GetManyUnsafe : uint32_t {
+  Input = 1,
+  Output = 2,
+};
+
+static constexpr uint32_t kGetManyUnsafeMask = static_cast<uint32_t>(GetManyUnsafe::Input) |
+                                                static_cast<uint32_t>(GetManyUnsafe::Output);
+
+static bool HasGetManyUnsafe(const uint32_t unsafe, const GetManyUnsafe flag) {
+  return (unsafe & static_cast<uint32_t>(flag)) != 0;
+}
+
+static napi_status GetGetManyUnsafe(napi_env env, napi_value options, uint32_t& result) {
+  result = 0;
+
+  napi_valuetype optionsType;
+  NAPI_STATUS_RETURN(napi_typeof(env, options, &optionsType));
+  if (optionsType == napi_undefined || optionsType == napi_null) return napi_ok;
+  if (optionsType != napi_object) return napi_invalid_arg;
+
+  napi_value value;
+  NAPI_STATUS_RETURN(napi_get_named_property(env, options, "unsafe", &value));
+
+  napi_valuetype valueType;
+  NAPI_STATUS_RETURN(napi_typeof(env, value, &valueType));
+  if (valueType == napi_undefined || valueType == napi_null) return napi_ok;
+  if (valueType == napi_boolean) {
+    bool legacy;
+    NAPI_STATUS_RETURN(GetValue(env, value, legacy));
+    result = legacy ? static_cast<uint32_t>(GetManyUnsafe::Output) : 0;
+    return napi_ok;
+  }
+
+  NAPI_STATUS_RETURN(GetValue(env, value, result));
+  if ((result & ~kGetManyUnsafeMask) != 0) {
+    NAPI_STATUS_RETURN(
+        napi_throw_range_error(env, nullptr, "getMany unsafe must contain only INPUT (1) and OUTPUT (2)"));
+    return napi_pending_exception;
+  }
+  return napi_ok;
+}
+
 struct PackedGetManyResult {
   rocksdb::PinnableSlice data;
   std::vector<int32_t> offsets;
@@ -3442,11 +3484,14 @@ static rocksdb::Status PackGetManyResult(const std::vector<rocksdb::Status>& sta
   return rocksdb::Status::OK();
 }
 
-static napi_status ConvertPackedGetManyResult(napi_env env, PackedGetManyResult& state, napi_value* result) {
+static napi_status ConvertPackedGetManyResult(napi_env env,
+                                              PackedGetManyResult& state,
+                                              napi_value* result,
+                                              const bool unsafe) {
   state.data.PinSelf();
 
   napi_value buffer;
-  NAPI_STATUS_RETURN(Convert(env, std::move(state.data), Encoding::Buffer, buffer, true));
+  NAPI_STATUS_RETURN(Convert(env, std::move(state.data), Encoding::Buffer, buffer, unsafe));
 
   void* offsetsData = nullptr;
   napi_value offsetsBuffer;
@@ -3494,7 +3539,10 @@ static napi_status PackedGetManyInputError(napi_env env, const char* message) {
   return napi_pending_exception;
 }
 
-static napi_status GetPackedGetManyInput(napi_env env, napi_value input, PackedGetManyInput& result) {
+static napi_status GetPackedGetManyInput(napi_env env,
+                                         napi_value input,
+                                         PackedGetManyInput& result,
+                                         napi_value* backing = nullptr) {
   napi_valuetype inputType;
   NAPI_STATUS_RETURN(napi_typeof(env, input, &inputType));
   if (inputType != napi_object) {
@@ -3532,6 +3580,7 @@ static napi_status GetPackedGetManyInput(napi_env env, napi_value input, PackedG
     void* data = nullptr;
     NAPI_STATUS_RETURN(napi_get_buffer_info(env, value, &data, &result.dataLength));
     result.data = static_cast<const char*>(data);
+    if (backing) *backing = value;
   }
 
   if (result.offsetsLength % 2 != 0) {
@@ -3546,36 +3595,6 @@ static napi_status GetPackedGetManyInput(napi_env env, napi_value input, PackedG
     }
   }
 
-  return napi_ok;
-}
-
-static napi_status GetBorrowedGetManyKeys(napi_env env,
-                                          napi_value input,
-                                          std::vector<rocksdb::Slice>& result) {
-  bool isArray = false;
-  NAPI_STATUS_RETURN(napi_is_array(env, input, &isArray));
-  if (isArray) {
-    uint32_t count = 0;
-    NAPI_STATUS_RETURN(napi_get_array_length(env, input, &count));
-    result.resize(count);
-    for (uint32_t index = 0; index < count; ++index) {
-      napi_value key;
-      NAPI_STATUS_RETURN(napi_get_element(env, input, index, &key));
-      NAPI_STATUS_RETURN(GetValue(env, key, result[index]));
-    }
-    return napi_ok;
-  }
-
-  PackedGetManyInput packed;
-  NAPI_STATUS_RETURN(GetPackedGetManyInput(env, input, packed));
-  result.resize(packed.size());
-  const auto* data = packed.data == nullptr ? "" : packed.data;
-  for (size_t index = 0; index < packed.size(); ++index) {
-    const auto layoutIndex = index * 2;
-    const auto offset = packed.offsets[layoutIndex];
-    const auto length = packed.offsets[layoutIndex + 1];
-    result[index] = rocksdb::Slice(data + offset, length);
-  }
   return napi_ok;
 }
 
@@ -3646,6 +3665,86 @@ static napi_status GetOwnedGetManyKeys(napi_env env, napi_value input, OwnedGetM
   return napi_ok;
 }
 
+struct GetManyInputKeys {
+  OwnedGetManyKeys owned;
+  std::vector<rocksdb::Slice> borrowed;
+  std::vector<bool> isBorrowed;
+  std::shared_ptr<Reference> reference;
+
+  size_t size() const { return isBorrowed.empty() ? owned.size() : isBorrowed.size(); }
+
+  std::vector<rocksdb::Slice> slices() const {
+    if (isBorrowed.empty()) return owned.slices();
+
+    std::vector<rocksdb::Slice> result;
+    result.reserve(isBorrowed.size());
+    for (size_t index = 0; index < isBorrowed.size(); ++index) {
+      result.emplace_back(isBorrowed[index] ? borrowed[index] : rocksdb::Slice(owned.array[index]));
+    }
+    return result;
+  }
+};
+
+static napi_status GetGetManyInputKeys(napi_env env,
+                                       napi_value input,
+                                       const bool borrow,
+                                       const bool retainBorrowed,
+                                       GetManyInputKeys& result) {
+  if (!borrow) return GetOwnedGetManyKeys(env, input, result.owned);
+
+  napi_value backings = nullptr;
+  bool isArray = false;
+  NAPI_STATUS_RETURN(napi_is_array(env, input, &isArray));
+  if (isArray) {
+    uint32_t count = 0;
+    NAPI_STATUS_RETURN(napi_get_array_length(env, input, &count));
+    result.owned.array.resize(count);
+    result.borrowed.resize(count);
+    result.isBorrowed.resize(count, false);
+
+    for (uint32_t index = 0; index < count; ++index) {
+      napi_value key;
+      NAPI_STATUS_RETURN(napi_get_element(env, input, index, &key));
+
+      napi_valuetype type;
+      NAPI_STATUS_RETURN(napi_typeof(env, key, &type));
+      if (type == napi_string) {
+        NAPI_STATUS_RETURN(GetValue(env, key, result.owned.array[index]));
+        continue;
+      }
+
+      napi_value backing;
+      NAPI_STATUS_RETURN(
+          GetString(env, key, result.borrowed[index], retainBorrowed ? &backing : nullptr));
+      if (retainBorrowed) {
+        if (!backings) {
+          NAPI_STATUS_RETURN(napi_create_array_with_length(env, count, &backings));
+        }
+        NAPI_STATUS_RETURN(napi_set_element(env, backings, index, backing));
+      }
+      result.isBorrowed[index] = true;
+    }
+  } else {
+    PackedGetManyInput packed;
+    NAPI_STATUS_RETURN(
+        GetPackedGetManyInput(env, input, packed, retainBorrowed ? &backings : nullptr));
+    result.borrowed.resize(packed.size());
+    result.isBorrowed.resize(packed.size(), true);
+    const auto* data = packed.data == nullptr ? "" : packed.data;
+    for (size_t index = 0; index < packed.size(); ++index) {
+      const auto layoutIndex = index * 2;
+      result.borrowed[index] =
+          rocksdb::Slice(data + packed.offsets[layoutIndex], packed.offsets[layoutIndex + 1]);
+    }
+  }
+
+  if (retainBorrowed && backings) {
+    result.reference = std::make_shared<Reference>();
+    NAPI_STATUS_RETURN(Reference::Create(env, backings, *result.reference));
+  }
+  return napi_ok;
+}
+
 static napi_value db_get_many_sync_impl(napi_env env, napi_callback_info info, const PackedMode mode) {
   NAPI_ARGV(3);
 
@@ -3666,13 +3765,16 @@ static napi_value db_get_many_sync_impl(napi_env env, napi_callback_info info, c
   uint32_t timeout = 0;
   NAPI_STATUS_THROWS(GetProperty(env, argv[2], "timeout", timeout));
 
-  bool unsafe = false;
-  if (mode != PackedMode::Packed) {
-    NAPI_STATUS_THROWS(GetProperty(env, argv[2], "unsafe", unsafe));
-  }
+  uint32_t unsafe = 0;
+  NAPI_STATUS_THROWS(GetGetManyUnsafe(env, argv[2], unsafe));
 
-  std::vector<rocksdb::Slice> keys;
-  NAPI_STATUS_THROWS(GetBorrowedGetManyKeys(env, argv[1], keys));
+  const auto unsafeOutput = HasGetManyUnsafe(unsafe, GetManyUnsafe::Output);
+  GetManyInputKeys inputKeys;
+  // JavaScript cannot run after synchronous admission, so byte-backed keys can
+  // always be borrowed for the duration of MultiGet. Immutable strings still
+  // become native-owned copies during conversion.
+  NAPI_STATUS_THROWS(GetGetManyInputKeys(env, argv[1], true, false, inputKeys));
+  const auto keys = inputKeys.slices();
   const auto count = static_cast<uint32_t>(keys.size());
   std::vector<rocksdb::Status> statuses;
   statuses.resize(count);
@@ -3708,7 +3810,7 @@ static napi_value db_get_many_sync_impl(napi_env env, napi_callback_info info, c
     ROCKS_STATUS_THROWS_NAPI(PackGetManyResult(statuses, values, packedResult));
 
     napi_value result;
-    NAPI_STATUS_THROWS(ConvertPackedGetManyResult(env, packedResult, &result));
+    NAPI_STATUS_THROWS(ConvertPackedGetManyResult(env, packedResult, &result, unsafeOutput));
     return result;
   }
 
@@ -3723,11 +3825,10 @@ static napi_value db_get_many_sync_impl(napi_env env, napi_callback_info info, c
       NAPI_STATUS_THROWS(napi_get_null(env, &row));
     } else {
       ROCKS_STATUS_THROWS_NAPI(statuses[n]);
-      // MultiGet may return either cache-pinned or internally-owned slices.
-      // Keep one stable copy policy for the whole batch: hundreds of external
-      // Buffer finalizers were slower in profiling and cannot safely outlive
-      // every RocksDB ownership mode.
-      NAPI_STATUS_THROWS(Convert(env, std::move(values[n]), valueEncoding, row, unsafe, false));
+      // Safe output copies every value. OUTPUT may transfer internally-owned
+      // slices; Convert still copies cache-pinned values that cannot outlive
+      // their RocksDB owner.
+      NAPI_STATUS_THROWS(Convert(env, std::move(values[n]), valueEncoding, row, unsafeOutput));
     }
     NAPI_STATUS_THROWS(napi_set_element(env, rows, n, row));
   }
@@ -3767,19 +3868,19 @@ static napi_value db_get_many_impl(napi_env env, napi_callback_info info, const 
   uint32_t timeout = 0;
   NAPI_STATUS_THROWS(GetProperty(env, argv[2], "timeout", timeout));
 
-  bool unsafe = false;
-  if (mode != PackedMode::Packed) {
-    NAPI_STATUS_THROWS(GetProperty(env, argv[2], "unsafe", unsafe));
-  }
+  uint32_t unsafe = 0;
+  NAPI_STATUS_THROWS(GetGetManyUnsafe(env, argv[2], unsafe));
+  const auto unsafeInput = HasGetManyUnsafe(unsafe, GetManyUnsafe::Input);
+  const auto unsafeOutput = HasGetManyUnsafe(unsafe, GetManyUnsafe::Output);
 
   auto callback = argv[3];
 
-  // Async work must not borrow Buffer, SliceLike or packed-arena storage. The
-  // caller can mutate or release the original input as soon as this method
-  // returns, so snapshot array keys or the packed key fields on the JS thread.
-  OwnedGetManyKeys ownedKeys;
-  NAPI_STATUS_THROWS(GetOwnedGetManyKeys(env, argv[1], ownedKeys));
-  const auto count = static_cast<uint32_t>(ownedKeys.size());
+  // Safe async work snapshots keys on the JS thread. INPUT permits borrowing
+  // exact Buffer/SliceLike backings instead; retain those backings until the
+  // worker completes even if the caller replaces or releases its containers.
+  GetManyInputKeys inputKeys;
+  NAPI_STATUS_THROWS(GetGetManyInputKeys(env, argv[1], unsafeInput, true, inputKeys));
+  const auto count = static_cast<uint32_t>(inputKeys.size());
 
   rocksdb::ReadOptions readOptions;
   readOptions.deadline =
@@ -3812,14 +3913,14 @@ static napi_value db_get_many_impl(napi_env env, napi_callback_info info, const 
 
   NAPI_STATUS_THROWS(runAsyncKeepAlive<State>(
       resourceName, env, callback, argv[0],
-      [=, ownedKeys = std::move(ownedKeys), readOptions = std::move(readOptions)](auto& state) {
+      [=, inputKeys = std::move(inputKeys), readOptions = std::move(readOptions)](auto& state) {
         // MultiGet can return slices pinned to RocksDB cache memory. Retain the
         // operation through JS conversion (the async worker owns this functor
         // until Complete) so safe conversion performs only its one required
         // copy and raw db_close cannot tear down the cache first.
         (void)databaseOperation;
 
-        const auto keys = ownedKeys.slices();
+        const auto keys = inputKeys.slices();
 
         state.statuses.resize(count);
         state.values.resize(count);
@@ -3833,7 +3934,7 @@ static napi_value db_get_many_impl(napi_env env, napi_callback_info info, const 
       },
       [=](auto& state, napi_env env, napi_value* result) {
         if (state.packed) {
-          return ConvertPackedGetManyResult(env, state.packedResult, result);
+          return ConvertPackedGetManyResult(env, state.packedResult, result, unsafeOutput);
         }
 
         NAPI_STATUS_RETURN(napi_create_array_with_length(env, count, result));
@@ -3846,7 +3947,7 @@ static napi_value db_get_many_impl(napi_env env, napi_callback_info info, const 
             NAPI_STATUS_RETURN(napi_get_null(env, &row));
           } else {
             ROCKS_STATUS_RETURN_NAPI(state.statuses[n]);
-            NAPI_STATUS_RETURN(Convert(env, std::move(state.values[n]), valueEncoding, row, unsafe, false));
+            NAPI_STATUS_RETURN(Convert(env, std::move(state.values[n]), valueEncoding, row, unsafeOutput));
           }
           NAPI_STATUS_RETURN(napi_set_element(env, *result, n, row));
         }

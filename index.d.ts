@@ -50,6 +50,11 @@ export type RocksRawDecoded<E extends RocksRawEncoding> = E extends 'slice'
   ? Slice
   : RocksDecoded<Extract<E, RocksNativeEncoding>>
 
+export enum RocksGetManyUnsafe {
+  INPUT = 1,
+  OUTPUT = 2,
+}
+
 export interface RocksColumn {
   readonly __rocksColumnBrand: never
 }
@@ -257,7 +262,10 @@ export interface RocksWriteOptions extends RocksColumnOperationOptions {
 }
 
 export interface RocksGetOptions<K, V> extends AbstractGetOptions<K, V>, RocksReadOptions {}
-export interface RocksGetManyOptions<K, V> extends AbstractGetManyOptions<K, V>, RocksReadOptions {}
+export interface RocksGetManyOptions<K, V>
+  extends AbstractGetManyOptions<K, V>, Omit<RocksReadOptions, 'unsafe'> {
+  unsafe?: boolean | RocksGetManyUnsafe
+}
 export type RocksUnboundedGetManyOptions<K, V> = RocksGetManyOptions<K, V> & {
   highWaterMarkBytes?: never
   timeout?: never
@@ -342,7 +350,15 @@ export type RocksPackedReadCallback<T, Packed extends RocksPackedReadMode = Rock
 export interface RocksRawGetManyOptions<
   E extends RocksRawEncoding = RocksRawEncoding,
   Packed extends RocksPackedReadMode = RocksDefaultPackedMode<E>,
-> extends RocksReadOptions {
+> extends Omit<RocksReadOptions, 'unsafe'> {
+  /**
+   * Bit flags controlling getMany copies. INPUT (1) permits async native code
+   * to borrow encoded key storage; sync reads always borrow byte-backed keys.
+   * OUTPUT (2) permits returned byte storage to be transferred by reference.
+   * Combine both with bitwise OR. For backwards compatibility, `true` means
+   * OUTPUT and `false` means no flags.
+   */
+  unsafe?: boolean | RocksGetManyUnsafe
   valueEncoding?: [Packed] extends [false] ? E : E & ('buffer' | RocksJavaScriptEncoding)
   /**
    * How the read materializes its values.

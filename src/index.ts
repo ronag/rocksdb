@@ -35,6 +35,11 @@ const kEmpty = Object.freeze({})
 const DEBUG = process.env.NODE_ENV !== 'production'
 const cleanupAttempts = 3
 
+export enum RocksGetManyUnsafe {
+  INPUT = 1,
+  OUTPUT = 2,
+}
+
 function once(callback) {
   let called = false
   return (...args) => {
@@ -496,8 +501,9 @@ class RocksLevel extends AbstractLevel<any, any, any> {
   // must not close until settlement. This path deliberately bypasses public
   // admission, codecs, sublevel prefixing, hooks and events; callers pass
   // encoded keys and own option reentrancy and error observation. Raw database
-  // reads may overlap one another. Native admission copies key bytes and this
-  // wrapper snapshots result-conversion options before returning.
+  // reads may overlap one another. Native admission copies key bytes unless
+  // INPUT is set, and this wrapper snapshots result-conversion options before
+  // returning.
   _getManyAsync(keys, options, callback) {
     if (DEBUG) {
       assert.strictEqual(this.status, 'open', 'unsafe _getManyAsync() requires an open database')

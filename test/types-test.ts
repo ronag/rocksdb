@@ -10,6 +10,7 @@ import {
   RocksColumn,
   RocksFormat,
   RocksGetManyOptions,
+  RocksGetManyUnsafe,
   RocksLevel,
   RocksPackedGetManyResult,
   RocksPackedIteratorResult,
@@ -65,6 +66,8 @@ const db = new RocksLevel('/tmp/rocks-level-types')
 expectType<AbstractLevel<RocksFormat, string, string>>(db)
 expectType<Promise<RocksLevel<string, string>>>(RocksLevel.open('/tmp/rocks-level-types'))
 expectType<boolean | null>(ioUringAvailable())
+expectType<1>(RocksGetManyUnsafe.INPUT)
+expectType<2>(RocksGetManyUnsafe.OUTPUT)
 
 const removedPublicCallback = (_err?: Error | null, _value?: unknown): void => {}
 // @ts-expect-error Standard open callbacks were removed by abstract-level v3
@@ -378,6 +381,14 @@ const unboundedValues = db.getMany(['key'])
 expectTrue<Equal<Awaited<typeof unboundedValues>, Array<string | undefined>>>()
 const unboundedOptionValues = db.getMany(['key'], { valueEncoding: 'utf8' })
 expectTrue<Equal<Awaited<typeof unboundedOptionValues>, Array<string | undefined>>>()
+void db.getMany(['key'], {
+  unsafe: RocksGetManyUnsafe.INPUT | RocksGetManyUnsafe.OUTPUT,
+})
+void db._getManyAsync(readonlyRawKeys, { unsafe: RocksGetManyUnsafe.INPUT })
+void db._getManySync(readonlyRawKeys, { unsafe: RocksGetManyUnsafe.OUTPUT })
+void db.getMany(['key'], { unsafe: true })
+void db._getManyAsync(readonlyRawKeys, { unsafe: false })
+void db._getManySync(readonlyRawKeys, { unsafe: true })
 const annotatedBoundedOptions: RocksGetManyOptions<string, string> = {
   highWaterMarkBytes: 0,
 }

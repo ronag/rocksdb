@@ -3,6 +3,7 @@
 const test = require('tape')
 const testCommon = require('./common')
 const binding = require('../binding')
+const { RocksGetManyUnsafe } = require('..')
 
 async function rejection (promise) {
   try {
@@ -805,6 +806,66 @@ test('raw getMany observes bounded options in native order', async function (t) 
     binding.db_get_many = dbGetMany
     await db.close()
   }
+  t.end()
+})
+
+test('getMany unsafe uses INPUT and OUTPUT bit flags', async function (t) {
+  const db = testCommon.factory({ keyEncoding: 'buffer', valueEncoding: 'buffer' })
+  await db.open()
+  await db.put(Buffer.from('key'), Buffer.from('value'))
+  await db.put(Buffer.from('jey'), Buffer.from('borrowed'))
+
+  t.equal(RocksGetManyUnsafe.INPUT, 1, 'exports the INPUT flag')
+  t.equal(RocksGetManyUnsafe.OUTPUT, 2, 'exports the OUTPUT flag')
+  t.equal(
+    (await db.get(Buffer.from('key'), { unsafe: true })).toString(),
+    'value',
+    'single get keeps its boolean unsafe output option'
+  )
+  t.equal(
+    (await db.getMany([Buffer.from('key')], {
+      unsafe: RocksGetManyUnsafe.INPUT | RocksGetManyUnsafe.OUTPUT
+    }))[0].toString(),
+    'value',
+    'public getMany accepts combined flags'
+  )
+  t.equal(
+    db._getManySync(['key'], {
+      valueEncoding: 'buffer',
+      packed: false
+    })[0].toString(),
+    'value',
+    'sync getMany keeps accepting immutable string keys'
+  )
+  const borrowedSyncKey = Buffer.from('key')
+  const borrowedSyncKeys = [borrowedSyncKey, Buffer.from('key')]
+  Object.defineProperty(borrowedSyncKeys, 1, {
+    get () {
+      borrowedSyncKey[0] = 0x6a
+      return Buffer.from('key')
+    }
+  })
+  t.equal(
+    db._getManySync(borrowedSyncKeys, {
+      valueEncoding: 'buffer',
+      packed: false
+    })[0].toString(),
+    'borrowed',
+    'sync getMany always borrows byte-backed inputs'
+  )
+
+  t.throws(
+    () => db._getManySync([Buffer.from('key')], { packed: true, unsafe: 4 }),
+    /getMany unsafe must contain only INPUT \(1\) and OUTPUT \(2\)/,
+    'sync packed getMany rejects unknown flags'
+  )
+  t.equal(
+    (await db._getManyAsync([Buffer.from('key')], { packed: false, unsafe: true }))[0].toString(),
+    'value',
+    'async unpacked getMany keeps true as the legacy output-only option'
+  )
+
+  await db.close()
   t.end()
 })
 

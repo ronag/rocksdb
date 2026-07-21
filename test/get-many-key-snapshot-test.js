@@ -4,17 +4,17 @@ const test = require('tape')
 const { spawnSync } = require('node:child_process')
 const temporaryDirectoryPath = JSON.stringify(require.resolve('./temporary-directory'))
 
-test('async getMany always snapshots Buffer and SliceLike keys before queueing', function (t) {
+test('async getMany copies or borrows unpacked and packed keys by INPUT flag', function (t) {
   const packagePath = JSON.stringify(require.resolve('..'))
   const script = `
     'use strict'
     const assert = require('node:assert/strict')
     const { pbkdf2 } = require('node:crypto')
     const temporaryDirectory = require(${temporaryDirectoryPath})
-    const { RocksLevel } = require(${packagePath})
+    const { RocksGetManyUnsafe, RocksLevel } = require(${packagePath})
 
-    const occupyWorker = () => new Promise((resolve, reject) => {
-      pbkdf2('password', 'salt', 400000, 16, 'sha256', (err) => {
+    const occupyWorker = (iterations = 400000) => new Promise((resolve, reject) => {
+      pbkdf2('password', 'salt', iterations, 16, 'sha256', (err) => {
         if (err) reject(err)
         else resolve()
       })
@@ -63,6 +63,77 @@ test('async getMany always snapshots Buffer and SliceLike keys before queueing',
       await blocker
 
       blocker = occupyWorker()
+      const borrowedKey = Buffer.from('a')
+      pending = db._getManyAsync([borrowedKey], {
+        valueEncoding: 'buffer',
+        packed: false,
+        unsafe: RocksGetManyUnsafe.INPUT
+      })
+      borrowedKey[0] = 0x62
+      assert.equal((await pending)[0].toString(), 'value-b')
+      await blocker
+
+      blocker = occupyWorker()
+      const safePackedBacking = Buffer.from('a')
+      pending = db._getManyAsync({
+        offsets: new Uint32Array([0, 1]),
+        buffer: safePackedBacking
+      }, { packed: false })
+      safePackedBacking[0] = 0x62
+      assert.equal((await pending)[0].toString(), 'value-a')
+      await blocker
+
+      blocker = occupyWorker()
+      const borrowedPackedBacking = Buffer.from('a')
+      pending = db._getManyAsync({
+        offsets: new Uint32Array([0, 1]),
+        buffer: borrowedPackedBacking
+      }, {
+        packed: false,
+        unsafe: RocksGetManyUnsafe.INPUT
+      })
+      borrowedPackedBacking[0] = 0x62
+      assert.equal((await pending)[0].toString(), 'value-b')
+      await blocker
+
+      blocker = occupyWorker(1000000)
+      let retainedBacking = Buffer.allocUnsafeSlow(1)
+      retainedBacking[0] = 0x61
+      const retainedBackingRef = new WeakRef(retainedBacking)
+      const retainedKeys = [retainedBacking]
+      pending = db._getManyAsync(retainedKeys, {
+        packed: false,
+        unsafe: RocksGetManyUnsafe.INPUT
+      })
+      retainedKeys[0] = Buffer.from('b')
+      retainedBacking = null
+      await new Promise(resolve => setImmediate(resolve))
+      for (let i = 0; i < 4; i++) global.gc()
+      assert.equal(retainedBackingRef.deref()?.[0], 0x61)
+      assert.equal((await pending)[0].toString(), 'value-a')
+      await blocker
+
+      blocker = occupyWorker(1000000)
+      let retainedPackedBacking = Buffer.allocUnsafeSlow(1)
+      retainedPackedBacking[0] = 0x61
+      const retainedPackedBackingRef = new WeakRef(retainedPackedBacking)
+      const retainedPackedInput = {
+        offsets: new Uint32Array([0, 1]),
+        buffer: retainedPackedBacking
+      }
+      pending = db._getManyAsync(retainedPackedInput, {
+        packed: false,
+        unsafe: RocksGetManyUnsafe.INPUT
+      })
+      retainedPackedInput.buffer = Buffer.from('b')
+      retainedPackedBacking = null
+      await new Promise(resolve => setImmediate(resolve))
+      for (let i = 0; i < 4; i++) global.gc()
+      assert.equal(retainedPackedBackingRef.deref()?.[0], 0x61)
+      assert.equal((await pending)[0].toString(), 'value-a')
+      await blocker
+
+      blocker = occupyWorker()
       const packedKey = Buffer.from('a')
       pending = db._getManyAsync([packedKey], { packed: true })
       packedKey[0] = 0x62
@@ -81,7 +152,7 @@ test('async getMany always snapshots Buffer and SliceLike keys before queueing',
     })
   `
 
-  const result = spawnSync(process.execPath, ['-e', script], {
+  const result = spawnSync(process.execPath, ['--expose-gc', '-e', script], {
     encoding: 'utf8',
     env: { ...process.env, UV_THREADPOOL_SIZE: '1' },
     timeout: 20000
