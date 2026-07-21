@@ -594,12 +594,16 @@ const batchParts: RocksBatchSlice = [Buffer.from('va'), slice, Buffer.from('ue')
 batch._put(slice, Buffer.from('value'))
 batch._putParts([Buffer.from('k'), slice], batchParts)
 batch._del(slice)
+batch._appendMany([slice, Buffer.from('value'), Buffer.from('deleted'), null])
+batch._appendMany([], { column: db.columns.default })
 batch._merge(slice, slice)
 batch._mergeParts([slice], batchParts)
 batch._putLogData(slice)
 batch._writeSync({ sync: true })
 // @ts-expect-error Raw batch values cannot be null
 batch._put(slice, null)
+// @ts-expect-error Raw append-many entries must be encoded values or null deletes
+batch._appendMany([slice, undefined])
 // @ts-expect-error Raw batch parts must be Buffer or SliceLike values
 batch._putParts([Buffer.from('key'), 'not-encoded'], batchParts)
 expectType<Array<string | Buffer | null>>(

@@ -161,6 +161,14 @@ class ChainedBatch extends AbstractChainedBatch<any, any, any> {
     })
   }
 
+  // Append alternating encoded key/value pairs in one native admission. A
+  // null value deletes its key; RocksDB copies every input before return.
+  _appendMany(entries, options) {
+    return this[kRunOperation]('_appendMany', () => {
+      binding.batch_append_many(this[kBatchContext], entries, options ?? EMPTY)
+    })
+  }
+
   _clear() {
     return this[kRunOperation]('_clear', () => {
       binding.batch_clear(this[kBatchContext])

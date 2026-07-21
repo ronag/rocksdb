@@ -14,7 +14,8 @@ const NATIVE_TEST_FAULT_HOOKS = [
   'test_faults_enabled',
   'test_method_exception',
   'test_complete_exception',
-  'test_fail_batch_iterator_once'
+  'test_fail_batch_iterator_once',
+  'test_fail_batch_append_many_once'
 ]
 
 function listEntries (root, directory = 'prebuilds') {

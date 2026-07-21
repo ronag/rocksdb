@@ -89,6 +89,13 @@ operation also exists, because raw operations do not change abstract-level's
 private length. A raw-only batch must use `_writeSync()` or `_writeAsync()` and
 then be explicitly cleared or closed.
 
+`_appendMany([key, value, ...], options)` appends an even, flat list of encoded
+pairs under one shared column lookup and native admission. A `null` value means
+delete; puts and deletes retain their exact input order. All entries are
+validated before mutation and copied before return. If validation or a native
+append fails, the existing batch is unchanged. Like every raw mutator, this
+method does not update the public batch `length`.
+
 Direct `_clear()`, `_writeSync()`, `_writeAsync()` and raw close are valid only
 when native/raw state is the complete batch state. `_clear()` clears only the
 native RocksDB batch. Raw writes submit the current native operations but do not
