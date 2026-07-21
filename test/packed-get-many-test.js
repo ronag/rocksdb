@@ -43,6 +43,41 @@ test('packed getMany sync and async preserve values, empty values and misses', a
   t.end()
 })
 
+test('raw auto getMany unpacks unless the selected representation is exposed', async function (t) {
+  const db = testCommon.factory({ keyEncoding: 'buffer', valueEncoding: 'buffer' })
+  await db.open()
+  await db.batch([
+    { type: 'put', key: Buffer.from('a'), value: Buffer.from('one') },
+    { type: 'put', key: Buffer.from('empty'), value: Buffer.alloc(0) }
+  ])
+
+  for (const [name, read] of [
+    ['sync', (options) => db._getManySync(['a', 'missing', 'empty'], options)],
+    ['async', (options) => db._getManyAsync(['a', 'missing', 'empty'], options)]
+  ]) {
+    const automatic = await read({ packed: 'auto' })
+    t.ok(Array.isArray(automatic), `${name} auto returns the ordinary value array by default`)
+    t.same(automatic, [Buffer.from('one'), undefined, Buffer.alloc(0)],
+      `${name} auto unpacks values, misses and empty values`)
+    t.equal(Object.hasOwn(automatic, 'packed'), false,
+      `${name} auto omits the discriminator by default`)
+
+    const exposed = await read({ packed: 'auto', exposePacked: true })
+    t.equal(exposed.packed, true, `${name} exposed auto reports the selected packed mode`)
+    t.notOk(Array.isArray(exposed), `${name} exposed auto preserves the packed arena`)
+    t.same(unpack(exposed), [Buffer.from('one'), undefined, Buffer.alloc(0)],
+      `${name} exposed auto preserves every result`)
+
+    const explicit = await read({ packed: true })
+    t.notOk(Array.isArray(explicit), `${name} explicit packed mode still returns its arena`)
+    t.equal(Object.hasOwn(explicit, 'packed'), false,
+      `${name} explicit packed mode omits only the discriminator`)
+  }
+
+  await db.close()
+  t.end()
+})
+
 test('getMany sync and async accept packed iterator batches', async function (t) {
   const db = testCommon.factory({ keyEncoding: 'buffer', valueEncoding: 'buffer' })
   await db.open()
@@ -306,7 +341,7 @@ test('raw getMany rejects invalid packed modes', async function (t) {
   t.end()
 })
 
-test('getMany defaults to auto packing at the 8 KiB average threshold', async function (t) {
+test('getMany auto mode hides native packing at the 8 KiB average threshold', async function (t) {
   const db = testCommon.factory({ keyEncoding: 'buffer', valueEncoding: 'buffer' })
   await db.open()
   await db.batch([
@@ -315,15 +350,18 @@ test('getMany defaults to auto packing at the 8 KiB average threshold', async fu
   ])
 
   for (const [name, read] of [
-    ['sync', (keys) => db._getManySync(keys)],
-    ['async', (keys) => db._getManyAsync(keys)]
+    ['sync', (keys, options) => db._getManySync(keys, options)],
+    ['async', (keys, options) => db._getManyAsync(keys, options)]
   ]) {
     const small = await read(['small'])
     const large = await read(['large'])
+    const exposedSmall = await read(['small'], { exposePacked: true })
 
-    t.notOk(Array.isArray(small), `${name} packs an 8 KiB average`)
+    t.ok(Array.isArray(small), `${name} unpacks an auto-packed 8 KiB average`)
     t.equal(Object.hasOwn(small, 'packed'), false, `${name} omits the packed discriminator`)
-    t.equal(small.buffer.byteLength, 8 * 1024, `${name} retains the packed bytes`)
+    t.equal(small[0].byteLength, 8 * 1024, `${name} retains the auto-packed value bytes`)
+    t.equal(exposedSmall.packed, true, `${name} exposes the native packed choice on request`)
+    t.equal(exposedSmall.buffer.byteLength, 8 * 1024, `${name} retains the exposed packed bytes`)
     t.ok(Array.isArray(large), `${name} leaves an average above 8 KiB unpacked`)
     t.equal(Object.hasOwn(large, 'packed'), false, `${name} omits the unpacked discriminator`)
     t.equal(large[0].byteLength, 8 * 1024 + 1, `${name} retains the unpacked value`)
@@ -404,6 +442,37 @@ test('packed getMany reports bounded partial reads', async function (t) {
       t.same(Array.from(result.offsets.subarray(index * 2, index * 2 + 2)), [-1, -1],
         'incomplete values expose the aborted byte layout')
     }
+  }
+
+  await db.close()
+  t.end()
+})
+
+test('auto getMany unpacks bounded partial reads for sync and async callers', async function (t) {
+  const db = testCommon.factory({ keyEncoding: 'buffer', valueEncoding: 'buffer' })
+  await db.open()
+  const value = Buffer.alloc(1024, 0x78)
+  const keys = ['a', 'b', 'c']
+  await db.batch(keys.map((key) => ({ type: 'put', key, value })))
+
+  for (const [name, read] of [
+    ['sync', (options) => db._getManySync(keys, options)],
+    ['async', (options) => db._getManyAsync(keys, options)]
+  ]) {
+    const options = {
+      packed: 'auto',
+      highWaterMarkBytes: 0,
+      allowPartial: true
+    }
+    const exposed = await read({ ...options, exposePacked: true })
+    t.equal(exposed.packed, true, `${name} bounded auto selects the packed native path`)
+    t.ok(exposed.statuses.includes(2), `${name} exposed result contains incomplete statuses`)
+
+    const result = await read(options)
+    t.ok(Array.isArray(result), `${name} bounded auto returns the ordinary value array`)
+    t.equal(result.length, keys.length, `${name} bounded auto preserves logical result count`)
+    t.ok(result.some(Buffer.isBuffer), `${name} bounded auto preserves completed values`)
+    t.ok(result.includes(null), `${name} bounded auto maps incomplete statuses to null`)
   }
 
   await db.close()

@@ -289,11 +289,17 @@ async function verifyModel (db, model, keyPool, missingKeys, random, context) {
   for (const packed of [false, true, 'auto']) {
     const syncContext = `${context}: sync getMany packed=${packed}`
     const sync = db._getManySync(query, { valueEncoding: 'buffer', packed })
+    if (packed === 'auto') {
+      assert.ok(Array.isArray(sync), `${syncContext}: unexposed auto result is an array`)
+    }
     validatePackedGetMany(sync, query.length, syncContext)
     assert.deepEqual(decodeGetMany(sync), expectedValues, `${syncContext}: values`)
 
     const asyncContext = `${context}: async getMany packed=${packed}`
     const asyncResult = await db._getManyAsync(query, { valueEncoding: 'buffer', packed })
+    if (packed === 'auto') {
+      assert.ok(Array.isArray(asyncResult), `${asyncContext}: unexposed auto result is an array`)
+    }
     validatePackedGetMany(asyncResult, query.length, asyncContext)
     assert.deepEqual(decodeGetMany(asyncResult), expectedValues, `${asyncContext}: values`)
   }
