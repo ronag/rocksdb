@@ -455,7 +455,14 @@ test('raw sync getMany honours the same allowPartial / exposePacked options', as
     t.equal(inferred[0].toString(), 'value', 'found values remain buffers')
     t.equal(inferred[1], undefined, 'missing keys remain undefined')
     t.equal(inferred[2], null, 'inferred partial reads keep incomplete markers')
-    t.equal(inferred.packed, false, 'sync exposes the packed discriminator by default')
+    t.equal(Object.hasOwn(inferred, 'packed'), false, 'sync omits the packed discriminator by default')
+
+    const exposed = db._getManySync(['found', 'missing', 'partial'], {
+      packed: false,
+      allowPartial: true,
+      exposePacked: true
+    })
+    t.equal(exposed.packed, false, 'sync exposes the packed discriminator on request')
 
     // allowPartial:false turns an incomplete slot into a thrown LEVEL_ABORTED.
     t.throws(
@@ -468,13 +475,12 @@ test('raw sync getMany honours the same allowPartial / exposePacked options', as
       'explicit complete-only sync reads throw on incomplete slots'
     )
 
-    // exposePacked:false drops the discriminator for a JavaScript encoding.
+    // JavaScript encodings also omit the discriminator by default.
     const bare = db._getManySync(['found', 'missing', 'partial'], {
       valueEncoding: 'utf8',
-      allowPartial: true,
-      exposePacked: false
+      allowPartial: true
     })
-    t.equal(Object.hasOwn(bare, 'packed'), false, 'exposePacked:false omits the discriminator')
+    t.equal(Object.hasOwn(bare, 'packed'), false, 'default exposure omits the discriminator')
     t.equal(bare[0], 'value', 'found values decode with the requested encoding')
     t.equal(bare[2], null, 'explicit partial sync reads keep incomplete markers')
   } finally {

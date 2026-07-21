@@ -133,8 +133,12 @@ KiB and the unpacked representation for larger values. `getMany` selects based
 on the average size of the values it found. Iterators select based on the first
 row in the batch, avoiding a second pass or a whole-batch copy.
 
-Every raw result exposes a `packed: boolean` discriminator. Async callbacks
-also receive the selected mode as their third argument:
+Raw `getMany` results omit the `packed` discriminator by default. Set
+`exposePacked: true` to attach it. Buffer results remain distinguishable without
+the property because unpacked results are arrays and packed results are arena
+objects. `slice`-, `utf8`- and `utf-8`-encoded results are always arrays. Raw
+iterator results continue to expose the discriminator. Async callbacks receive
+the selected native mode as their third argument regardless of `exposePacked`:
 
 ```js
 db._getManyAsync(keys, { valueEncoding: 'buffer' }, (err, result, packed) => {
@@ -173,14 +177,14 @@ AbstractLevel encoding manifest. It is only exposed by `_getManySync()`,
 A slice-encoded `getMany` result is always an ordinary value array containing
 `@nxtedition/slice` `Slice` objects. A slice-encoded iterator result always has
 `rows` containing `Slice` objects for its slice fields. If the native read was
-packed, those objects are zero-copy views of its shared byte arena. The
-`packed` discriminator and async callback flag continue to report which native
-representation was selected.
+packed, those objects are zero-copy views of its shared byte arena. Iterator
+results and async callback flags report which native representation was
+selected; `getMany` results report it when `exposePacked: true`.
 
 `utf8`- and `utf-8`-encoded raw results have the same ordinary array or `rows`
-shapes, with their enabled fields converted to strings in JavaScript. The
-`packed` discriminator still reports the native representation selected before
-that conversion.
+shapes, with their enabled fields converted to strings in JavaScript. Iterator
+results, async callback flags and explicitly exposed `getMany` discriminators
+report the native representation selected before that conversion.
 
 The declared contract permits `packed: true` and `packed: 'auto'` only with
 `buffer`, `slice`, `utf8` or `utf-8` for every enabled raw field. Development
@@ -196,7 +200,7 @@ above.
 | omitted | `'auto'` for enabled `buffer` and `slice` fields; `false` otherwise | Recommended default. It gets the small-value packing benefit without changing the default path for `utf8`, `utf-8` and other encodings. |
 | `false` | Individual values and iterator fields | Use when values are usually larger than 8 KiB, the consumer requires the ordinary array/row representation, or predictable latency matters more than reducing allocations. |
 | `true` | One contiguous byte arena | Use for known-small `buffer` or `slice` batches when the consumer benefits from the arena or shared `Slice` backing. Avoid forcing it for large values because creating the arena requires a copy. |
-| `'auto'` | Arena or individual fields, reported by `result.packed` | Use for mixed or unknown sizes when the consumer can handle both representations. It packs `getMany` when the average found value is at most 8 KiB and iterators when the first row is at most 8 KiB. |
+| `'auto'` | Arena or individual fields, reported by callbacks, iterator results or explicitly exposed `getMany` results | Use for mixed or unknown sizes when the consumer can handle both representations. It packs `getMany` when the average found value is at most 8 KiB and iterators when the first row is at most 8 KiB. |
 
 For `buffer`, omitting `packed` is usually the right choice. For `slice`, the
 same default can produce zero-copy `Slice` views over a shared arena. For

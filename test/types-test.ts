@@ -9,7 +9,6 @@ import {
   RocksBatchSlice,
   RocksColumn,
   RocksFormat,
-  RocksGetManyReadResult,
   RocksGetManyOptions,
   RocksLevel,
   RocksPackedGetManyResult,
@@ -21,6 +20,8 @@ import {
   RocksRawUnboundedGetManyOptions,
   RocksRawIteratorResult,
   RocksStatistics,
+  RocksUnexposedGetManyReadResult,
+  RocksUnexposedPackedGetManyResult,
   RocksUpdate,
   RocksWriteBufferManager,
   SliceLike,
@@ -106,13 +107,18 @@ expectType<number>(statistics.getStatistics().bytesRead)
 expectType<true>(statistics.setStatisticsEnabled(false))
 
 const rawValues = db._getManySync([slice, Buffer.from('key'), 'key'])
-expectTrue<Equal<typeof rawValues, RocksGetManyReadResult<'buffer', 'auto', false>>>()
+expectTrue<Equal<typeof rawValues, RocksUnexposedGetManyReadResult<'buffer', 'auto', false>>>()
 const readonlyRawKeys = [slice, Buffer.from('key'), 'key'] as const
 const readonlyRawValues = db._getManySync(readonlyRawKeys)
-expectTrue<Equal<typeof readonlyRawValues, RocksGetManyReadResult<'buffer', 'auto', false>>>()
+expectTrue<
+  Equal<typeof readonlyRawValues, RocksUnexposedGetManyReadResult<'buffer', 'auto', false>>
+>()
 const defaultAsyncRawValues = db._getManyAsync(readonlyRawKeys)
 expectTrue<
-  Equal<Awaited<typeof defaultAsyncRawValues>, RocksGetManyReadResult<'buffer', 'auto', false>>
+  Equal<
+    Awaited<typeof defaultAsyncRawValues>,
+    RocksUnexposedGetManyReadResult<'buffer', 'auto', false>
+  >
 >()
 
 type CompleteRawUtf8Value = RocksRawGetManyResult<'utf8', false, false>[number]
@@ -128,7 +134,10 @@ const unboundedRawOptions: RocksRawUnboundedGetManyOptions<'buffer', false> = {
 }
 const unboundedRawValues = db._getManyAsync(readonlyRawKeys, unboundedRawOptions)
 expectTrue<
-  Equal<Awaited<typeof unboundedRawValues>, RocksRawGetManyResult<'buffer', false, true>>
+  Equal<
+    Awaited<typeof unboundedRawValues>,
+    RocksRawGetManyValues<'buffer', true> | RocksRawGetManyResult<'buffer', false, true>
+  >
 >()
 
 const boundedRawOptions: RocksRawBoundedGetManyOptions<'buffer', false> = {
@@ -136,28 +145,31 @@ const boundedRawOptions: RocksRawBoundedGetManyOptions<'buffer', false> = {
   highWaterMarkBytes: 0,
 }
 const boundedRawValues = db._getManyAsync(readonlyRawKeys, boundedRawOptions)
-expectTrue<Equal<Awaited<typeof boundedRawValues>, RocksRawGetManyResult<'buffer'>>>()
+expectTrue<
+  Equal<
+    Awaited<typeof boundedRawValues>,
+    RocksRawGetManyValues<'buffer'> | RocksRawGetManyResult<'buffer'>
+  >
+>()
 
 const unboundedSliceValues = db._getManyAsync([slice], {
   packed: true,
   valueEncoding: 'slice',
 })
-expectTrue<
-  Equal<Awaited<typeof unboundedSliceValues>, RocksRawGetManyResult<'slice', true, false>>
->()
+expectTrue<Equal<Awaited<typeof unboundedSliceValues>, RocksRawGetManyValues<'slice', false>>>()
 
 const timedAutoUtf8Values = db._getManyAsync([slice], {
   packed: 'auto',
   timeout: 1,
   valueEncoding: 'utf8',
 })
-expectTrue<Equal<Awaited<typeof timedAutoUtf8Values>, RocksRawGetManyResult<'utf8', boolean>>>()
+expectTrue<Equal<Awaited<typeof timedAutoUtf8Values>, RocksRawGetManyValues<'utf8'>>>()
 
 const packedBudgetValues = db._getManyAsync([slice], {
   highWaterMarkBytes: 0,
   packed: true,
 })
-expectTrue<Equal<Awaited<typeof packedBudgetValues>, RocksPackedGetManyResult>>()
+expectTrue<Equal<Awaited<typeof packedBudgetValues>, RocksUnexposedPackedGetManyResult>>()
 
 const annotatedRawOptions: RocksRawGetManyOptions<'buffer', false> = {
   packed: false,
@@ -165,7 +177,10 @@ const annotatedRawOptions: RocksRawGetManyOptions<'buffer', false> = {
 const annotatedRawValues = db._getManyAsync(readonlyRawKeys, annotatedRawOptions)
 // Pre-annotated options widen allowPartial to boolean (see note above).
 expectTrue<
-  Equal<Awaited<typeof annotatedRawValues>, RocksRawGetManyResult<'buffer', false, true>>
+  Equal<
+    Awaited<typeof annotatedRawValues>,
+    RocksRawGetManyValues<'buffer', true> | RocksRawGetManyResult<'buffer', false, true>
+  >
 >()
 
 declare const optionalRawBudget: number | undefined
@@ -173,7 +188,7 @@ const optionalBudgetRawValues = db._getManyAsync(readonlyRawKeys, {
   highWaterMarkBytes: optionalRawBudget,
   packed: false,
 })
-expectTrue<Equal<Awaited<typeof optionalBudgetRawValues>, RocksRawGetManyResult<'buffer'>>>()
+expectTrue<Equal<Awaited<typeof optionalBudgetRawValues>, RocksRawGetManyValues<'buffer'>>>()
 
 // A bounded read with allowPartial explicitly disabled rejects incomplete slots.
 const explicitCompleteRawValues = db._getManyAsync(readonlyRawKeys, {
@@ -182,7 +197,7 @@ const explicitCompleteRawValues = db._getManyAsync(readonlyRawKeys, {
   allowPartial: false,
 })
 expectTrue<
-  Equal<Awaited<typeof explicitCompleteRawValues>, RocksRawGetManyResult<'buffer', false, false>>
+  Equal<Awaited<typeof explicitCompleteRawValues>, RocksRawGetManyValues<'buffer', false>>
 >()
 
 // allowPartial:true opts an unbounded read into null-marked incomplete slots.
@@ -190,86 +205,69 @@ const explicitPartialRawValues = db._getManyAsync(readonlyRawKeys, {
   packed: false,
   allowPartial: true,
 })
-expectTrue<
-  Equal<Awaited<typeof explicitPartialRawValues>, RocksRawGetManyResult<'buffer', false, true>>
->()
+expectTrue<Equal<Awaited<typeof explicitPartialRawValues>, RocksRawGetManyValues<'buffer', true>>>()
 
 // A dynamic boolean allowPartial keeps the incomplete markers in the type.
 const dynamicPartialRawValues = db._getManyAsync(readonlyRawKeys, {
   packed: false,
   allowPartial: booleanFlag,
 })
-expectTrue<
-  Equal<Awaited<typeof dynamicPartialRawValues>, RocksRawGetManyResult<'buffer', false, true>>
->()
+expectTrue<Equal<Awaited<typeof dynamicPartialRawValues>, RocksRawGetManyValues<'buffer', true>>>()
 
 const optionalPartialRawValues = db._getManyAsync(readonlyRawKeys, {
   packed: false,
   allowPartial: optionalBooleanFlag,
 })
-expectTrue<
-  Equal<Awaited<typeof optionalPartialRawValues>, RocksRawGetManyResult<'buffer', false, true>>
->()
+expectTrue<Equal<Awaited<typeof optionalPartialRawValues>, RocksRawGetManyValues<'buffer', true>>>()
 
 // Unbounded with no allowPartial defaults to complete-only (no null markers).
 const implicitCompleteRawValues = db._getManyAsync(readonlyRawKeys, { packed: false })
 expectTrue<
-  Equal<Awaited<typeof implicitCompleteRawValues>, RocksRawGetManyResult<'buffer', false, false>>
+  Equal<Awaited<typeof implicitCompleteRawValues>, RocksRawGetManyValues<'buffer', false>>
 >()
-expectType<RocksRawGetManyResult<'utf8', false, false>>(
+expectType<RocksRawGetManyValues<'utf8', false>>(
   db._getManySync([slice], { valueEncoding: 'utf8' })
 )
-expectType<Promise<RocksRawGetManyResult<'utf8', false, true>>>(
+expectType<Promise<RocksRawGetManyValues<'utf8', true>>>(
   db._getManyAsync([slice], { valueEncoding: 'utf8', allowPartial: true })
 )
-expectType<RocksPackedGetManyResult>(db._getManySync([slice], { packed: true }))
-expectType<Promise<RocksPackedGetManyResult>>(db._getManyAsync([slice], { packed: true }))
-expectType<RocksPackedGetManyResult | RocksRawGetManyResult<'buffer', false, false>>(
+expectType<RocksUnexposedPackedGetManyResult>(db._getManySync([slice], { packed: true }))
+expectType<Promise<RocksUnexposedPackedGetManyResult>>(db._getManyAsync([slice], { packed: true }))
+expectType<RocksUnexposedGetManyReadResult<'buffer', boolean, false>>(
   db._getManySync([slice], { packed: booleanFlag })
 )
-expectType<RocksPackedGetManyResult | RocksRawGetManyResult<'buffer', false, false>>(
+expectType<RocksUnexposedGetManyReadResult<'buffer', 'auto', false>>(
   db._getManySync([slice], { packed: 'auto' })
 )
 const autoRawValues = db._getManyAsync([slice], { packed: 'auto' })
 expectTrue<
-  Equal<
-    Awaited<typeof autoRawValues>,
-    RocksPackedGetManyResult | RocksRawGetManyResult<'buffer', false, false>
-  >
+  Equal<Awaited<typeof autoRawValues>, RocksUnexposedGetManyReadResult<'buffer', 'auto', false>>
 >()
 const unexposedSliceValues = db._getManyAsync([slice], {
   packed: 'auto',
   valueEncoding: 'slice',
-  exposePacked: false,
 })
 expectTrue<Equal<Awaited<typeof unexposedSliceValues>, RocksRawGetManyValues<'slice', false>>>()
 unexposedSliceValues.then((values) => {
-  // @ts-expect-error exposePacked false omits the packed discriminator
+  // @ts-expect-error The default omits the packed discriminator
   void values.packed
 })
-// @ts-expect-error exposePacked:false requires an explicit JavaScript encoding
-db._getManyAsync([slice], { packed: 'auto', exposePacked: false })
-// @ts-expect-error Buffer encoding cannot omit the packed discriminator
-db._getManyAsync([slice], { packed: 'auto', valueEncoding: 'buffer', exposePacked: false })
 db._getManyAsync([slice], { packed: 'auto' }, (err, result, packed) => {
   expectType<Error | null | undefined>(err)
   expectTrue<
-    Equal<
-      typeof result,
-      RocksPackedGetManyResult | RocksRawGetManyResult<'buffer', false, false> | undefined
-    >
+    Equal<typeof result, RocksUnexposedGetManyReadResult<'buffer', 'auto', false> | undefined>
   >()
   expectTrue<Equal<typeof packed, boolean | undefined>>()
-  if (result?.packed) expectType<RocksPackedGetManyResult>(result)
+  if (result && !Array.isArray(result)) expectType<RocksUnexposedPackedGetManyResult>(result)
 })
 db._getManyAsync([slice], { packed: false, valueEncoding: 'utf8' }, (err, result, packed) => {
   expectType<Error | null | undefined>(err)
-  expectTrue<Equal<typeof result, RocksRawGetManyResult<'utf8', false, false> | undefined>>()
+  expectTrue<Equal<typeof result, RocksRawGetManyValues<'utf8', false> | undefined>>()
   expectTrue<Equal<typeof packed, false | undefined>>()
 })
 db._getManyAsync([slice], { packed: true }, (err, result, packed) => {
   expectType<Error | null | undefined>(err)
-  expectTrue<Equal<typeof result, RocksPackedGetManyResult | undefined>>()
+  expectTrue<Equal<typeof result, RocksUnexposedPackedGetManyResult | undefined>>()
   expectTrue<Equal<typeof packed, true | undefined>>()
 })
 db._getManyAsync(
@@ -277,13 +275,13 @@ db._getManyAsync(
   { packed: false, timeout: 1, allowPartial: false },
   (err, result, packed) => {
     expectType<Error | null | undefined>(err)
-    expectTrue<Equal<typeof result, RocksRawGetManyResult<'buffer', false, false> | undefined>>()
+    expectTrue<Equal<typeof result, RocksRawGetManyValues<'buffer', false> | undefined>>()
     expectTrue<Equal<typeof packed, false | undefined>>()
   }
 )
 db._getManyAsync([slice], { packed: false, allowPartial: booleanFlag }, (err, result, packed) => {
   expectType<Error | null | undefined>(err)
-  expectTrue<Equal<typeof result, RocksRawGetManyResult<'buffer', false, true> | undefined>>()
+  expectTrue<Equal<typeof result, RocksRawGetManyValues<'buffer', true> | undefined>>()
   expectTrue<Equal<typeof packed, false | undefined>>()
 })
 db._getManyAsync(
@@ -291,7 +289,7 @@ db._getManyAsync(
   { packed: false, allowPartial: optionalBooleanFlag },
   (err, result, packed) => {
     expectType<Error | null | undefined>(err)
-    expectTrue<Equal<typeof result, RocksRawGetManyResult<'buffer', false, true> | undefined>>()
+    expectTrue<Equal<typeof result, RocksRawGetManyValues<'buffer', true> | undefined>>()
     expectTrue<Equal<typeof packed, false | undefined>>()
   }
 )
@@ -304,42 +302,63 @@ db._getManyAsync(
     expectTrue<Equal<typeof packed, boolean | undefined>>()
   }
 )
+db._getManyAsync([slice], { packed: 'auto', exposePacked: true }, (err, result, packed) => {
+  expectType<Error | null | undefined>(err)
+  expectTrue<
+    Equal<
+      typeof result,
+      RocksPackedGetManyResult | RocksRawGetManyResult<'buffer', false, false> | undefined
+    >
+  >()
+  expectTrue<Equal<typeof packed, boolean | undefined>>()
+  if (result?.packed) expectType<RocksPackedGetManyResult>(result)
+})
 expectType<RocksPackedGetManyResult>(
-  db._getManySync([slice], { packed: true, valueEncoding: 'buffer' })
+  db._getManySync([slice], { packed: true, valueEncoding: 'buffer', exposePacked: true })
 )
 expectType<RocksRawGetManyResult<'slice', true, false>>(
-  db._getManySync([slice], { packed: true, valueEncoding: 'slice' })
+  db._getManySync([slice], { packed: true, valueEncoding: 'slice', exposePacked: true })
 )
 expectType<RocksRawGetManyResult<'slice', boolean, false>>(
-  db._getManySync([slice], { packed: 'auto', valueEncoding: 'slice' })
+  db._getManySync([slice], { packed: 'auto', valueEncoding: 'slice', exposePacked: true })
 )
 expectType<RocksRawGetManyResult<'slice', boolean, false>>(
-  db._getManySync([slice], { valueEncoding: 'slice' })
+  db._getManySync([slice], { valueEncoding: 'slice', exposePacked: true })
 )
 expectType<RocksRawGetManyResult<'utf8', true, false>>(
-  db._getManySync([slice], { packed: true, valueEncoding: 'utf8' })
+  db._getManySync([slice], { packed: true, valueEncoding: 'utf8', exposePacked: true })
 )
 expectType<RocksRawGetManyResult<'utf8', boolean, false>>(
-  db._getManySync([slice], { packed: 'auto', valueEncoding: 'utf8' })
+  db._getManySync([slice], { packed: 'auto', valueEncoding: 'utf8', exposePacked: true })
 )
 expectType<RocksRawGetManyResult<'utf-8', true, false>>(
-  db._getManySync([slice], { packed: true, valueEncoding: 'utf-8' })
+  db._getManySync([slice], { packed: true, valueEncoding: 'utf-8', exposePacked: true })
 )
 expectType<RocksRawGetManyResult<'utf8', boolean, false>>(
-  db._getManySync([slice], { packed: booleanFlag, valueEncoding: 'utf8' })
+  db._getManySync([slice], {
+    packed: booleanFlag,
+    valueEncoding: 'utf8',
+    exposePacked: true,
+  })
 )
 // Sync honours allowPartial and exposePacked just like the async path.
-expectType<RocksRawGetManyResult<'buffer', false, true>>(
+expectType<RocksRawGetManyValues<'buffer', true>>(
   db._getManySync([slice], { packed: false, highWaterMarkBytes: 0 })
 )
 expectType<RocksRawGetManyResult<'buffer', false, false>>(
-  db._getManySync([slice], { packed: false, highWaterMarkBytes: 0, allowPartial: false })
+  db._getManySync([slice], {
+    packed: false,
+    highWaterMarkBytes: 0,
+    allowPartial: false,
+    exposePacked: true,
+  })
 )
 expectType<RocksRawGetManyValues<'utf8', false>>(
-  db._getManySync([slice], { valueEncoding: 'utf8', exposePacked: false })
+  db._getManySync([slice], { valueEncoding: 'utf8' })
 )
-// @ts-expect-error Sync exposePacked:false also requires a JavaScript encoding
-db._getManySync([slice], { valueEncoding: 'buffer', exposePacked: false })
+expectType<RocksUnexposedGetManyReadResult<'buffer', 'auto', false>>(
+  db._getManySync([slice], { valueEncoding: 'buffer', exposePacked: false })
+)
 // @ts-expect-error Packed getMany does not support view output
 db._getManySync([slice], { packed: true, valueEncoding: 'view' })
 // @ts-expect-error Raw keys cannot be null
@@ -397,10 +416,10 @@ const packedIteratorKeys = iterator._nextvSync(10, { packed: true })
 expectType<Buffer | undefined>(packedIteratorKeys.lastKey)
 expectType<Uint32Array>(packedIteratorKeys.keys)
 expectType<Uint32Array>(packedIteratorKeys.values)
-expectType<RocksPackedGetManyResult | RocksRawGetManyResult<'buffer', false, false>>(
+expectType<RocksUnexposedGetManyReadResult<'buffer', 'auto', false>>(
   db._getManySync({ offsets: packedIteratorKeys.keys, buffer: packedIteratorKeys.buffer })
 )
-expectType<Promise<RocksPackedGetManyResult | RocksRawGetManyResult<'buffer', false, false>>>(
+expectType<Promise<RocksUnexposedGetManyReadResult<'buffer', 'auto', false>>>(
   db._getManyAsync({ offsets: packedIteratorKeys.keys, buffer: packedIteratorKeys.buffer })
 )
 expectType<RocksPackedIteratorResult | RocksRawIteratorResult<Buffer, Buffer>>(
@@ -510,8 +529,7 @@ const valuesOnlyIterator = db._iterator({
 })
 expectType<
   Promise<
-    | RocksPackedIteratorResult<false, true>
-    | RocksRawIteratorResult<string, Buffer, false, true>
+    RocksPackedIteratorResult<false, true> | RocksRawIteratorResult<string, Buffer, false, true>
   >
 >(valuesOnlyIterator._nextvAsync(10))
 const packedValuesOnly = valuesOnlyIterator._nextvAsync(10, { packed: true })
@@ -521,7 +539,7 @@ packedValuesOnly.then((input) => {
   expectType<Uint32Array>(input.values)
   // @ts-expect-error Packed getMany input must contain an offsets table
   db._getManySync(input)
-  expectType<RocksPackedGetManyResult | RocksRawGetManyResult<'buffer', false, false>>(
+  expectType<RocksUnexposedGetManyReadResult<'buffer', 'auto', false>>(
     db._getManySync({ offsets: input.values, buffer: input.buffer })
   )
 })
@@ -534,15 +552,14 @@ const keysOnlyIterator = db._iterator({
 })
 expectType<
   Promise<
-    | RocksPackedIteratorResult<true, false>
-    | RocksRawIteratorResult<Buffer, string, true, false>
+    RocksPackedIteratorResult<true, false> | RocksRawIteratorResult<Buffer, string, true, false>
   >
 >(keysOnlyIterator._nextvAsync(10))
 const packedKeysOnly = keysOnlyIterator._nextvSync(10, { packed: true })
 expectType<RocksPackedIteratorResult<true, false>>(packedKeysOnly)
 expectType<Uint32Array>(packedKeysOnly.keys)
 expectType<undefined>(packedKeysOnly.values)
-expectType<RocksPackedGetManyResult | RocksRawGetManyResult<'buffer', false, false>>(
+expectType<RocksUnexposedGetManyReadResult<'buffer', 'auto', false>>(
   db._getManySync({ offsets: packedKeysOnly.keys, buffer: packedKeysOnly.buffer })
 )
 
@@ -554,8 +571,7 @@ const noFieldsRawIterator = db._iterator({
 })
 expectType<
   Promise<
-    | RocksPackedIteratorResult<false, false>
-    | RocksRawIteratorResult<string, Slice, false, false>
+    RocksPackedIteratorResult<false, false> | RocksRawIteratorResult<string, Slice, false, false>
   >
 >(noFieldsRawIterator._nextvAsync(10))
 expectType<RocksPackedIteratorResult<false, false>>(
