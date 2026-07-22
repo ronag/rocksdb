@@ -49,7 +49,8 @@ try {
   const getOpts = {
     valueEncoding: 'buffer',
     fillCache: true,
-    packed: false
+    packed: false,
+    exposePacked: true
   }
   const packedGetOpts = { ...getOpts, packed: true }
   const autoGetOpts = { ...getOpts, packed: 'auto' }
@@ -72,9 +73,12 @@ try {
 
   for (const size of [64, 1024, 4096, 16 * 1024]) {
     const label = size < 1024 ? `${size} B` : `${size / 1024} KiB`
+    const names = []
     const keys = []
     for (let n = 0; n < 256; n++) {
-      const key = Buffer.from(`${n}-${size}`)
+      const name = `${n}-${size}`.padEnd(64, 'x')
+      const key = Buffer.from(name)
+      names.push(name)
       keys.push(key)
       await db.put(key, Buffer.alloc(size, 0x5a))
     }
@@ -100,9 +104,12 @@ try {
       })
 
       if (size === 64) {
-        const stringKeys = Array.from({ length: keys.length }, (_, n) => `${n}-${size}`)
+        bench('_getManySync string keys packed=false ' + label, () => {
+          consumeResult(db._getManySync(names, getOpts))
+        })
+
         bench('_getManyAsync string keys packed=false ' + label, async () => {
-          consumeResult(await db._getManyAsync(stringKeys, getOpts))
+          consumeResult(await db._getManyAsync(names, getOpts))
         })
       }
 

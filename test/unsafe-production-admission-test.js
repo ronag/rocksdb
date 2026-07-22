@@ -84,6 +84,22 @@ test('production unsafe paths avoid redundant copies while native admission owns
       }
       assert.deepEqual(values.map(value => value.toString()), ['value-a', 'value-b'])
 
+      const originalGetManySync = binding.db_get_many_sync
+      binding.db_get_many_sync = function (context, keys, options) {
+        assert.strictEqual(keys, stringKeys, 'raw sync getMany forwards the original keys array')
+        assert.equal(typeof keys[0], 'string', 'raw sync getMany leaves strings for native conversion')
+        return originalGetManySync(context, keys, options)
+      }
+      try {
+        values = db._getManySync(stringKeys, {
+          valueEncoding: 'buffer',
+          packed: false
+        })
+      } finally {
+        binding.db_get_many_sync = originalGetManySync
+      }
+      assert.deepEqual(values.map(value => value.toString()), ['value-a', 'value-b'])
+
       const encodingOptions = { valueEncoding: 'slice', packed: true }
       const encodedValues = db._getManyAsync(['a'], encodingOptions)
       encodingOptions.valueEncoding = 'utf8'
