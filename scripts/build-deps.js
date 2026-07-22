@@ -185,6 +185,49 @@ function cmakeMarchFlags () {
   return [`-DCMAKE_C_FLAGS=${flags}`, `-DCMAKE_CXX_FLAGS=${flags}`]
 }
 
+// Route compiler invocations through ccache when it is available, so repeated
+// from-source builds (which recompile abseil/re2/zstd + rocksdb) reuse cached
+// object files. cmake takes a compiler launcher; node-gyp (install.js /
+// prebuildify.js) and zstd's plain Makefile take CC/CXX instead. Opt out with
+// ROCKS_LEVEL_CCACHE=0 — the Docker build sets that because it already routes
+// cc/g++ through ccache via a PATH masquerade, and a second, script-level
+// ccache layer would recurse ("ccache ccache gcc") and error.
+let ccacheAvailable
+function ccacheEnabled () {
+  if (ccacheAvailable === undefined) {
+    const flag = (process.env.ROCKS_LEVEL_CCACHE || '').toLowerCase()
+    if (flag === '0' || flag === 'false' || flag === 'off') {
+      ccacheAvailable = false
+    } else {
+      try {
+        execFileSync('ccache', ['--version'], { stdio: 'ignore' })
+        ccacheAvailable = true
+      } catch {
+        ccacheAvailable = false
+      }
+    }
+  }
+  return ccacheAvailable
+}
+
+function cmakeCcacheFlags () {
+  return ccacheEnabled()
+    ? ['-DCMAKE_C_COMPILER_LAUNCHER=ccache', '-DCMAKE_CXX_COMPILER_LAUNCHER=ccache']
+    : []
+}
+
+// CC/CXX overrides for tools without a launcher concept (node-gyp, zstd's
+// Makefile). Wrap any caller-provided compiler and never double-wrap, so an
+// explicit CC="clang -foo" still gets cached.
+function ccacheCompilerEnv (env = process.env) {
+  if (!ccacheEnabled()) return {}
+  const wrap = (value, fallback) => {
+    const base = value && value.trim() ? value.trim() : fallback
+    return /(^|\s|\/)ccache(\s|$)/.test(base) ? base : `ccache ${base}`
+  }
+  return { CC: wrap(env.CC, 'cc'), CXX: wrap(env.CXX, 'c++') }
+}
+
 function stampPath (prefix) {
   return path.join(prefix, '.stamp.json')
 }
@@ -249,6 +292,7 @@ function buildAbseil (prefix, src) {
     '-DABSL_BUILD_TESTING=OFF',
     '-DABSL_PROPAGATE_CXX_STD=ON',
     ...CMAKE_COMMON_FLAGS,
+    ...cmakeCcacheFlags(),
     ...cmakeMarchFlags(),
     ...macOsDeploymentFlags(),
     ...macOsArchFlags()
@@ -271,6 +315,7 @@ function buildRe2 (prefix, src) {
     '-DBUILD_SHARED_LIBS=OFF',
     '-DRE2_BUILD_TESTING=OFF',
     ...CMAKE_COMMON_FLAGS,
+    ...cmakeCcacheFlags(),
     ...cmakeMarchFlags(),
     ...macOsDeploymentFlags(),
     ...macOsArchFlags()
@@ -292,7 +337,11 @@ function buildZstd (prefix, src) {
   const lib = path.join(src, 'lib')
   const deploymentFlag = process.platform === 'darwin' ? `-mmacosx-version-min=${MACOS_DEPLOYMENT_TARGET}` : ''
   const cflags = ['-fPIC', '-O2', marchFlags(), deploymentFlag].filter(Boolean).join(' ')
-  sh('make', ['-C', lib, '-j', jobs(), `CFLAGS=${cflags}`, 'libzstd.a'])
+  const makeArgs = ['-C', lib, '-j', jobs(), `CFLAGS=${cflags}`]
+  const { CC } = ccacheCompilerEnv()
+  if (CC) makeArgs.push(`CC=${CC}`)
+  makeArgs.push('libzstd.a')
+  sh('make', makeArgs)
 
   fs.copyFileSync(path.join(lib, 'libzstd.a'), path.join(prefix, 'lib', 'libzstd.a'))
   for (const header of ['zstd.h', 'zstd_errors.h', 'zdict.h']) {
@@ -347,6 +396,8 @@ if (require.main === module) {
 
 module.exports = {
   DEPENDENCIES,
+  ccacheCompilerEnv,
+  ccacheEnabled,
   cloneAtCommit,
   createSha1ObjectFormatCheck,
   ensure,

@@ -40,6 +40,12 @@ ENV PATH="/usr/lib/ccache:${PATH}"
 ENV CCACHE_DIR=/ccache
 ENV CCACHE_MAXSIZE=2G
 
+# The build scripts (build-deps.js / install.js) add their own ccache layer for
+# local dev builds. Disable it here: this image already routes cc/g++ through
+# ccache via the PATH masquerade above, and a second layer would invoke
+# "ccache ccache gcc", which ccache rejects as a recursive invocation.
+ENV ROCKS_LEVEL_CCACHE=0
+
 # Build abseil/re2/zstd before copying package metadata so the expensive native
 # dependency layer survives both source edits and package-only changes. These
 # scripts use only Node built-ins; npm dependencies are installed afterward for

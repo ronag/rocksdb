@@ -17,6 +17,8 @@ execFileSync(process.execPath, [require.resolve('prebuildify/bin.js'), '--napi',
     ...process.env,
     GYP_DEFINES: '',
     JOBS: buildDeps.jobs(),
-    ROCKS_LEVEL_DEPS_PREFIX: prefix
+    ROCKS_LEVEL_DEPS_PREFIX: prefix,
+    // Cache the rocksdb + binding.cc compile via ccache when available.
+    ...buildDeps.ccacheCompilerEnv(process.env)
   }
 })

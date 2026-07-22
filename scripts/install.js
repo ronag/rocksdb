@@ -46,7 +46,10 @@ function nativeBuildEnvironment (prefix, env = process.env, jobs = buildDeps.job
     // requested rebuild.
     npm_config_build_from_source: 'true',
     JOBS: jobs,
-    ROCKS_LEVEL_DEPS_PREFIX: prefix
+    ROCKS_LEVEL_DEPS_PREFIX: prefix,
+    // Cache the rocksdb + binding.cc compile across rebuilds when ccache is
+    // present (no-op otherwise); off in Docker via ROCKS_LEVEL_CCACHE=0.
+    ...buildDeps.ccacheCompilerEnv(env)
   }
 }
 

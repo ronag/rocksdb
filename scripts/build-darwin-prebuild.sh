@@ -94,7 +94,13 @@ CANDIDATE_DIR="$OUT_DIR/prebuilds/$PLATFORM"
 # below prebuilds ensures the candidate and destination live on one filesystem.
 # Pin the matching persistent dependency prefix just like scripts/prebuildify.js
 # so a caller's temporary ROCKS_LEVEL_DEPS_PREFIX cannot contaminate a release.
-GYP_DEFINES= ROCKS_LEVEL_DEPS_PREFIX="$DEPS_PREFIX" JOBS="${JOBS:-16}" \
+BUILD_ENV=(GYP_DEFINES= ROCKS_LEVEL_DEPS_PREFIX="$DEPS_PREFIX" JOBS="${JOBS:-16}")
+# Cache the rocksdb + binding.cc compile across release rebuilds when ccache is
+# available (matches scripts/build-deps.js); ROCKS_LEVEL_CCACHE=0 opts out.
+if [ "${ROCKS_LEVEL_CCACHE:-}" != "0" ] && command -v ccache >/dev/null 2>&1; then
+  BUILD_ENV+=(CC="ccache ${CC:-cc}" CXX="ccache ${CXX:-c++}")
+fi
+env "${BUILD_ENV[@]}" \
   npx prebuildify -t "$1" --napi --strip --arch arm64 --out "$OUT_DIR"
 
 EXPECTED_PREBUILD="$CANDIDATE_DIR/$ADDON"
