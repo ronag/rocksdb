@@ -180,8 +180,10 @@ values into the same packed input format. The result can be prepared once and
 passed directly to any number of raw multi-get calls:
 
 ```js
+const { Slice } = require('@nxtedition/slice')
 const { pack } = require('@nxtedition/rocksdb')
 
+const slice = Slice.fromString('three')
 const keys = pack(['one', Buffer.from('two'), slice])
 const values = await db._getManyAsync(keys)
 ```

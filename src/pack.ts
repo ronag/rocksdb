@@ -122,18 +122,15 @@ export function pack(values: readonly PackValue[], buffers?: PackBuffers): PackR
   let position = 0
   for (let index = 0; index < byteValues.length; index++) {
     const value = byteValues[index]
-    const valueByteLength = typeof value === 'string' ? Buffer.byteLength(value) : value.byteLength
     const offsetIndex = index * 2
 
     offsets[offsetIndex] = position
-    offsets[offsetIndex + 1] = valueByteLength
-
-    if (typeof value === 'string') {
-      buffer.write(value, position, valueByteLength, 'utf8')
-    } else {
-      value.buffer.copy(buffer, position, value.byteOffset, value.byteOffset + value.byteLength)
-    }
-    position += valueByteLength
+    const written =
+      typeof value === 'string'
+        ? buffer.write(value, position, 'utf8')
+        : value.buffer.copy(buffer, position, value.byteOffset, value.byteOffset + value.byteLength)
+    offsets[offsetIndex + 1] = written
+    position += written
   }
 
   const reusable = { buffer, offsets }
