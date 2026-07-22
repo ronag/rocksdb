@@ -25,6 +25,7 @@ test('raw synchronous write returns scoped PerfContext timers', async function (
   for (const [name, value] of Object.entries(profile)) {
     t.equal(typeof value, 'number', `${name} is a number`)
     t.ok(Number.isFinite(value) && value >= 0, `${name} is a non-negative finite duration`)
+    t.ok(value < 60e9, `${name} is a plausible single-write duration`)
   }
   t.ok(
     profile.writeWalNanos + profile.writeMemtableNanos + profile.writePreAndPostProcessNanos > 0,
