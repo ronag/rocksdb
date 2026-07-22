@@ -193,6 +193,8 @@ back to a later call to avoid reallocating when they are large enough. Reuse
 them only after any read borrowing the packed input has settled:
 
 ```js
+const { pack, RocksGetManyUnsafe } = require('@nxtedition/rocksdb')
+
 let buffers
 
 const first = pack(firstKeys, buffers)
