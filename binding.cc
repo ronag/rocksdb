@@ -3698,22 +3698,141 @@ static napi_status GetPackedGetManyInput(napi_env env,
   return napi_ok;
 }
 
+struct OwnedGetManyKey {
+  napi_value value = nullptr;
+  size_t offset = 0;
+  size_t length = 0;
+};
+
+class AsyncGetManyStringSlabPool {
+ public:
+  std::string Acquire(const size_t minimumCapacity) {
+    std::lock_guard lock(mutex_);
+    if (slabs_.empty()) return {};
+
+    // Prefer the smallest slab that already fits. If none does, grow the
+    // largest retained slab and leave smaller ones for smaller requests.
+    auto slab = slabs_.end();
+    for (auto candidate = slabs_.begin(); candidate != slabs_.end(); ++candidate) {
+      if (candidate->capacity() >= minimumCapacity &&
+          (slab == slabs_.end() || candidate->capacity() < slab->capacity())) {
+        slab = candidate;
+      }
+    }
+    if (slab == slabs_.end()) {
+      slab = std::max_element(
+          slabs_.begin(), slabs_.end(), [](const auto& left, const auto& right) {
+            return left.capacity() < right.capacity();
+          });
+    }
+    retainedCapacity_ -= slab->capacity();
+    auto result = std::move(*slab);
+    slabs_.erase(slab);
+    return result;
+  }
+
+  void Release(std::string&& slab) noexcept {
+    try {
+      slab.clear();
+      const auto capacity = slab.capacity();
+      if (capacity == 0 || capacity > kMaxRetainedCapacity) return;
+
+      std::lock_guard lock(mutex_);
+      if (slabs_.size() >= kMaxRetainedSlabs ||
+          capacity > kMaxRetainedCapacity - retainedCapacity_) {
+        return;
+      }
+      slabs_.push_back(std::move(slab));
+      retainedCapacity_ += capacity;
+    } catch (...) {
+      // Pooling is opportunistic. Allocation or teardown failures must not
+      // turn a successfully completed read into a process-level exception.
+    }
+  }
+
+ private:
+  static constexpr size_t kMaxRetainedSlabs = 32;
+  static constexpr size_t kMaxRetainedCapacity = 8 * 1024 * 1024;
+
+  std::mutex mutex_;
+  std::vector<std::string> slabs_;
+  size_t retainedCapacity_ = 0;
+};
+
+static AsyncGetManyStringSlabPool asyncGetManyStringSlabPool;
+
+class AsyncGetManyStringSlabLease {
+ public:
+  AsyncGetManyStringSlabLease() = default;
+
+  ~AsyncGetManyStringSlabLease() { Release(); }
+
+  AsyncGetManyStringSlabLease(AsyncGetManyStringSlabLease&& other) noexcept
+      : data_(std::move(other.data_)), active_(std::exchange(other.active_, false)) {}
+
+  AsyncGetManyStringSlabLease& operator=(AsyncGetManyStringSlabLease&& other) noexcept {
+    if (this != &other) {
+      Release();
+      data_ = std::move(other.data_);
+      active_ = std::exchange(other.active_, false);
+    }
+    return *this;
+  }
+
+  AsyncGetManyStringSlabLease(const AsyncGetManyStringSlabLease&) = delete;
+  AsyncGetManyStringSlabLease& operator=(const AsyncGetManyStringSlabLease&) = delete;
+
+  std::string& Acquire(const size_t minimumCapacity) {
+    if (!active_) {
+      data_ = asyncGetManyStringSlabPool.Acquire(minimumCapacity);
+      active_ = true;
+    }
+    return data_;
+  }
+
+  const std::string& data() const { return data_; }
+
+ private:
+  void Release() noexcept {
+    if (!active_) return;
+    active_ = false;
+    asyncGetManyStringSlabPool.Release(std::move(data_));
+  }
+
+  std::string data_;
+  bool active_ = false;
+};
+
 struct OwnedGetManyKeys {
   std::vector<std::string> array;
   std::string packedData;
-  std::vector<uint32_t> packedOffsets;
+  std::vector<OwnedGetManyKey> packedKeys;
+  std::string* reusablePackedData = nullptr;
+  AsyncGetManyStringSlabLease asyncPackedData;
+  bool poolAsyncPackedData = false;
   bool packed = false;
 
-  size_t size() const { return packed ? packedOffsets.size() - 1 : array.size(); }
+  size_t size() const { return packed ? packedKeys.size() : array.size(); }
+
+  std::string& data(const size_t minimumCapacity = 0) {
+    if (reusablePackedData) return *reusablePackedData;
+    if (poolAsyncPackedData) return asyncPackedData.Acquire(minimumCapacity);
+    return packedData;
+  }
+
+  const std::string& data() const {
+    if (reusablePackedData) return *reusablePackedData;
+    if (poolAsyncPackedData) return asyncPackedData.data();
+    return packedData;
+  }
 
   std::vector<rocksdb::Slice> slices() const {
     std::vector<rocksdb::Slice> result;
     result.reserve(size());
     if (packed) {
-      for (size_t index = 0; index + 1 < packedOffsets.size(); ++index) {
-        const auto start = packedOffsets[index];
-        const auto end = packedOffsets[index + 1];
-        result.emplace_back(packedData.data() + start, end - start);
+      const auto* const base = data().data();
+      for (const auto& key : packedKeys) {
+        result.emplace_back(base + key.offset, key.length);
       }
     } else {
       for (const auto& key : array) result.emplace_back(key);
@@ -3722,26 +3841,55 @@ struct OwnedGetManyKeys {
   }
 };
 
-static napi_status GetOwnedGetManyKeys(napi_env env, napi_value input, OwnedGetManyKeys& result) {
-  bool isArray = false;
-  NAPI_STATUS_RETURN(napi_is_array(env, input, &isArray));
-  if (isArray) {
-    uint32_t count = 0;
-    NAPI_STATUS_RETURN(napi_get_array_length(env, input, &count));
-    result.array.resize(count);
-    for (uint32_t index = 0; index < count; ++index) {
-      napi_value key;
-      NAPI_STATUS_RETURN(napi_get_element(env, input, index, &key));
-      NAPI_STATUS_RETURN(GetValue(env, key, result.array[index]));
-    }
-    return napi_ok;
+static napi_status AddStringGetManyKey(napi_env env, napi_value key, OwnedGetManyKeys& result) {
+  size_t length = 0;
+  NAPI_STATUS_RETURN(napi_get_value_string_utf8(env, key, nullptr, 0, &length));
+
+  const auto offset = result.packedKeys.empty()
+                          ? 0
+                          : result.packedKeys.back().offset + result.packedKeys.back().length;
+  // Keep one byte for the trailing NUL that N-API writes while converting the
+  // final key. Terminators between keys are overwritten by the next key.
+  if (offset >= result.packedData.max_size() ||
+      length > result.packedData.max_size() - offset - 1) {
+    NAPI_STATUS_RETURN(
+        napi_throw_range_error(env, nullptr, "String getMany keys exceed addressable memory"));
+    return napi_pending_exception;
   }
 
+  result.packedKeys.push_back({key, offset, length});
+  return napi_ok;
+}
+
+static napi_status PackStringGetManyKeys(napi_env env, OwnedGetManyKeys& result) {
+  const auto keyBytes = result.packedKeys.empty()
+                            ? 0
+                            : result.packedKeys.back().offset + result.packedKeys.back().length;
+  auto& data = result.data(keyBytes + 1);
+  data.resize(keyBytes + 1);
+
+  for (auto& key : result.packedKeys) {
+    size_t written = 0;
+    NAPI_STATUS_RETURN(napi_get_value_string_utf8(env,
+                                                  key.value,
+                                                  data.data() + key.offset,
+                                                  key.length + 1,
+                                                  &written));
+    key.value = nullptr;
+  }
+
+  data.resize(keyBytes);
+  result.packed = true;
+  return napi_ok;
+}
+
+static napi_status GetOwnedPackedGetManyKeys(napi_env env,
+                                             napi_value input,
+                                             OwnedGetManyKeys& result) {
   PackedGetManyInput packed;
   NAPI_STATUS_RETURN(GetPackedGetManyInput(env, input, packed));
   result.packed = true;
-  result.packedOffsets.reserve(packed.size() + 1);
-  result.packedOffsets.push_back(0);
+  result.packedKeys.reserve(packed.size());
 
   size_t keyBytes = 0;
   for (size_t index = 0; index < packed.size(); ++index) {
@@ -3751,15 +3899,17 @@ static napi_status GetOwnedGetManyKeys(napi_env env, napi_value input, OwnedGetM
     }
     keyBytes += length;
   }
-  result.packedData.reserve(keyBytes);
+  auto& packedData = result.data(keyBytes);
+  packedData.reserve(keyBytes);
 
   const auto* data = packed.data == nullptr ? "" : packed.data;
   for (size_t index = 0; index < packed.size(); ++index) {
     const auto layoutIndex = index * 2;
     const auto offset = packed.offsets[layoutIndex];
     const auto length = packed.offsets[layoutIndex + 1];
-    result.packedData.append(data + offset, length);
-    result.packedOffsets.push_back(static_cast<uint32_t>(result.packedData.size()));
+    const auto targetOffset = packedData.size();
+    packedData.append(data + offset, length);
+    result.packedKeys.push_back({nullptr, targetOffset, length});
   }
 
   return napi_ok;
@@ -3785,62 +3935,127 @@ struct GetManyInputKeys {
   }
 };
 
+struct ReusableSyncGetManyStringSlab {
+  std::string data;
+  bool inUse = false;
+};
+
+// Retain UTF-8 key capacity between top-level synchronous calls. Keep one slab
+// per thread because separate Worker isolates may issue synchronous reads
+// concurrently. Reentrant calls use their own slab so option or key getters
+// cannot overwrite an outer call's admitted keys.
+static thread_local ReusableSyncGetManyStringSlab reusableSyncGetManyStringSlab;
+
+class ReusableSyncGetManyStringSlabLease {
+ public:
+  explicit ReusableSyncGetManyStringSlabLease(ReusableSyncGetManyStringSlab& slab)
+      : slab_(slab.inUse ? nullptr : &slab) {
+    if (slab_) slab_->inUse = true;
+  }
+
+  ~ReusableSyncGetManyStringSlabLease() {
+    if (slab_) slab_->inUse = false;
+  }
+
+  ReusableSyncGetManyStringSlabLease(const ReusableSyncGetManyStringSlabLease&) = delete;
+  ReusableSyncGetManyStringSlabLease& operator=(const ReusableSyncGetManyStringSlabLease&) = delete;
+
+  std::string* data() const { return slab_ ? &slab_->data : nullptr; }
+
+ private:
+  ReusableSyncGetManyStringSlab* slab_;
+};
+
+static napi_status GetArrayGetManyInputKeys(napi_env env,
+                                            napi_value input,
+                                            const bool borrow,
+                                            const bool retainBorrowed,
+                                            GetManyInputKeys& result) {
+  uint32_t count = 0;
+  NAPI_STATUS_RETURN(napi_get_array_length(env, input, &count));
+
+  result.owned.packedKeys.reserve(count);
+
+  napi_value backings = nullptr;
+  bool mixed = false;
+  for (uint32_t index = 0; index < count; ++index) {
+    napi_value key;
+    NAPI_STATUS_RETURN(napi_get_element(env, input, index, &key));
+
+    napi_valuetype type;
+    NAPI_STATUS_RETURN(napi_typeof(env, key, &type));
+    if (!mixed && type == napi_string) {
+      NAPI_STATUS_RETURN(AddStringGetManyKey(env, key, result.owned));
+      continue;
+    }
+
+    if (!mixed) {
+      mixed = true;
+      result.owned.array.resize(count);
+      if (borrow) {
+        result.borrowed.resize(count);
+        result.isBorrowed.resize(count, false);
+      }
+      for (size_t previous = 0; previous < result.owned.packedKeys.size(); ++previous) {
+        NAPI_STATUS_RETURN(
+            GetValue(env, result.owned.packedKeys[previous].value, result.owned.array[previous]));
+      }
+      result.owned.packedKeys.clear();
+    }
+
+    if (!borrow || type == napi_string) {
+      NAPI_STATUS_RETURN(GetValue(env, key, result.owned.array[index]));
+      continue;
+    }
+
+    napi_value backing;
+    NAPI_STATUS_RETURN(
+        GetString(env, key, result.borrowed[index], retainBorrowed ? &backing : nullptr));
+    if (retainBorrowed) {
+      if (!backings) {
+        NAPI_STATUS_RETURN(napi_create_array_with_length(env, count, &backings));
+      }
+      NAPI_STATUS_RETURN(napi_set_element(env, backings, index, backing));
+    }
+    result.isBorrowed[index] = true;
+  }
+
+  if (!mixed) return PackStringGetManyKeys(env, result.owned);
+
+  if (retainBorrowed && backings) {
+    result.reference = std::make_shared<Reference>();
+    NAPI_STATUS_RETURN(Reference::Create(env, backings, *result.reference));
+  }
+  return napi_ok;
+}
+
 static napi_status GetGetManyInputKeys(napi_env env,
                                        napi_value input,
                                        const bool borrow,
                                        const bool retainBorrowed,
                                        GetManyInputKeys& result) {
-  if (!borrow) return GetOwnedGetManyKeys(env, input, result.owned);
-
-  napi_value backings = nullptr;
   bool isArray = false;
   NAPI_STATUS_RETURN(napi_is_array(env, input, &isArray));
-  if (isArray) {
-    uint32_t count = 0;
-    NAPI_STATUS_RETURN(napi_get_array_length(env, input, &count));
-    result.owned.array.resize(count);
-    result.borrowed.resize(count);
-    result.isBorrowed.resize(count, false);
+  if (isArray) return GetArrayGetManyInputKeys(env, input, borrow, retainBorrowed, result);
 
-    for (uint32_t index = 0; index < count; ++index) {
-      napi_value key;
-      NAPI_STATUS_RETURN(napi_get_element(env, input, index, &key));
+  if (!borrow) return GetOwnedPackedGetManyKeys(env, input, result.owned);
 
-      napi_valuetype type;
-      NAPI_STATUS_RETURN(napi_typeof(env, key, &type));
-      if (type == napi_string) {
-        NAPI_STATUS_RETURN(GetValue(env, key, result.owned.array[index]));
-        continue;
-      }
-
-      napi_value backing;
-      NAPI_STATUS_RETURN(
-          GetString(env, key, result.borrowed[index], retainBorrowed ? &backing : nullptr));
-      if (retainBorrowed) {
-        if (!backings) {
-          NAPI_STATUS_RETURN(napi_create_array_with_length(env, count, &backings));
-        }
-        NAPI_STATUS_RETURN(napi_set_element(env, backings, index, backing));
-      }
-      result.isBorrowed[index] = true;
-    }
-  } else {
-    PackedGetManyInput packed;
-    NAPI_STATUS_RETURN(
-        GetPackedGetManyInput(env, input, packed, retainBorrowed ? &backings : nullptr));
-    result.borrowed.resize(packed.size());
-    result.isBorrowed.resize(packed.size(), true);
-    const auto* data = packed.data == nullptr ? "" : packed.data;
-    for (size_t index = 0; index < packed.size(); ++index) {
-      const auto layoutIndex = index * 2;
-      result.borrowed[index] =
-          rocksdb::Slice(data + packed.offsets[layoutIndex], packed.offsets[layoutIndex + 1]);
-    }
+  napi_value backing = nullptr;
+  PackedGetManyInput packed;
+  NAPI_STATUS_RETURN(
+      GetPackedGetManyInput(env, input, packed, retainBorrowed ? &backing : nullptr));
+  result.borrowed.resize(packed.size());
+  result.isBorrowed.resize(packed.size(), true);
+  const auto* data = packed.data == nullptr ? "" : packed.data;
+  for (size_t index = 0; index < packed.size(); ++index) {
+    const auto layoutIndex = index * 2;
+    result.borrowed[index] =
+        rocksdb::Slice(data + packed.offsets[layoutIndex], packed.offsets[layoutIndex + 1]);
   }
 
-  if (retainBorrowed && backings) {
+  if (retainBorrowed && backing) {
     result.reference = std::make_shared<Reference>();
-    NAPI_STATUS_RETURN(Reference::Create(env, backings, *result.reference));
+    NAPI_STATUS_RETURN(Reference::Create(env, backing, *result.reference));
   }
   return napi_ok;
 }
@@ -3869,7 +4084,9 @@ static napi_value db_get_many_sync_impl(napi_env env, napi_callback_info info, c
   NAPI_STATUS_THROWS(GetGetManyUnsafe(env, argv[2], unsafe));
 
   const auto unsafeOutput = HasGetManyUnsafe(unsafe, GetManyUnsafe::Output);
+  ReusableSyncGetManyStringSlabLease slabLease(reusableSyncGetManyStringSlab);
   GetManyInputKeys inputKeys;
+  inputKeys.owned.reusablePackedData = slabLease.data();
   // JavaScript cannot run after synchronous admission, so byte-backed keys can
   // always be borrowed for the duration of MultiGet. Immutable strings still
   // become native-owned copies during conversion.
@@ -3979,6 +4196,9 @@ static napi_value db_get_many_impl(napi_env env, napi_callback_info info, const 
   // exact Buffer/SliceLike backings instead; retain those backings until the
   // worker completes even if the caller replaces or releases its containers.
   GetManyInputKeys inputKeys;
+  // The move-only lease follows inputKeys into runAsyncKeepAlive's execute
+  // functor and returns its capacity when Complete destroys the worker.
+  inputKeys.owned.poolAsyncPackedData = true;
   NAPI_STATUS_THROWS(GetGetManyInputKeys(env, argv[1], unsafeInput, true, inputKeys));
   const auto count = static_cast<uint32_t>(inputKeys.size());
 

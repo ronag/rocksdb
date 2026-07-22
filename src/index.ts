@@ -627,10 +627,6 @@ class RocksLevel extends AbstractLevel<any, any, any> {
   }
 
   [kGetManySync](keys, options, allowPartial, packed, exposePacked) {
-    if (Array.isArray(keys) && keys.some((key) => typeof key === 'string')) {
-      keys = keys.map((key) => (typeof key === 'string' ? Buffer.from(key) : key))
-    }
-
     let bindingOptions = options
     if (allowPartial == null) {
       allowPartial = false

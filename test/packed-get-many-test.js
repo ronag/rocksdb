@@ -43,6 +43,79 @@ test('packed getMany sync and async preserve values, empty values and misses', a
   t.end()
 })
 
+test('getMany sync and async preserve UTF-8 string-key slab boundaries', async function (t) {
+  const db = testCommon.factory({ keyEncoding: 'buffer', valueEncoding: 'buffer' })
+  await db.open()
+
+  const keys = ['ascii'.padEnd(64, 'x'), 'räksmörgås', '🪨'.repeat(16)]
+  const expected = keys.map((key, index) => Buffer.from(`value-${index}`))
+  await db.batch(keys.map((key, index) => ({
+    type: 'put',
+    key: Buffer.from(key),
+    value: expected[index]
+  })))
+
+  t.same(db._getManySync(keys, { packed: false }), expected,
+    'sync reads every string from the shared key slab')
+  t.same(await db._getManyAsync(keys, { packed: false }), expected,
+    'async reads every string from the shared key slab')
+
+  await db.close()
+  t.end()
+})
+
+test('concurrent async getMany calls keep pooled string-key slabs isolated', async function (t) {
+  const db = testCommon.factory({ keyEncoding: 'buffer', valueEncoding: 'buffer' })
+  await db.open()
+
+  const batches = Array.from({ length: 16 }, (_, batch) =>
+    Array.from({ length: 32 }, (_, index) =>
+      `batch-${batch}-key-${index}-🪨`.padEnd(64 + batch, 'x')))
+  await db.batch(batches.flatMap((keys, batch) => keys.map((key, index) => ({
+    type: 'put',
+    key: Buffer.from(key),
+    value: Buffer.from(`${batch}:${index}`)
+  }))))
+
+  const results = await Promise.all(batches.map((keys) =>
+    db._getManyAsync(keys, { packed: false })))
+
+  for (let batch = 0; batch < results.length; ++batch) {
+    t.same(results[batch], batches[batch].map((_, index) => Buffer.from(`${batch}:${index}`)),
+      `batch ${batch} retains its own admitted key bytes`)
+  }
+
+  await db.close()
+  t.end()
+})
+
+test('sync string-key slab survives reentrant option getters', async function (t) {
+  const db = testCommon.factory({ keyEncoding: 'buffer', valueEncoding: 'buffer' })
+  await db.open()
+
+  const outerKey = 'outer'.padEnd(64, 'x')
+  const innerKey = 'inner'.padEnd(64, 'x')
+  await db.batch([
+    { type: 'put', key: Buffer.from(outerKey), value: Buffer.from('outer-value') },
+    { type: 'put', key: Buffer.from(innerKey), value: Buffer.from('inner-value') }
+  ])
+
+  let nested
+  const values = db._getManySync([outerKey], {
+    packed: false,
+    get fillCache () {
+      nested = db._getManySync([innerKey], { packed: false })
+      return true
+    }
+  })
+
+  t.equal(values[0].toString(), 'outer-value', 'outer read retains its admitted slab bytes')
+  t.equal(nested[0].toString(), 'inner-value', 'reentrant read uses an independent slab')
+
+  await db.close()
+  t.end()
+})
+
 test('raw auto getMany unpacks unless the selected representation is exposed', async function (t) {
   const db = testCommon.factory({ keyEncoding: 'buffer', valueEncoding: 'buffer' })
   await db.open()
