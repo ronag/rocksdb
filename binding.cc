@@ -3830,8 +3830,9 @@ struct OwnedGetManyKeys {
     std::vector<rocksdb::Slice> result;
     result.reserve(size());
     if (packed) {
+      const auto* const base = data().data();
       for (const auto& key : packedKeys) {
-        result.emplace_back(data().data() + key.offset, key.length);
+        result.emplace_back(base + key.offset, key.length);
       }
     } else {
       for (const auto& key : array) result.emplace_back(key);

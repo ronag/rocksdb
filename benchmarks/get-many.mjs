@@ -49,11 +49,11 @@ try {
   const getOpts = {
     valueEncoding: 'buffer',
     fillCache: true,
-    packed: false,
-    exposePacked: true
+    packed: false
   }
   const packedGetOpts = { ...getOpts, packed: true }
   const autoGetOpts = { ...getOpts, packed: 'auto' }
+  const exposedAutoGetOpts = { ...autoGetOpts, exposePacked: true }
 
   let checksum = 0
   function consume (rows) {
@@ -67,8 +67,8 @@ try {
   }
 
   function consumeResult (result) {
-    if (result.packed) consumePacked(result)
-    else consume(result)
+    if (Array.isArray(result)) consume(result)
+    else consumePacked(result)
   }
 
   for (const size of [64, 1024, 4096, 16 * 1024]) {
@@ -83,16 +83,19 @@ try {
       await db.put(key, Buffer.alloc(size, 0x5a))
     }
     const warmed = db._getManySync(keys, getOpts)
-    assert.equal(warmed.packed, false)
+    assert(Array.isArray(warmed))
     assert.equal(warmed.length, keys.length)
     assert(warmed.every((row) => Buffer.isBuffer(row) && row.byteLength === size && row[0] === 0x5a))
     const warmedPacked = db._getManySync(keys, packedGetOpts)
-    assert.equal(warmedPacked.packed, true)
+    assert(!Array.isArray(warmedPacked))
     assert.equal(warmedPacked.count, keys.length)
     assert.equal(warmedPacked.buffer.byteLength, keys.length * size)
     assert(warmedPacked.statuses.every((status) => status === 0))
     const warmedAuto = db._getManySync(keys, autoGetOpts)
-    assert.equal(warmedAuto.packed, size <= 8 * 1024)
+    assert(Array.isArray(warmedAuto))
+    assert.equal(warmedAuto.length, keys.length)
+    const exposedAuto = db._getManySync(keys, exposedAutoGetOpts)
+    assert.equal(exposedAuto.packed, size <= 8 * 1024)
 
     group(() => {
       bench('_getManySync packed=false ' + label, () => {
