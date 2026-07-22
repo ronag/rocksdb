@@ -770,6 +770,15 @@ export interface RocksChainedBatchWriteOptions extends AbstractChainedBatchWrite
   lowPriority?: boolean
 }
 
+export interface RocksWritePerfContext {
+  readonly writeWalNanos: number
+  readonly writeMemtableNanos: number
+  readonly writeDelayNanos: number
+  readonly writeSchedulingFlushesCompactionsNanos: number
+  readonly writePreAndPostProcessNanos: number
+  readonly writeThreadWaitNanos: number
+}
+
 export interface RocksBatchEntry<K = Buffer | string, V = Buffer | string> {
   readonly type: 'put' | 'del' | 'merge' | 'data'
   readonly key: K | null
@@ -852,6 +861,11 @@ export interface RocksChainedBatch<TDatabase, KDefault, VDefault> extends Abstra
    * closing it. Requires the database and batch to remain open and may block.
    */
   _writeSync(options?: RocksChainedBatchWriteOptions): void
+  /**
+   * Write raw-managed native state synchronously and return scoped RocksDB
+   * PerfContext write timers. The prior thread-local PerfContext is restored.
+   */
+  _writeSyncProfile(options?: RocksChainedBatchWriteOptions): RocksWritePerfContext
   /**
    * Write raw-managed native state without consuming, clearing or closing it.
    * Keep the database and batch open and idle until this call settles.
