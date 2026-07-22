@@ -123,6 +123,13 @@ BUILD_ARGS=(
   --output "type=local,dest=$STAGE_DIR"
   --build-context "ccache=$CCACHE_LOCAL_DIR"
 )
+# @nxtedition/slice is private, so the in-container npm install needs registry
+# auth. Forward the local npmrc as a BuildKit secret (never a build layer) so a
+# remote Docker host can install it. NPM_CONFIG_USERCONFIG wins if set.
+NPMRC_FILE="${NPM_CONFIG_USERCONFIG:-$HOME/.npmrc}"
+if [ -f "$NPMRC_FILE" ]; then
+  BUILD_ARGS+=(--secret "id=npmrc,src=$NPMRC_FILE")
+fi
 if [ -n "${JOBS:-}" ]; then
   BUILD_ARGS+=(--build-arg "JOBS=$JOBS")
 fi
@@ -166,11 +173,17 @@ fi
 echo "Downloading compiler cache to $CCACHE_LOCAL_DIR..."
 CCACHE_DOWNLOAD_DIR=$(mktemp -d "$(dirname "$CCACHE_LOCAL_DIR")/.ccache-download.XXXXXX") || CCACHE_DOWNLOAD_DIR=
 if [ -n "$CCACHE_DOWNLOAD_DIR" ]; then
+  CCACHE_BUILD_ARGS=(
+    --platform "$PLATFORM"
+    --target ccache-artifact
+    --build-context "ccache=$CCACHE_LOCAL_DIR"
+    --output "type=local,dest=$CCACHE_DOWNLOAD_DIR"
+  )
+  if [ -f "$NPMRC_FILE" ]; then
+    CCACHE_BUILD_ARGS+=(--secret "id=npmrc,src=$NPMRC_FILE")
+  fi
   if DOCKER_BUILDKIT=1 docker build \
-    --platform "$PLATFORM" \
-    --target ccache-artifact \
-    --build-context "ccache=$CCACHE_LOCAL_DIR" \
-    --output "type=local,dest=$CCACHE_DOWNLOAD_DIR" \
+    "${CCACHE_BUILD_ARGS[@]}" \
     . \
     && cp -a "$CCACHE_DOWNLOAD_DIR/." "$CCACHE_LOCAL_DIR/"; then
     :

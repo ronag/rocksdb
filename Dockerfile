@@ -51,7 +51,12 @@ RUN --mount=type=cache,target=/ccache,id=rocks-level-ccache,sharing=locked \
     ROCKS_LEVEL_MARCH="$ROCKS_LEVEL_MARCH" JOBS="$JOBS" node scripts/build-deps.js
 
 COPY package.json ./
-RUN npm install --ignore-scripts
+# @nxtedition/slice is a private npm package, so npm needs registry auth to
+# install it. The npmrc is provided as a BuildKit secret (see build.sh) mounted
+# at npm's user-config path, keeping the token out of every image layer. It is
+# optional so public/local builds that already have the package cached still run.
+RUN --mount=type=secret,id=npmrc,target=/root/.npmrc,required=false \
+    npm install --ignore-scripts
 
 COPY . .
 
