@@ -251,6 +251,7 @@ enum ResourceName {
   ResourceLeveldownClose,
   ResourceLeveldownGetMany,
   ResourceLeveldownFlushWal,
+  ResourceLeveldownFlush,
   ResourceLeveldownIteratorInit,
   ResourceLeveldownIteratorSeek,
   ResourceLeveldownBatchWrite,
@@ -965,10 +966,10 @@ static constexpr napi_type_tag kUpdatesReferenceTag = {0xe254e64dfaa9406bULL, 0x
 
 static napi_status GetResourceName(napi_env env, ResourceName name, napi_value& result) {
   static constexpr const char* names[] = {
-      "iterator.nextv",        "leveldown.open",         "leveldown.close",
-      "leveldown.get_many",    "leveldown.flush_wal",    "leveldown.iterator_init",
-      "leveldown.iterator_seek", "leveldown.batch_write", "leveldown.updates_since",
-      "leveldown.compact_range", "leveldown.clear"};
+      "iterator.nextv",          "leveldown.open",         "leveldown.close",
+      "leveldown.get_many",      "leveldown.flush_wal",    "leveldown.flush",
+      "leveldown.iterator_init", "leveldown.iterator_seek", "leveldown.batch_write",
+      "leveldown.updates_since", "leveldown.compact_range", "leveldown.clear"};
   static_assert(std::size(names) == ResourceNameCount);
   return napi_create_string_utf8(env, names[name], NAPI_AUTO_LENGTH, &result);
 }
@@ -3255,6 +3256,8 @@ NAPI_METHOD(db_open) {
     dbOptions.wal_compression =
         walCompression ? rocksdb::CompressionType::kZSTD : rocksdb::CompressionType::kNoCompression;
 
+    NAPI_STATUS_THROWS(GetProperty(env, options, "atomicFlush", dbOptions.atomic_flush));
+
     dbOptions.avoid_unnecessary_blocking_io = true;
     NAPI_STATUS_THROWS(
         GetProperty(env, options, "avoidUnnecessaryBlockingIO", dbOptions.avoid_unnecessary_blocking_io));
@@ -4369,6 +4372,9 @@ NAPI_METHOD(db_clear) {
   bool lowPriority = false;
   NAPI_STATUS_THROWS(GetProperty(env, options, "lowPriority", lowPriority));
 
+  bool disableWAL = false;
+  NAPI_STATUS_THROWS(GetProperty(env, options, "disableWAL", disableWAL));
+
   const auto callback = argv[2];
   napi_value resourceName;
   NAPI_STATUS_THROWS(GetResourceName(env, ResourceLeveldownClear, resourceName));
@@ -4376,7 +4382,7 @@ NAPI_METHOD(db_clear) {
   NAPI_STATUS_THROWS(runAsyncKeepAlive(
       resourceName, env, callback, argv[0],
       [database, databaseOperation, column, reverse, limit, lt = std::move(lt), lte = std::move(lte),
-       gt = std::move(gt), gte = std::move(gte), sync, lowPriority](auto& state) {
+       gt = std::move(gt), gte = std::move(gte), sync, lowPriority, disableWAL](auto& state) {
         const DatabaseOperationScope operationScope(databaseOperation);
         if (limit == 0) {
           return rocksdb::Status::OK();
@@ -4385,6 +4391,7 @@ NAPI_METHOD(db_clear) {
         rocksdb::WriteOptions writeOptions;
         writeOptions.sync = sync;
         writeOptions.low_pri = lowPriority;
+        writeOptions.disableWAL = disableWAL;
         rocksdb::ReadOptions readOptions;
         readOptions.fill_cache = false;
         const auto* comparator = column->GetComparator();
@@ -4746,6 +4753,39 @@ NAPI_METHOD(db_flush_wal) {
     const DatabaseOperationScope operationScope(databaseOperation);
     return database->db->FlushWAL(sync);
   }));
+
+  return 0;
+}
+
+NAPI_METHOD(db_flush) {
+  NAPI_ARGV(2);
+
+  Database* database;
+  std::shared_ptr<DatabaseReference> reference;
+  NAPI_STATUS_THROWS(GetDatabase(env, argv[0], database, &reference));
+  std::shared_ptr<DatabaseOperation> databaseOperation;
+  NAPI_STATUS_THROWS(BeginDatabaseOperation(env, database, reference, databaseOperation));
+
+  std::vector<rocksdb::ColumnFamilyHandle*> columns;
+  if (database->columns.empty()) {
+    columns.push_back(database->db->DefaultColumnFamily());
+  } else {
+    columns.reserve(database->columns.size());
+    for (const auto& entry : database->columns) {
+      columns.push_back(entry.second.handle);
+    }
+  }
+
+  const auto callback = argv[1];
+  napi_value resourceName;
+  NAPI_STATUS_THROWS(GetResourceName(env, ResourceLeveldownFlush, resourceName));
+
+  NAPI_STATUS_THROWS(runAsyncKeepAlive(
+      resourceName, env, callback, argv[0],
+      [database, databaseOperation, columns = std::move(columns)](auto& state) {
+        const DatabaseOperationScope operationScope(databaseOperation);
+        return database->db->Flush(rocksdb::FlushOptions(), columns);
+      }));
 
   return 0;
 }
@@ -5440,6 +5480,9 @@ NAPI_METHOD(batch_write) {
   bool lowPriority = false;
   NAPI_STATUS_THROWS(GetProperty(env, argv[2], "lowPriority", lowPriority));
 
+  bool disableWAL = false;
+  NAPI_STATUS_THROWS(GetProperty(env, argv[2], "disableWAL", disableWAL));
+
   auto callback = argv[3];
 
   napi_value resourceName;
@@ -5451,6 +5494,7 @@ NAPI_METHOD(batch_write) {
     rocksdb::WriteOptions writeOptions;
     writeOptions.sync = sync;
     writeOptions.low_pri = lowPriority;
+    writeOptions.disableWAL = disableWAL;
     return database->db->Write(writeOptions, &batch->batch);
   }));
 
@@ -5476,9 +5520,13 @@ NAPI_METHOD(batch_write_sync) {
   bool lowPriority = false;
   NAPI_STATUS_THROWS(GetProperty(env, argv[2], "lowPriority", lowPriority));
 
+  bool disableWAL = false;
+  NAPI_STATUS_THROWS(GetProperty(env, argv[2], "disableWAL", disableWAL));
+
   rocksdb::WriteOptions writeOptions;
   writeOptions.sync = sync;
   writeOptions.low_pri = lowPriority;
+  writeOptions.disableWAL = disableWAL;
   std::lock_guard lock(batch->mutex);
   ROCKS_STATUS_THROWS_NAPI(database->db->Write(writeOptions, &batch->batch));
 
@@ -5545,9 +5593,13 @@ NAPI_METHOD(batch_write_sync_profile) {
   bool lowPriority = false;
   NAPI_STATUS_THROWS(GetProperty(env, argv[2], "lowPriority", lowPriority));
 
+  bool disableWAL = false;
+  NAPI_STATUS_THROWS(GetProperty(env, argv[2], "disableWAL", disableWAL));
+
   rocksdb::WriteOptions writeOptions;
   writeOptions.sync = sync;
   writeOptions.low_pri = lowPriority;
+  writeOptions.disableWAL = disableWAL;
 
   rocksdb::Status status;
   rocksdb::PerfContext context;
@@ -5562,6 +5614,57 @@ NAPI_METHOD(batch_write_sync_profile) {
   napi_value result;
   NAPI_STATUS_THROWS(ConvertWritePerfContext(env, context, &result));
   return result;
+}
+
+NAPI_METHOD(batch_write_profile) {
+  NAPI_ARGV(4);
+
+  Database* database;
+  std::shared_ptr<DatabaseReference> reference;
+  NAPI_STATUS_THROWS(GetDatabase(env, argv[0], database, &reference));
+  std::shared_ptr<DatabaseOperation> databaseOperation;
+  NAPI_STATUS_THROWS(BeginDatabaseOperation(env, database, reference, databaseOperation));
+
+  std::shared_ptr<NativeBatch> batch;
+  NAPI_STATUS_THROWS(GetBatch(env, argv[1], batch));
+  NAPI_STATUS_THROWS(ValidateBatch(env, batch, reference));
+
+  bool sync = false;
+  NAPI_STATUS_THROWS(GetProperty(env, argv[2], "sync", sync));
+
+  bool lowPriority = false;
+  NAPI_STATUS_THROWS(GetProperty(env, argv[2], "lowPriority", lowPriority));
+
+  bool disableWAL = false;
+  NAPI_STATUS_THROWS(GetProperty(env, argv[2], "disableWAL", disableWAL));
+
+  const auto callback = argv[3];
+  napi_value resourceName;
+  NAPI_STATUS_THROWS(GetResourceName(env, ResourceLeveldownBatchWrite, resourceName));
+
+  NAPI_STATUS_THROWS(runAsyncKeepAlive<rocksdb::PerfContext>(
+      resourceName, env, callback, argv[0],
+      [database, databaseOperation, batch, sync, lowPriority, disableWAL](auto& context) {
+        const DatabaseOperationScope operationScope(databaseOperation);
+        rocksdb::WriteOptions writeOptions;
+        writeOptions.sync = sync;
+        writeOptions.low_pri = lowPriority;
+        writeOptions.disableWAL = disableWAL;
+
+        rocksdb::Status status;
+        {
+          std::lock_guard lock(batch->mutex);
+          ScopedPerfContext scope;
+          status = database->db->Write(writeOptions, &batch->batch);
+          context = scope.Snapshot();
+        }
+        return status;
+      },
+      [](auto& context, napi_env env, napi_value* result) {
+        return ConvertWritePerfContext(env, context, result);
+      }));
+
+  return 0;
 }
 
 NAPI_METHOD(batch_count) {
@@ -6224,6 +6327,7 @@ NAPI_INIT() {
   NAPI_EXPORT_FUNCTION(db_compact_range_sync);
   NAPI_EXPORT_FUNCTION(db_compact_range);
   NAPI_EXPORT_FUNCTION(db_flush_wal);
+  NAPI_EXPORT_FUNCTION(db_flush);
 
   NAPI_EXPORT_FUNCTION(statistics_init);
   NAPI_EXPORT_FUNCTION(statistics_set_stats_level);
@@ -6261,6 +6365,7 @@ NAPI_INIT() {
   NAPI_EXPORT_FUNCTION(batch_write);
   NAPI_EXPORT_FUNCTION(batch_write_sync);
   NAPI_EXPORT_FUNCTION(batch_write_sync_profile);
+  NAPI_EXPORT_FUNCTION(batch_write_profile);
   NAPI_EXPORT_FUNCTION(batch_merge);
   NAPI_EXPORT_FUNCTION(batch_merge_parts);
   NAPI_EXPORT_FUNCTION(batch_count);

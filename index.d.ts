@@ -214,6 +214,8 @@ export interface RocksOpenOptions extends AbstractOpenOptions, RocksColumnOption
   walSizeLimit?: number
   maxTotalWalSize?: number
   walCompression?: boolean
+  /** Atomically flush all selected column families together. This option cannot be changed after open. */
+  atomicFlush?: boolean
   avoidUnnecessaryBlockingIO?: boolean
   createMissingColumnFamilies?: boolean
   writeDbIdToManifest?: boolean
@@ -265,6 +267,7 @@ export interface RocksReadOptions extends RocksColumnOperationOptions {
 export interface RocksWriteOptions extends RocksColumnOperationOptions {
   sync?: boolean
   lowPriority?: boolean
+  disableWAL?: boolean
 }
 
 export interface RocksGetOptions<K, V> extends AbstractGetOptions<K, V>, RocksReadOptions {}
@@ -283,6 +286,7 @@ export interface RocksDelOptions<K> extends AbstractDelOptions<K>, RocksWriteOpt
 export interface RocksBatchOptions<K, V> extends AbstractBatchOptions<K, V> {
   sync?: boolean
   lowPriority?: boolean
+  disableWAL?: boolean
 }
 
 export interface RocksBatchPutOperation<TDatabase, K, V>
@@ -768,7 +772,14 @@ export interface RocksChainedBatchDelOptions<TDatabase, K>
 export interface RocksChainedBatchWriteOptions extends AbstractChainedBatchWriteOptions {
   sync?: boolean
   lowPriority?: boolean
+  disableWAL?: boolean
+  profile?: false
 }
+
+export type RocksProfiledChainedBatchWriteOptions = Omit<
+  RocksChainedBatchWriteOptions,
+  'profile'
+> & { profile: true }
 
 export interface RocksWritePerfContext {
   readonly writeWalNanos: number
@@ -857,20 +868,24 @@ export interface RocksChainedBatch<TDatabase, KDefault, VDefault> extends Abstra
    */
   _clear(): void
   /**
-   * Write raw-managed native state synchronously without consuming, clearing or
-   * closing it. Requires the database and batch to remain open and may block.
+   * Write raw-managed native state synchronously and optionally return scoped
+   * RocksDB PerfContext timers. This does not consume, clear or close the batch,
+   * requires the database and batch to remain open, and may block. The prior
+   * thread-local PerfContext state is restored.
    */
+  _writeSync(options: RocksProfiledChainedBatchWriteOptions): RocksWritePerfContext
   _writeSync(options?: RocksChainedBatchWriteOptions): void
-  /**
-   * Write raw-managed native state synchronously and return scoped RocksDB
-   * PerfContext write timers. The prior thread-local PerfContext is restored.
-   */
-  _writeSyncProfile(options?: RocksChainedBatchWriteOptions): RocksWritePerfContext
   /**
    * Write raw-managed native state without consuming, clearing or closing it.
    * Keep the database and batch open and idle until this call settles.
    */
+  _writeAsync(options: RocksProfiledChainedBatchWriteOptions): Promise<RocksWritePerfContext>
   _writeAsync(options?: RocksChainedBatchWriteOptions): Promise<void>
+  /** Callback overload returning scoped PerfContext timers when profiling. */
+  _writeAsync(
+    options: RocksProfiledChainedBatchWriteOptions,
+    callback: RocksNodeCallback<RocksWritePerfContext>
+  ): void
   /** Callback overload with the same raw-state and serialization contract. */
   _writeAsync(
     options: RocksChainedBatchWriteOptions | undefined,
@@ -1148,6 +1163,10 @@ export class RocksLevel<KDefault = string, VDefault = string> extends AbstractLe
   compactRange(options: RocksCompactRangeOptions): Promise<void>
   compactRange(callback: RocksNodeCallback<void>): void
   compactRange(options: RocksCompactRangeOptions, callback: RocksNodeCallback<void>): void
+
+  /** Flush every open column family on a native worker. With `atomicFlush`, the flush is all-or-nothing. */
+  _flushAsync(): Promise<void>
+  _flushAsync(callback: RocksNodeCallback<void>): void
 
   flushWAL(): Promise<void>
   flushWAL(sync: boolean): Promise<void>

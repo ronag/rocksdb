@@ -205,19 +205,11 @@ class ChainedBatch extends AbstractChainedBatch<any, any, any> {
   // clear or close the batch, so another raw write replays the same operations.
   _writeSync(options) {
     return this[kRunOperation]('_writeSync', () => {
-      binding.batch_write_sync(this[kDbContext], this[kBatchContext], options ?? EMPTY)
-    })
-  }
-
-  // Submit synchronously with scoped RocksDB PerfContext write timers. The
-  // caller's thread-local PerfContext state is restored before return.
-  _writeSyncProfile(options) {
-    return this[kRunOperation]('_writeSyncProfile', () => {
-      return binding.batch_write_sync_profile(
-        this[kDbContext],
-        this[kBatchContext],
-        options ?? EMPTY
-      )
+      const write =
+        options?.profile === true
+          ? binding.batch_write_sync_profile
+          : binding.batch_write_sync
+      return write(this[kDbContext], this[kBatchContext], options ?? EMPTY)
     })
   }
 
@@ -227,27 +219,28 @@ class ChainedBatch extends AbstractChainedBatch<any, any, any> {
   _writeAsync(options, callback) {
     callback = fromCallback(callback, kPromise)
     try {
-      this[kStartWrite]('_writeAsync', options, callback)
+      this[kStartWrite]('_writeAsync', options, callback, options?.profile === true)
     } catch (err) {
       process.nextTick(callback, err)
     }
     return callback[kPromise]
   }
 
-  [kStartWrite](operation, options, callback) {
+  [kStartWrite](operation, options, callback, profile = false) {
     this[kEnterOperation](operation)
     let completed = false
-    this[kScheduleWrite](options, (err) => {
+    this[kScheduleWrite](options, profile, (err, value) => {
       if (completed) return
       completed = true
       this[kLeaveOperation]()
-      callback(err)
+      callback(err, value)
     })
   }
 
-  [kScheduleWrite](options, callback) {
+  [kScheduleWrite](options, profile, callback) {
     try {
-      binding.batch_write(this[kDbContext], this[kBatchContext], options ?? EMPTY, callback)
+      const write = profile ? binding.batch_write_profile : binding.batch_write
+      write(this[kDbContext], this[kBatchContext], options ?? EMPTY, callback)
     } catch (err) {
       process.nextTick(callback, err)
     }
