@@ -165,7 +165,20 @@ class ChainedBatch extends AbstractChainedBatch<any, any, any> {
   // null value deletes its key; RocksDB copies every input before return.
   _appendMany(entries, options) {
     return this[kRunOperation]('_appendMany', () => {
-      binding.batch_append_many(this[kBatchContext], entries, options ?? EMPTY)
+      const inputType = options?.inputType
+      const append =
+        inputType === undefined
+          ? binding.batch_append_many
+          : inputType === 'buffer'
+            ? binding.batch_append_many_buffer
+            : inputType === 'string'
+              ? binding.batch_append_many_string
+              : null
+
+      if (append === null) {
+        throw new TypeError("appendMany inputType must be 'string' or 'buffer'")
+      }
+      append(this[kBatchContext], entries, options ?? EMPTY)
     })
   }
 

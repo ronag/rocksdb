@@ -1197,26 +1197,35 @@ struct NativeBatch final {
   rocksdb::WriteBatch batch;
 };
 
-static napi_status GetOwnedBatchAppendString(napi_env env, napi_value from, std::string& to) {
-  bool isBuffer = false;
-  NAPI_STATUS_RETURN(napi_is_buffer(env, from, &isBuffer));
+enum class BatchAppendInputType : uint8_t {
+  Any,
+  Buffer,
+  String,
+};
 
-  if (isBuffer) {
-    char* data = nullptr;
-    size_t length = 0;
-    NAPI_STATUS_RETURN(napi_get_buffer_info(env, from, reinterpret_cast<void**>(&data), &length));
-    if (length == 0) {
-      to.clear();
-    } else {
-      to.assign(data, length);
-    }
-    return napi_ok;
+static napi_status GetOwnedBatchAppendBuffer(napi_env env, napi_value from, std::string& to) {
+  char* data = nullptr;
+  size_t length = 0;
+  NAPI_STATUS_RETURN(napi_get_buffer_info(env, from, reinterpret_cast<void**>(&data), &length));
+  if (length == 0) {
+    to.clear();
+  } else {
+    to.assign(data, length);
   }
+  return napi_ok;
+}
 
-  napi_valuetype type;
-  NAPI_STATUS_RETURN(napi_typeof(env, from, &type));
-  if (type == napi_string) return GetString(env, from, to);
-  if (type != napi_object) return napi_invalid_arg;
+static napi_status GetOwnedBatchAppendUtf8(napi_env env, napi_value from, std::string& to) {
+  size_t length = 0;
+  NAPI_STATUS_RETURN(napi_get_value_string_utf8(env, from, nullptr, 0, &length));
+  to.resize(length + 1);
+  size_t written = 0;
+  NAPI_STATUS_RETURN(napi_get_value_string_utf8(env, from, to.data(), to.size(), &written));
+  to.resize(written);
+  return napi_ok;
+}
+
+static napi_status GetOwnedBatchAppendSlice(napi_env env, napi_value from, std::string& to) {
 
   int64_t offset = 0;
   {
@@ -1252,10 +1261,32 @@ static napi_status GetOwnedBatchAppendString(napi_env env, napi_value from, std:
   return napi_ok;
 }
 
+template <BatchAppendInputType InputType>
+static napi_status GetOwnedBatchAppendValue(napi_env env, napi_value from, std::string& to) {
+  if constexpr (InputType == BatchAppendInputType::Buffer) {
+    return GetOwnedBatchAppendBuffer(env, from, to);
+  }
+  if constexpr (InputType == BatchAppendInputType::String) {
+    return GetOwnedBatchAppendUtf8(env, from, to);
+  }
+
+  bool isBuffer = false;
+  NAPI_STATUS_RETURN(napi_is_buffer(env, from, &isBuffer));
+  if (isBuffer) return GetOwnedBatchAppendBuffer(env, from, to);
+
+  const auto stringStatus = GetOwnedBatchAppendUtf8(env, from, to);
+  if (stringStatus == napi_ok) return napi_ok;
+  if (stringStatus != napi_string_expected) return stringStatus;
+
+  napi_valuetype type;
+  NAPI_STATUS_RETURN(napi_typeof(env, from, &type));
+  if (type != napi_object) return napi_invalid_arg;
+  return GetOwnedBatchAppendSlice(env, from, to);
+}
+
 struct BatchAppendEntry {
   std::string key;
-  std::string value;
-  bool isDelete = false;
+  std::optional<std::string> value;
 };
 
 class BatchSavePoint final {
@@ -5223,7 +5254,8 @@ NAPI_METHOD(batch_del) {
   return 0;
 }
 
-NAPI_METHOD(batch_append_many) {
+template <BatchAppendInputType InputType>
+static napi_value BatchAppendMany(napi_env env, napi_callback_info info) {
   NAPI_ARGV(3);
 
   std::shared_ptr<NativeBatch> batch;
@@ -5248,24 +5280,23 @@ NAPI_METHOD(batch_append_many) {
   }
 
   std::vector<BatchAppendEntry> entries;
-  entries.reserve(length / 2);
+  entries.resize(length / 2);
   for (uint32_t index = 0; index < length; index += 2) {
+    auto& entry = entries[index / 2];
+
     napi_value keyValue;
     NAPI_STATUS_THROWS(napi_get_element(env, argv[1], index, &keyValue));
 
-    BatchAppendEntry entry;
-    NAPI_STATUS_THROWS(GetOwnedBatchAppendString(env, keyValue, entry.key));
+    NAPI_STATUS_THROWS(GetOwnedBatchAppendValue<InputType>(env, keyValue, entry.key));
 
     napi_value valueValue;
     NAPI_STATUS_THROWS(napi_get_element(env, argv[1], index + 1, &valueValue));
     napi_valuetype valueType;
     NAPI_STATUS_THROWS(napi_typeof(env, valueValue, &valueType));
-    entry.isDelete = valueType == napi_null;
-    if (!entry.isDelete) {
-      NAPI_STATUS_THROWS(GetOwnedBatchAppendString(env, valueValue, entry.value));
+    if (valueType != napi_null) {
+      entry.value.emplace();
+      NAPI_STATUS_THROWS(GetOwnedBatchAppendValue<InputType>(env, valueValue, *entry.value));
     }
-
-    entries.push_back(std::move(entry));
   }
 
   rocksdb::ColumnFamilyHandle* column = nullptr;
@@ -5283,11 +5314,11 @@ NAPI_METHOD(batch_append_many) {
     const auto& entry = entries[index];
     const rocksdb::Slice key(entry.key);
     rocksdb::Status status;
-    if (entry.isDelete) {
-      status = column ? batch->batch.Delete(column, key) : batch->batch.Delete(key);
-    } else {
-      const rocksdb::Slice value(entry.value);
+    if (entry.value) {
+      const rocksdb::Slice value(*entry.value);
       status = column ? batch->batch.Put(column, key, value) : batch->batch.Put(key, value);
+    } else {
+      status = column ? batch->batch.Delete(column, key) : batch->batch.Delete(key);
     }
     if (!status.ok()) {
       const auto rollbackStatus = savePoint.Rollback();
@@ -5303,6 +5334,18 @@ NAPI_METHOD(batch_append_many) {
 
   ROCKS_STATUS_THROWS_NAPI(savePoint.Commit());
   return nullptr;
+}
+
+NAPI_METHOD(batch_append_many) {
+  return BatchAppendMany<BatchAppendInputType::Any>(env, info);
+}
+
+NAPI_METHOD(batch_append_many_buffer) {
+  return BatchAppendMany<BatchAppendInputType::Buffer>(env, info);
+}
+
+NAPI_METHOD(batch_append_many_string) {
+  return BatchAppendMany<BatchAppendInputType::String>(env, info);
 }
 
 NAPI_METHOD(batch_merge) {
@@ -6131,6 +6174,8 @@ NAPI_INIT() {
   NAPI_EXPORT_FUNCTION(batch_put_log_data);
   NAPI_EXPORT_FUNCTION(batch_del);
   NAPI_EXPORT_FUNCTION(batch_append_many);
+  NAPI_EXPORT_FUNCTION(batch_append_many_buffer);
+  NAPI_EXPORT_FUNCTION(batch_append_many_string);
   NAPI_EXPORT_FUNCTION(batch_clear);
   NAPI_EXPORT_FUNCTION(batch_write);
   NAPI_EXPORT_FUNCTION(batch_write_sync);

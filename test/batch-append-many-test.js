@@ -119,6 +119,47 @@ test('raw appendMany validates the complete input before mutation', async functi
   t.end()
 })
 
+test('raw appendMany input type hints preserve behavior and reject mismatches', async function (t) {
+  const db = testCommon.factory({ keyEncoding: 'buffer', valueEncoding: 'buffer' })
+  await db.open()
+  const batch = db._chainedBatch()
+
+  batch._appendMany(['string-put', 'value', 'string-delete', null], { inputType: 'string' })
+  batch._appendMany(
+    [Buffer.from('buffer-put'), Buffer.from('value'), Buffer.from('buffer-delete'), null],
+    { inputType: 'buffer' }
+  )
+  const expected = rows(batch)
+
+  for (const [inputType, entries] of [
+    ['string', [Buffer.from('key'), 'value']],
+    ['buffer', [Buffer.from('key'), 'value']],
+    ['invalid', ['key', 'value']]
+  ]) {
+    t.throws(
+      () => batch._appendMany(entries, { inputType }),
+      /argument|failed|inputType/i,
+      `${inputType} hint rejects a mismatched entry or option`
+    )
+    t.deepEqual(rows(batch), expected, `${inputType} failure leaves existing operations unchanged`)
+  }
+
+  t.deepEqual(
+    rows(batch),
+    [
+      ['put', 'string-put', 'value'],
+      ['del', 'string-delete', null],
+      ['put', 'buffer-put', 'value'],
+      ['del', 'buffer-delete', null]
+    ],
+    'hinted strings and buffers retain put/delete order'
+  )
+
+  batch._closeSync()
+  await db.close()
+  t.end()
+})
+
 test('raw appendMany copies caller-owned buffers and clears with public state', async function (t) {
   const db = testCommon.factory({ keyEncoding: 'buffer', valueEncoding: 'buffer' })
   await db.open()

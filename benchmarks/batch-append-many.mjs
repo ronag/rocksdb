@@ -78,13 +78,13 @@ function median (values) {
     : sorted[middle]
 }
 
-function executeGroups (batch, method, entrySets, iterations, column) {
-  const options = { column }
+function executeGroups (batch, method, entrySets, iterations, column, inputKind) {
+  const options = method === 'appendManyHinted' ? { column, inputType: inputKind } : { column }
 
   for (let group = 0; group < iterations; group++) {
     const entries = entrySets[group & 1]
 
-    if (method === 'appendMany') {
+    if (method === 'appendMany' || method === 'appendManyHinted') {
       batch._appendMany(entries, options)
     } else {
       for (let index = 0; index < entries.length; index += 2) {
@@ -98,11 +98,11 @@ function executeGroups (batch, method, entrySets, iterations, column) {
   }
 }
 
-function measure (batch, method, entrySets, iterations, size, column) {
+function measure (batch, method, entrySets, iterations, size, column, inputKind) {
   globalThis.gc()
   const cpuStart = process.cpuUsage()
   const start = process.hrtime.bigint()
-  executeGroups(batch, method, entrySets, iterations, column)
+  executeGroups(batch, method, entrySets, iterations, column, inputKind)
   const duration = Number(process.hrtime.bigint() - start)
   const cpu = process.cpuUsage(cpuStart)
   const operations = iterations * size
@@ -195,32 +195,46 @@ try {
       const entrySets = [entriesFor(size, 0, inputKind), entriesFor(size, 1, inputKind)]
       const batches = {
         scalar: db._chainedBatch(),
-        appendMany: db._chainedBatch()
+        appendMany: db._chainedBatch(),
+        appendManyHinted: db._chainedBatch()
       }
 
       for (let warmup = 0; warmup < warmupSamples; warmup++) {
-        executeGroups(batches.scalar, 'scalar', entrySets, iterations, column)
-        executeGroups(batches.appendMany, 'appendMany', entrySets, iterations, column)
+        executeGroups(batches.scalar, 'scalar', entrySets, iterations, column, inputKind)
+        executeGroups(batches.appendMany, 'appendMany', entrySets, iterations, column, inputKind)
+        executeGroups(
+          batches.appendManyHinted,
+          'appendManyHinted',
+          entrySets,
+          iterations,
+          column,
+          inputKind
+        )
       }
 
-      const samples = { scalar: [], appendMany: [] }
+      const samples = { scalar: [], appendMany: [], appendManyHinted: [] }
       for (let sample = 0; sample < measuredSamples; sample++) {
-        const order = sample % 2 === 0
-          ? ['scalar', 'appendMany']
-          : ['appendMany', 'scalar']
+        const order =
+          sample % 3 === 0
+            ? ['scalar', 'appendMany', 'appendManyHinted']
+            : sample % 3 === 1
+              ? ['appendMany', 'appendManyHinted', 'scalar']
+              : ['appendManyHinted', 'scalar', 'appendMany']
 
         for (const method of order) {
           samples[method].push(
-            measure(batches[method], method, entrySets, iterations, size, column)
+            measure(batches[method], method, entrySets, iterations, size, column, inputKind)
           )
         }
       }
 
       batches.scalar._closeSync()
       batches.appendMany._closeSync()
+      batches.appendManyHinted._closeSync()
 
       const scalarWall = median(samples.scalar.map((sample) => sample.wallNsPerOperation))
       const bulkWall = median(samples.appendMany.map((sample) => sample.wallNsPerOperation))
+      const hintedWall = median(samples.appendManyHinted.map((sample) => sample.wallNsPerOperation))
 
       cases.push({
         inputKind,
@@ -236,8 +250,16 @@ try {
           wallNsPerOperation: bulkWall,
           cpuNsPerOperation: median(samples.appendMany.map((sample) => sample.cpuNsPerOperation))
         },
+        appendManyHinted: {
+          wallNsPerOperation: hintedWall,
+          cpuNsPerOperation: median(
+            samples.appendManyHinted.map((sample) => sample.cpuNsPerOperation)
+          )
+        },
         speedup: scalarWall / bulkWall,
-        wallReductionPercent: (1 - bulkWall / scalarWall) * 100
+        wallReductionPercent: (1 - bulkWall / scalarWall) * 100,
+        hintedSpeedup: scalarWall / hintedWall,
+        hintedOverGenericPercent: (1 - hintedWall / bulkWall) * 100
       })
     }
   }
@@ -277,8 +299,10 @@ if (process.env.BENCH_JSON === '1') {
     {
       scalarNsPerOperation: entry.scalar.wallNsPerOperation.toFixed(2),
       appendManyNsPerOperation: entry.appendMany.wallNsPerOperation.toFixed(2),
+      hintedNsPerOperation: entry.appendManyHinted.wallNsPerOperation.toFixed(2),
       speedup: `${entry.speedup.toFixed(3)}x`,
-      wallReduction: `${entry.wallReductionPercent.toFixed(2)}%`
+      hintedSpeedup: `${entry.hintedSpeedup.toFixed(3)}x`,
+      hintedOverGeneric: `${entry.hintedOverGenericPercent.toFixed(2)}%`
     }
   ])))
 }
