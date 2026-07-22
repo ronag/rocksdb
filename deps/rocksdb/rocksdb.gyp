@@ -24,7 +24,6 @@
         "ZSTD_STATIC_LINKING_ONLY=1",
         "ROCKSDB_BACKTRACE=1",
         "NIOSTATS_CONTEXT=1",
-        "NPERF_CONTEXT=1",
         "BOOST_REGEX_STANDALONE=yes"
       ],
       "include_dirs": [
