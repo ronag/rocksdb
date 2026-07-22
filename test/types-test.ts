@@ -25,6 +25,7 @@ import {
   RocksUnexposedPackedGetManyResult,
   RocksUpdate,
   RocksWriteBufferManager,
+  RocksWritePerfContext,
   SliceLike,
   ioUringAvailable,
 } from '..'
@@ -601,14 +602,23 @@ batch._appendMany([Buffer.from('key'), null], { inputType: 'buffer' })
 batch._merge(slice, slice)
 batch._mergeParts([slice], batchParts)
 batch._putLogData(slice)
-batch._writeSync({ sync: true })
-const writeProfile = batch._writeSyncProfile({ sync: true })
+batch._writeSync({ sync: true, disableWAL: true })
+const writeProfile = batch._writeSync({ profile: true, disableWAL: true })
 expectType<number>(writeProfile.writeWalNanos)
 expectType<number>(writeProfile.writeMemtableNanos)
 expectType<number>(writeProfile.writeDelayNanos)
 expectType<number>(writeProfile.writeSchedulingFlushesCompactionsNanos)
 expectType<number>(writeProfile.writePreAndPostProcessNanos)
 expectType<number>(writeProfile.writeThreadWaitNanos)
+expectType<Promise<void>>(batch.write({ disableWAL: true }))
+expectType<Promise<void>>(batch._writeAsync({ disableWAL: true }))
+expectType<Promise<RocksWritePerfContext>>(
+  batch._writeAsync({ profile: true, disableWAL: true })
+)
+batch._writeAsync({ profile: true }, (err, profile) => {
+  expectType<Error | null | undefined>(err)
+  expectType<RocksWritePerfContext | undefined>(profile)
+})
 // @ts-expect-error Raw batch values cannot be null
 batch._put(slice, null)
 // @ts-expect-error Raw append-many entries must be encoded values or null deletes
@@ -667,6 +677,10 @@ expectType<Promise<void>>(db.flushWAL(true))
 db.flushWAL(false, (err) => {
   expectType<Error | null | undefined>(err)
 })
+expectType<Promise<void>>(db._flushAsync())
+db._flushAsync((err) => {
+  expectType<Error | null | undefined>(err)
+})
 
 class DerivedRocksLevel extends RocksLevel {
   get currentSequence(): number {
@@ -681,12 +695,17 @@ class DerivedRocksLevel extends RocksLevel {
 expectType<number>(new DerivedRocksLevel('/tmp/derived-rocks-level-types').currentSequence)
 
 new RocksLevel('/tmp/rocks-level-options', {
+  atomicFlush: true,
   compression: false,
   blobCompression: 'zstd',
   cache,
   writeBufferManager,
   statistics,
 })
+expectType<Promise<void>>(db.put('key', 'value', { disableWAL: true }))
+expectType<Promise<void>>(
+  db.batch([{ type: 'put', key: 'key', value: 'value' }], { disableWAL: true })
+)
 
 // SliceLike is a private encoded format. The default public encoding remains utf8.
 // @ts-expect-error SliceLike must be encoded before use as a default public key

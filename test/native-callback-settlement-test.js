@@ -256,7 +256,7 @@ test('batch writes settle and release native batches once after callback-then-th
   t.end()
 })
 
-test('query, compactRange and flushWAL settle and unref once after callback-then-throw', async function (t) {
+test('query, compactRange, flushWAL and _flushAsync settle and unref once after callback-then-throw', async function (t) {
   const db = testCommon.factory()
   await db.open()
 
@@ -281,6 +281,13 @@ test('query, compactRange and flushWAL settle and unref once after callback-then
       value: undefined,
       callback: callback => db.flushWAL({}, callback),
       promise: () => db.flushWAL({})
+    },
+    {
+      name: '_flushAsync',
+      bindingName: 'db_flush',
+      value: undefined,
+      callback: callback => db._flushAsync(callback),
+      promise: () => db._flushAsync()
     }
   ]
 

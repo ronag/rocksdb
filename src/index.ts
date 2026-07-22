@@ -989,6 +989,35 @@ class RocksLevel extends AbstractLevel<any, any, any> {
     return promise
   }
 
+  _flushAsync(callback) {
+    callback = fromCallback(callback, kPromise)
+
+    if (this.status !== 'open') {
+      process.nextTick(
+        callback,
+        new ModuleError('Database is not open', {
+          code: 'LEVEL_DATABASE_NOT_OPEN',
+        })
+      )
+      return callback[kPromise]
+    }
+
+    const promise = callback[kPromise]
+    this[kRef]()
+    const complete = once((err, value) => {
+      this[kUnref]()
+      callback(err, value)
+    })
+
+    try {
+      binding.db_flush(this[kContext], complete)
+    } catch (err) {
+      process.nextTick(complete, err)
+    }
+
+    return promise
+  }
+
   flushWAL(options = {}, callback) {
     if (typeof options === 'function') {
       callback = options

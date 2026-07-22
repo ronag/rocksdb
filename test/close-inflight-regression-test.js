@@ -61,6 +61,19 @@ test('close() waits for in-flight flushWAL', async function (t) {
   t.end()
 })
 
+test('close() waits for in-flight _flushAsync', async function (t) {
+  for (let i = 0; i < ITERATIONS; i++) {
+    const db = testCommon.factory({ atomicFlush: true })
+    await db.open()
+    await seed(db, 5)
+    const p = db._flushAsync()
+    await db.close()
+    await p
+  }
+  t.pass('survived _flushAsync+close')
+  t.end()
+})
+
 test('flushWAL owns its lifetime before reading public options', async function (t) {
   const db = testCommon.factory()
   await db.open()
