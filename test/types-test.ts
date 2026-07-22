@@ -602,6 +602,13 @@ batch._merge(slice, slice)
 batch._mergeParts([slice], batchParts)
 batch._putLogData(slice)
 batch._writeSync({ sync: true })
+const writeProfile = batch._writeSyncProfile({ sync: true })
+expectType<number>(writeProfile.writeWalNanos)
+expectType<number>(writeProfile.writeMemtableNanos)
+expectType<number>(writeProfile.writeDelayNanos)
+expectType<number>(writeProfile.writeSchedulingFlushesCompactionsNanos)
+expectType<number>(writeProfile.writePreAndPostProcessNanos)
+expectType<number>(writeProfile.writeThreadWaitNanos)
 // @ts-expect-error Raw batch values cannot be null
 batch._put(slice, null)
 // @ts-expect-error Raw append-many entries must be encoded values or null deletes

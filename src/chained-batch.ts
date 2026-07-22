@@ -209,6 +209,18 @@ class ChainedBatch extends AbstractChainedBatch<any, any, any> {
     })
   }
 
+  // Submit synchronously with scoped RocksDB PerfContext write timers. The
+  // caller's thread-local PerfContext state is restored before return.
+  _writeSyncProfile(options) {
+    return this[kRunOperation]('_writeSyncProfile', () => {
+      return binding.batch_write_sync_profile(
+        this[kDbContext],
+        this[kBatchContext],
+        options ?? EMPTY
+      )
+    })
+  }
+
   // Submit the current native operations without consuming, clearing or
   // closing them. The batch and database must remain open and idle until the
   // callback or promise settles.

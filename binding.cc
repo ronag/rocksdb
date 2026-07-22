@@ -13,6 +13,8 @@
 #include <rocksdb/filter_policy.h>
 #include <rocksdb/merge_operator.h>
 #include <rocksdb/options.h>
+#include <rocksdb/perf_context.h>
+#include <rocksdb/perf_level.h>
 #include <rocksdb/slice.h>
 #include <rocksdb/slice_transform.h>
 #include <rocksdb/statistics.h>
@@ -5483,6 +5485,85 @@ NAPI_METHOD(batch_write_sync) {
   return 0;
 }
 
+class ScopedPerfContext {
+ public:
+  ScopedPerfContext()
+      : context_(rocksdb::get_perf_context()),
+        previousLevel_(rocksdb::GetPerfLevel()),
+        previousContext_(*context_) {
+    context_->Reset();
+    rocksdb::SetPerfLevel(rocksdb::PerfLevel::kEnableTimeExceptForMutex);
+  }
+
+  ~ScopedPerfContext() {
+    rocksdb::SetPerfLevel(previousLevel_);
+    *context_ = previousContext_;
+  }
+
+  rocksdb::PerfContext Snapshot() const { return *context_; }
+
+ private:
+  rocksdb::PerfContext* context_;
+  rocksdb::PerfLevel previousLevel_;
+  rocksdb::PerfContext previousContext_;
+};
+
+static napi_status SetWritePerfContextValue(napi_env env, napi_value result, const char* name, uint64_t value) {
+  napi_value converted;
+  NAPI_STATUS_RETURN(napi_create_double(env, static_cast<double>(value), &converted));
+  return napi_set_named_property(env, result, name, converted);
+}
+
+static napi_status ConvertWritePerfContext(napi_env env, const rocksdb::PerfContext& context, napi_value* result) {
+  NAPI_STATUS_RETURN(napi_create_object(env, result));
+  NAPI_STATUS_RETURN(SetWritePerfContextValue(env, *result, "writeWalNanos", context.write_wal_time));
+  NAPI_STATUS_RETURN(SetWritePerfContextValue(env, *result, "writeMemtableNanos", context.write_memtable_time));
+  NAPI_STATUS_RETURN(SetWritePerfContextValue(env, *result, "writeDelayNanos", context.write_delay_time));
+  NAPI_STATUS_RETURN(SetWritePerfContextValue(env, *result, "writeSchedulingFlushesCompactionsNanos",
+                                               context.write_scheduling_flushes_compactions_time));
+  NAPI_STATUS_RETURN(SetWritePerfContextValue(env, *result, "writePreAndPostProcessNanos",
+                                               context.write_pre_and_post_process_time));
+  return SetWritePerfContextValue(env, *result, "writeThreadWaitNanos", context.write_thread_wait_nanos);
+}
+
+NAPI_METHOD(batch_write_sync_profile) {
+  NAPI_ARGV(3);
+
+  Database* database;
+  std::shared_ptr<DatabaseReference> reference;
+  NAPI_STATUS_THROWS(GetDatabase(env, argv[0], database, &reference));
+  std::shared_ptr<DatabaseOperation> databaseOperation;
+  NAPI_STATUS_THROWS(BeginDatabaseOperation(env, database, reference, databaseOperation));
+
+  std::shared_ptr<NativeBatch> batch;
+  NAPI_STATUS_THROWS(GetBatch(env, argv[1], batch));
+  NAPI_STATUS_THROWS(ValidateBatch(env, batch, reference));
+
+  bool sync = false;
+  NAPI_STATUS_THROWS(GetProperty(env, argv[2], "sync", sync));
+
+  bool lowPriority = false;
+  NAPI_STATUS_THROWS(GetProperty(env, argv[2], "lowPriority", lowPriority));
+
+  rocksdb::WriteOptions writeOptions;
+  writeOptions.sync = sync;
+  writeOptions.low_pri = lowPriority;
+
+  rocksdb::Status status;
+  rocksdb::PerfContext context;
+  {
+    std::lock_guard lock(batch->mutex);
+    ScopedPerfContext scope;
+    status = database->db->Write(writeOptions, &batch->batch);
+    context = scope.Snapshot();
+  }
+  ROCKS_STATUS_THROWS_NAPI(status);
+
+  napi_value result;
+  NAPI_STATUS_THROWS(ConvertWritePerfContext(env, context, &result));
+  return result;
+}
+
 NAPI_METHOD(batch_count) {
   NAPI_ARGV(1);
 
@@ -6179,6 +6260,7 @@ NAPI_INIT() {
   NAPI_EXPORT_FUNCTION(batch_clear);
   NAPI_EXPORT_FUNCTION(batch_write);
   NAPI_EXPORT_FUNCTION(batch_write_sync);
+  NAPI_EXPORT_FUNCTION(batch_write_sync_profile);
   NAPI_EXPORT_FUNCTION(batch_merge);
   NAPI_EXPORT_FUNCTION(batch_merge_parts);
   NAPI_EXPORT_FUNCTION(batch_count);
