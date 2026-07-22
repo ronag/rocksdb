@@ -248,6 +248,11 @@ export interface RocksColumnOperationOptions {
   column?: RocksColumn
 }
 
+export interface RocksBatchAppendManyOptions extends RocksColumnOperationOptions {
+  /** Assert that every non-null entry has this type to skip per-entry type detection. */
+  inputType?: 'string' | 'buffer'
+}
+
 export interface RocksReadOptions extends RocksColumnOperationOptions {
   fillCache?: boolean
   asyncIO?: boolean
@@ -825,7 +830,7 @@ export interface RocksChainedBatch<TDatabase, KDefault, VDefault> extends Abstra
    * resolved once, every input is copied before return, and any failure leaves
    * the batch unchanged.
    */
-  _appendMany(entries: RocksBatchAppendManyEntries, options?: RocksColumnOperationOptions): void
+  _appendMany(entries: RocksBatchAppendManyEntries, options?: RocksBatchAppendManyOptions): void
   /** Append an encoded merge to an idle, open batch; native code copies both inputs. */
   _merge(key: RocksSlice, value: RocksSlice, options?: RocksColumnOperationOptions): void
   /**

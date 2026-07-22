@@ -94,7 +94,9 @@ pairs under one shared column lookup and native admission. A `null` value means
 delete; puts and deletes retain their exact input order. All entries are
 validated before mutation and copied before return. If validation or a native
 append fails, the existing batch is unchanged. Like every raw mutator, this
-method does not update the public batch `length`.
+method does not update the public batch `length`. Set `options.inputType` to
+`'string'` or `'buffer'` when every non-null entry has that type to skip dynamic
+type detection. A mismatched entry rejects the entire append.
 
 Direct `_clear()`, `_writeSync()`, `_writeAsync()` and raw close are valid only
 when native/raw state is the complete batch state. `_clear()` clears only the
