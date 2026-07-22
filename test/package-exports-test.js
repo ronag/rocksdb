@@ -28,6 +28,7 @@ test('ESM named imports match the public runtime exports', (t) => {
     'RocksCache',
     'RocksWriteBufferManager',
     'RocksStatistics',
+    'pack',
     'ioUringAvailable'
   ])
 

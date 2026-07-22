@@ -12,6 +12,8 @@ import {
   RocksGetManyOptions,
   RocksGetManyUnsafe,
   RocksLevel,
+  RocksPackBuffers,
+  RocksPackResult,
   RocksPackedGetManyResult,
   RocksPackedIteratorResult,
   RocksRawBoundedGetManyOptions,
@@ -27,6 +29,7 @@ import {
   RocksWriteBufferManager,
   SliceLike,
   ioUringAvailable,
+  pack,
 } from '..'
 
 // Internal nominal brands are type implementation details, not runtime exports.
@@ -68,6 +71,19 @@ expectType<Promise<RocksLevel<string, string>>>(RocksLevel.open('/tmp/rocks-leve
 expectType<boolean | null>(ioUringAvailable())
 expectType<1>(RocksGetManyUnsafe.INPUT)
 expectType<2>(RocksGetManyUnsafe.OUTPUT)
+
+const reusablePackBuffers: RocksPackBuffers = {
+  buffer: Buffer.alloc(128),
+  offsets: new Uint32Array(16),
+}
+const packedInput = pack(
+  [Slice.fromString('slice'), Buffer.from('buffer'), 'string'],
+  reusablePackBuffers
+)
+expectType<RocksPackResult>(packedInput)
+expectType<RocksPackBuffers>(packedInput.buffers)
+expectType<Uint32Array>(packedInput.offsets)
+expectType<Buffer>(packedInput.buffer)
 
 const removedPublicCallback = (_err?: Error | null, _value?: unknown): void => {}
 // @ts-expect-error Standard open callbacks were removed by abstract-level v3

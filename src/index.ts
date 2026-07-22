@@ -8,6 +8,7 @@ import binding = require('./binding')
 import { RocksCache } from './cache'
 import { ChainedBatch } from './chained-batch'
 import { Iterator, KeyIterator, ValueIterator } from './iterator'
+export { pack } from './pack'
 import { RocksStatistics, getStatisticsContext } from './statistics'
 import {
   getPackedMode,

@@ -503,6 +503,23 @@ export interface RocksPackedGetManyInput {
   readonly buffer: Buffer
 }
 
+/** Full-capacity allocations retained by {@link pack} for a later packing call. */
+export interface RocksPackBuffers {
+  readonly offsets: Uint32Array
+  readonly buffer: Buffer
+}
+
+/** A packed getMany input plus the allocations that can be reused by a later {@link pack} call. */
+export interface RocksPackResult extends RocksPackedGetManyInput {
+  readonly buffers: RocksPackBuffers
+}
+
+/** Pack encoded values into one getMany input, optionally reusing allocations returned by an earlier call. */
+export function pack(
+  values: readonly (Slice | Buffer | string)[],
+  buffers?: RocksPackBuffers
+): RocksPackResult
+
 export type RocksRawGetManyValues<
   E extends RocksRawEncoding,
   AllowPartial extends boolean = true,

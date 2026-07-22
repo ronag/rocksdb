@@ -175,6 +175,32 @@ Either table can be passed to `_getManySync()` or `_getManyAsync()` without
 materializing individual buffers. For example, use iterator values as multi-get
 keys with `{ offsets: result.values, buffer: result.buffer }`.
 
+The exported `pack()` helper turns an array of `Slice`, `Buffer` and string
+values into the same packed input format. The result can be prepared once and
+passed directly to any number of raw multi-get calls:
+
+```js
+const { pack } = require('@nxtedition/rocksdb')
+
+const keys = pack(['one', Buffer.from('two'), slice])
+const values = await db._getManyAsync(keys)
+```
+
+Each result also exposes its full-capacity allocations as `buffers`. Pass those
+back to a later call to avoid reallocating when they are large enough. Reuse
+them only after any read borrowing the packed input has settled:
+
+```js
+let buffers
+
+const first = pack(firstKeys, buffers)
+buffers = first.buffers
+await db._getManyAsync(first, { unsafe: RocksGetManyUnsafe.INPUT })
+
+const second = pack(secondKeys, buffers)
+buffers = second.buffers
+```
+
 The public and raw `getMany` options use `unsafe` as a copy-control bit mask.
 `RocksGetManyUnsafe.INPUT` (`1`) permits async reads to borrow both packed
 arenas and unpacked Buffer/SliceLike keys instead of copying them. Async reads
