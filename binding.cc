@@ -1766,7 +1766,23 @@ struct BaseIterator : public Closable {
 
   bool Valid() const {
     assert(iterator_);
-    return iterator_->Valid() && InRange(iterator_->key());
+    if (!iterator_->Valid()) return false;
+
+    // RocksDB enforces an inclusive lower bound and exclusive upper bound.
+    // Only the opposite inclusivity at the terminal edge needs a manual check.
+    if (reverse_) {
+      if (!lower_bound_ || lower_inclusive_) return true;
+      const auto key = iterator_->key();
+      const auto* comparator = column_->GetComparator();
+      const auto compared = comparator->Compare(key, *lower_bound_);
+      return compared > 0;
+    }
+
+    if (!upper_bound_ || !upper_inclusive_) return true;
+    const auto key = iterator_->key();
+    const auto* comparator = column_->GetComparator();
+    const auto compared = comparator->Compare(key, *upper_bound_);
+    return compared <= 0;
   }
 
   bool Increment() {
@@ -1815,9 +1831,10 @@ struct BaseIterator : public Closable {
   }
 
   rocksdb::Status PreflightStatus() const {
-    // Every movement checks Status(), so replay a terminal failure before a
-    // retry can call Next()/Prev() on RocksDB's invalid iterator. Keeping the
-    // status locally avoids a virtual RocksDB call on every healthy batch.
+    // A failed movement makes Valid() false and is checked through Status().
+    // Replay that terminal failure before a retry can call Next()/Prev() on
+    // RocksDB's invalid iterator. Keeping the status locally avoids a virtual
+    // RocksDB call on every healthy batch.
     return terminalStatus_;
   }
 
@@ -1922,6 +1939,9 @@ static bool SupportsPackedReads(const Encoding encoding) {
 }
 
 static constexpr size_t kAutoPackedValueBytes = 8 * 1024;
+// Iterator timeouts are best effort. Sampling avoids a clock read for every
+// rejected candidate during heavily filtered scans.
+static constexpr size_t kDeadlineCheckInterval = 64;
 
 struct IteratorOptions {
   bool unsafe = false;
@@ -2019,6 +2039,7 @@ class Iterator final : public BaseIterator, public std::enable_shared_from_this<
   std::optional<re2::RE2> keyFilter_;
   std::optional<re2::RE2> valueFilter_;
   const bool unsafe_;
+  bool terminal_ = false;
 
   bool ShouldAutoPackCurrent() const {
     if (values_) return CurrentValue().size() <= kAutoPackedValueBytes;
@@ -2074,11 +2095,13 @@ class Iterator final : public BaseIterator, public std::enable_shared_from_this<
 
   void Seek(const rocksdb::Slice& target) override {
     first_ = true;
+    terminal_ = false;
     return BaseIterator::Seek(target);
   }
 
   rocksdb::Status Refresh() override {
     first_ = true;
+    terminal_ = false;
     return BaseIterator::Refresh();
   }
 
@@ -2181,6 +2204,7 @@ class Iterator final : public BaseIterator, public std::enable_shared_from_this<
 
           const auto deadline =
               timeout ? database_->db->GetEnv()->NowMicros() + static_cast<uint64_t>(timeout) * 1000 : 0;
+          size_t scannedSinceDeadlineCheck = kDeadlineCheckInterval;
 
           while (true) {
             if (state.count >= count || state.bytes > highWaterMarkBytes_) {
@@ -2190,15 +2214,18 @@ class Iterator final : public BaseIterator, public std::enable_shared_from_this<
               break;
             }
 
-            if (deadline > 0 && database_->db->GetEnv()->NowMicros() > deadline) {
-              // Timed out: neither finished nor limited; the caller may retry.
-              break;
+            if (deadline > 0 && scannedSinceDeadlineCheck >= kDeadlineCheckInterval) {
+              if (database_->db->GetEnv()->NowMicros() > deadline) {
+                // Timed out: neither finished nor limited; the caller may retry.
+                break;
+              }
+              scannedSinceDeadlineCheck = 0;
             }
 
-            // RocksDB requires Next()/Prev() to be called only while Valid().
-            // Natural or range exhaustion leaves the native iterator invalid;
-            // make repeated raw reads idempotent instead of advancing it again.
-            if (!first_ && !Valid()) {
+            // Natural or range exhaustion leaves the native iterator invalid.
+            // Remember it so repeated raw reads do not call Next()/Prev() on an
+            // invalid RocksDB iterator or repeat the range checks.
+            if (terminal_) {
               state.finished = true;
               break;
             }
@@ -2209,13 +2236,14 @@ class Iterator final : public BaseIterator, public std::enable_shared_from_this<
               first_ = false;
             }
 
-            ROCKS_STATUS_RETURN(Status());
-
             if (!Valid()) {
+              ROCKS_STATUS_RETURN(Status());
               // Iterator naturally exhausted.
+              terminal_ = true;
               state.finished = true;
               break;
             }
+            if (deadline > 0) scannedSinceDeadlineCheck++;
 
             // Apply the key/value filters BEFORE charging the user `limit`, so
             // `limit` counts matched (emitted) rows, not rows merely scanned and
@@ -2237,6 +2265,7 @@ class Iterator final : public BaseIterator, public std::enable_shared_from_this<
             if (!Increment()) {
               // Hit the user's `limit` option: terminal, and flag that it was a
               // limit rather than natural exhaustion.
+              terminal_ = true;
               state.finished = true;
               state.limited = true;
               break;
@@ -2439,6 +2468,7 @@ class Iterator final : public BaseIterator, public std::enable_shared_from_this<
 
     const auto deadline =
         timeout ? database_->db->GetEnv()->NowMicros() + static_cast<uint64_t>(timeout) * 1000 : 0;
+    size_t scannedSinceDeadlineCheck = kDeadlineCheckInterval;
 
     size_t rowCount = 0;
     size_t bytes = 0;
@@ -2450,15 +2480,18 @@ class Iterator final : public BaseIterator, public std::enable_shared_from_this<
         break;
       }
 
-      if (deadline > 0 && database_->db->GetEnv()->NowMicros() > deadline) {
-        // Timed out: neither finished nor limited; the caller may retry.
-        break;
+      if (deadline > 0 && scannedSinceDeadlineCheck >= kDeadlineCheckInterval) {
+        if (database_->db->GetEnv()->NowMicros() > deadline) {
+          // Timed out: neither finished nor limited; the caller may retry.
+          break;
+        }
+        scannedSinceDeadlineCheck = 0;
       }
 
-      // RocksDB requires Next()/Prev() to be called only while Valid().
-      // Natural or range exhaustion leaves the native iterator invalid;
-      // make repeated raw reads idempotent instead of advancing it again.
-      if (!first_ && !Valid()) {
+      // Natural or range exhaustion leaves the native iterator invalid.
+      // Remember it so repeated raw reads do not call Next()/Prev() on an
+      // invalid RocksDB iterator or repeat the range checks.
+      if (terminal_) {
         NAPI_STATUS_THROWS(napi_get_boolean(env, true, &finished));
         break;
       }
@@ -2469,13 +2502,14 @@ class Iterator final : public BaseIterator, public std::enable_shared_from_this<
         first_ = false;
       }
 
-      ROCKS_STATUS_THROWS_NAPI(Status());
-
       if (!Valid()) {
+        ROCKS_STATUS_THROWS_NAPI(Status());
         // Iterator naturally exhausted.
+        terminal_ = true;
         NAPI_STATUS_THROWS(napi_get_boolean(env, true, &finished));
         break;
       }
+      if (deadline > 0) scannedSinceDeadlineCheck++;
 
       // Apply the key/value filters BEFORE charging the user `limit`, so `limit`
       // counts matched (emitted) rows, not rows merely scanned and discarded.
@@ -2494,6 +2528,7 @@ class Iterator final : public BaseIterator, public std::enable_shared_from_this<
       if (!Increment()) {
         // Hit the user's `limit` option: terminal, and flag that it was a limit
         // rather than natural exhaustion.
+        terminal_ = true;
         NAPI_STATUS_THROWS(napi_get_boolean(env, true, &finished));
         NAPI_STATUS_THROWS(napi_get_boolean(env, true, &limited));
         break;
