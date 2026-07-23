@@ -26,6 +26,24 @@ async function writeRaw (batch) {
   }
 }
 
+test('undefined column maps are treated as omitted', async function (t) {
+  for (const [name, constructorOptions, openOptions] of [
+    ['constructor', { columns: undefined }, undefined],
+    ['open', undefined, { columns: undefined }]
+  ]) {
+    const db = testCommon.factory(constructorOptions)
+
+    await db.open(openOptions)
+    await db.put('key', 'value')
+
+    t.equal(await db.get('key'), 'value', `${name} options leave the default column usable`)
+    t.deepEqual(db.columns, {}, `${name} options expose no explicit columns`)
+
+    await db.close()
+  }
+  t.end()
+})
+
 test('explicit columns inherit top-level column options', async function (t) {
   let overrideReads = 0
   let overrideReceiver

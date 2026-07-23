@@ -3452,23 +3452,30 @@ NAPI_METHOD(db_open) {
       napi_value columns;
       NAPI_STATUS_THROWS(napi_get_named_property(env, options, "columns", &columns));
 
-      napi_value keys;
-      NAPI_STATUS_THROWS(napi_get_property_names(env, columns, &keys));
+      napi_valuetype columnsType;
+      NAPI_STATUS_THROWS(napi_typeof(env, columns, &columnsType));
 
-      uint32_t len;
-      NAPI_STATUS_THROWS(napi_get_array_length(env, keys, &len));
+      // Optional properties commonly survive object spreads with an undefined
+      // value. Treat that exactly like an omitted column map.
+      if (columnsType != napi_undefined) {
+        napi_value keys;
+        NAPI_STATUS_THROWS(napi_get_property_names(env, columns, &keys));
 
-      descriptors.resize(len);
-      for (uint32_t n = 0; n < len; ++n) {
-        napi_value key;
-        NAPI_STATUS_THROWS(napi_get_element(env, keys, n, &key));
+        uint32_t len;
+        NAPI_STATUS_THROWS(napi_get_array_length(env, keys, &len));
 
-        napi_value column;
-        NAPI_STATUS_THROWS(napi_get_property(env, columns, key, &column));
+        descriptors.resize(len);
+        for (uint32_t n = 0; n < len; ++n) {
+          napi_value key;
+          NAPI_STATUS_THROWS(napi_get_element(env, keys, n, &key));
 
-        NAPI_STATUS_THROWS(InitOptions(env, descriptors[n].options, column));
+          napi_value column;
+          NAPI_STATUS_THROWS(napi_get_property(env, columns, key, &column));
 
-        NAPI_STATUS_THROWS(GetValue(env, key, descriptors[n].name));
+          NAPI_STATUS_THROWS(InitOptions(env, descriptors[n].options, column));
+
+          NAPI_STATUS_THROWS(GetValue(env, key, descriptors[n].name));
+        }
       }
     }
 
