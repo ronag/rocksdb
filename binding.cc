@@ -1351,7 +1351,7 @@ struct BatchEntry {
   BatchOp op = BatchOp::Empty;
   std::optional<std::string> key = std::nullopt;
   std::optional<std::string> val = std::nullopt;
-  std::optional<ColumnFamily> column = std::nullopt;
+  std::optional<uint32_t> column = std::nullopt;
 };
 
 #if defined(ROCKS_LEVEL_TEST_FAULTS)
@@ -1360,7 +1360,8 @@ static std::atomic<bool> gFailBatchAppendManyAfterFirstOperation{false};
 #endif
 
 struct BatchIterator : public rocksdb::WriteBatch::Handler {
-  BatchIterator(const bool keys,
+  BatchIterator(const Database* database,
+                const bool keys,
                 const bool values,
                 const bool data,
                 const rocksdb::ColumnFamilyHandle* column,
@@ -1371,7 +1372,14 @@ struct BatchIterator : public rocksdb::WriteBatch::Handler {
         data_(data),
         columnId_(column ? std::optional<uint32_t>(column->GetID()) : std::nullopt),
         keyEncoding_(keyEncoding),
-        valueEncoding_(valueEncoding) {}
+        valueEncoding_(valueEncoding) {
+    // A database can be imported by wrappers in different N-API environments.
+    // Snapshot plain names while this wrapper owns an open operation, then let
+    // JavaScript resolve each name through its own db.columns object.
+    for (const auto& [id, column] : database->columns) {
+      columnNames_.emplace(static_cast<uint32_t>(id), column.descriptor.name);
+    }
+  }
 
   napi_status Iterate(napi_env env, const rocksdb::WriteBatch& batch, napi_value* result) {
     // Updates reuses one BatchIterator across WAL batches. Never let a failed
@@ -1432,9 +1440,15 @@ struct BatchIterator : public rocksdb::WriteBatch::Handler {
                                  cache_[n].op == BatchOp::DeleteRange ? keyEncoding_ : valueEncoding_, val));
       NAPI_STATUS_RETURN(napi_set_element(env, *result, n * 4 + 2, val));
 
-      // TODO (fix)
-      // napi_value column = cache_[n].column ? cache_[n].column->val : nullVal;
-      NAPI_STATUS_RETURN(napi_set_element(env, *result, n * 4 + 3, nullVal));
+      napi_value column = nullVal;
+      if (cache_[n].column) {
+        const auto found = columnNames_.find(*cache_[n].column);
+        if (found != columnNames_.end()) {
+          NAPI_STATUS_RETURN(
+              napi_create_string_utf8(env, found->second.data(), found->second.size(), &column));
+        }
+      }
+      NAPI_STATUS_RETURN(napi_set_element(env, *result, n * 4 + 3, column));
 
 #if defined(ROCKS_LEVEL_TEST_FAULTS)
       if (n == 0 && gFailBatchIteratorAfterFirstRow.exchange(false, std::memory_order_relaxed)) {
@@ -1462,9 +1476,7 @@ struct BatchIterator : public rocksdb::WriteBatch::Handler {
       entry.val = value.ToStringView();
     }
 
-    // if (database_ && database_->columns.find(column_family_id) != database_->columns.end()) {
-    //   entry.column = database_->columns[column_family_id];
-    // }
+    entry.column = column_family_id;
 
     cache_.push_back(entry);
 
@@ -1482,9 +1494,7 @@ struct BatchIterator : public rocksdb::WriteBatch::Handler {
       entry.key = key.ToStringView();
     }
 
-    // if (database_ && database_->columns.find(column_family_id) != database_->columns.end()) {
-    //   entry.column = database_->columns[column_family_id];
-    // }
+    entry.column = column_family_id;
 
     cache_.push_back(entry);
 
@@ -1506,9 +1516,7 @@ struct BatchIterator : public rocksdb::WriteBatch::Handler {
       entry.val = value.ToStringView();
     }
 
-    // if (database_ && database_->columns.find(column_family_id) != database_->columns.end()) {
-    //   entry.column = database_->columns[column_family_id];
-    // }
+    entry.column = column_family_id;
 
     cache_.push_back(entry);
 
@@ -1523,6 +1531,7 @@ struct BatchIterator : public rocksdb::WriteBatch::Handler {
     }
 
     BatchEntry entry = {BatchOp::DeleteRange};
+    entry.column = column_family_id;
     if (keys_) {
       entry.key = beginKey.ToStringView();
       entry.val = endKey.ToStringView();
@@ -1546,6 +1555,7 @@ struct BatchIterator : public rocksdb::WriteBatch::Handler {
   bool Continue() override { return true; }
 
  private:
+  std::map<uint32_t, std::string> columnNames_;
   const bool keys_;
   const bool values_;
   const bool data_;
@@ -5748,7 +5758,7 @@ NAPI_METHOD(batch_iterate) {
   rocksdb::ColumnFamilyHandle* column = nullptr;
   NAPI_STATUS_THROWS(GetColumnProperty(env, options, database, column, false));
 
-  BatchIterator iterator(keys, values, data, column, keyEncoding, valueEncoding);
+  BatchIterator iterator(database, keys, values, data, column, keyEncoding, valueEncoding);
 
   napi_value result;
   std::lock_guard lock(batch->mutex);
@@ -5768,7 +5778,7 @@ struct Updates : public BatchIterator, public Closable {
           const rocksdb::ColumnFamilyHandle* column,
           const Encoding keyEncoding,
           const Encoding valueEncoding)
-      : BatchIterator(keys, values, data, column, keyEncoding, valueEncoding),
+      : BatchIterator(database, keys, values, data, column, keyEncoding, valueEncoding),
         database_(database),
         reference_(std::move(reference)),
         databaseContext_(std::move(databaseContext)),

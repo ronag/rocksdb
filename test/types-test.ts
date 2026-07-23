@@ -627,7 +627,7 @@ batch._appendMany([slice, undefined])
 batch._appendMany(['key', 'value'], { inputType: 'slice' })
 // @ts-expect-error Raw batch parts must be Buffer or SliceLike values
 batch._putParts([Buffer.from('key'), 'not-encoded'], batchParts)
-expectType<Array<string | Buffer | null>>(
+expectType<Array<string | Buffer | RocksColumn | null>>(
   batch.toArray({ keyEncoding: 'utf8', valueEncoding: 'buffer' })
 )
 expectType<Promise<void>>(batch[Symbol.asyncDispose]())
@@ -635,6 +635,7 @@ for (const entry of batch) {
   expectType<'put' | 'del' | 'merge' | 'data'>(entry.type)
   expectType<string | null>(entry.key)
   expectType<string | null>(entry.value)
+  expectType<RocksColumn | null>(entry.column)
 }
 batch._clear()
 
@@ -644,6 +645,9 @@ expectType<AsyncGenerator<RocksUpdate<string, Buffer>, void, unknown>>(
 declare const update: RocksUpdate<string, Buffer>
 expectType<number>(update.seq)
 expectType<number>(update.nextSeq)
+expectType<
+  Array<'put' | 'del' | 'merge' | 'data' | 'clear' | string | Buffer | RocksColumn | null>
+>(update.rows)
 // @ts-expect-error Update cursors are readonly
 update.nextSeq = 0
 
