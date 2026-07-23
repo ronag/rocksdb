@@ -5,8 +5,8 @@ cd "$(dirname "$0")"
 
 # Releases and their tags must originate from the canonical branch.
 BRANCH=$(git branch --show-current)
-if [ "$BRANCH" != master ]; then
-  echo "Releases must be run from master (current branch: ${BRANCH:-detached HEAD})." >&2
+if [ "$BRANCH" != master ] && [ "$BRANCH" != main ]; then
+  echo "Releases must be run from master or main (current branch: ${BRANCH:-detached HEAD})." >&2
   exit 1
 fi
 
