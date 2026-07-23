@@ -26,6 +26,14 @@ const EMPTY = {}
 const DEBUG = process.env.NODE_ENV !== 'production'
 const cleanupAttempts = 3
 
+function resolveBatchColumns(rows, columns) {
+  for (let index = 3; index < rows.length; index += 4) {
+    const name = rows[index]
+    rows[index] = typeof name === 'string' && Object.hasOwn(columns, name) ? columns[name] : null
+  }
+  return rows
+}
+
 function batchBusyError(operation, active) {
   return new ModuleError(
     `Batch is busy: cannot call ${operation}() while ${active} is in progress`,
@@ -348,6 +356,7 @@ class ChainedBatch extends AbstractChainedBatch<any, any, any> {
         type: rows[n + 0],
         key: rows[n + 1],
         value: rows[n + 2],
+        column: rows[n + 3],
       }
     }
   }
@@ -356,14 +365,17 @@ class ChainedBatch extends AbstractChainedBatch<any, any, any> {
     if (this[kBatchContext] === null) return []
 
     return this[kRunOperation]('toArray', () => {
-      return binding.batch_iterate(this[kDbContext], this[kBatchContext], {
-        keys: true,
-        values: true,
-        data: true,
-        ...options,
-      })
+      return resolveBatchColumns(
+        binding.batch_iterate(this[kDbContext], this[kBatchContext], {
+          keys: true,
+          values: true,
+          data: true,
+          ...options,
+        }),
+        this.db.columns
+      )
     })
   }
 }
 
-export { ChainedBatch }
+export { ChainedBatch, resolveBatchColumns }

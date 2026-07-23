@@ -794,6 +794,7 @@ export interface RocksBatchEntry<K = Buffer | string, V = Buffer | string> {
   readonly type: 'put' | 'del' | 'merge' | 'data'
   readonly key: K | null
   readonly value: V | null
+  readonly column: RocksColumn | null
 }
 
 export interface RocksBatchToArrayOptions<
@@ -903,7 +904,14 @@ export interface RocksChainedBatch<TDatabase, KDefault, VDefault> extends Abstra
   >(
     options?: RocksBatchToArrayOptions<KEncoding, VEncoding>
   ): Array<
-    'put' | 'del' | 'merge' | 'data' | RocksDecoded<KEncoding> | RocksDecoded<VEncoding> | null
+    | 'put'
+    | 'del'
+    | 'merge'
+    | 'data'
+    | RocksDecoded<KEncoding>
+    | RocksDecoded<VEncoding>
+    | RocksColumn
+    | null
   >
   [Symbol.iterator](): IterableIterator<RocksBatchEntry<string, string>>
 }
@@ -967,7 +975,9 @@ export interface RocksUpdatesOptions<
 export interface RocksUpdate<K = Buffer | string, V = Buffer | string> {
   readonly seq: number
   readonly nextSeq: number
-  readonly rows: Array<'put' | 'del' | 'merge' | 'data' | 'clear' | K | V | null>
+  readonly rows: Array<
+    'put' | 'del' | 'merge' | 'data' | 'clear' | K | V | RocksColumn | null
+  >
 }
 
 export interface RocksCompactRangeOptions {

@@ -6,7 +6,7 @@ import { fromCallback } from 'catering'
 import ModuleError = require('module-error')
 import binding = require('./binding')
 import { RocksCache } from './cache'
-import { ChainedBatch } from './chained-batch'
+import { ChainedBatch, resolveBatchColumns } from './chained-batch'
 import { Iterator, KeyIterator, ValueIterator } from './iterator'
 import { RocksStatistics, getStatisticsContext } from './statistics'
 import {
@@ -929,6 +929,7 @@ class RocksLevel extends AbstractLevel<any, any, any> {
         if (!value) {
           break
         }
+        resolveBatchColumns(value.rows, this[kColumns])
         yield value
       }
     } catch (err) {

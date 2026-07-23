@@ -43,8 +43,11 @@ test('batch put concatenates Buffer and SliceLike parts synchronously', async fu
   valueParts[0].fill(0)
 
   const rows = batch.toArray({ keyEncoding: 'buffer', valueEncoding: 'buffer' })
-  t.same(rows, ['put', Buffer.from('record_key'), Buffer.from('value-middle-tail'), null],
-    'batch inspection exposes the concatenated entry')
+  t.same(
+    rows,
+    ['put', Buffer.from('record_key'), Buffer.from('value-middle-tail'), db.columns.default],
+    'batch inspection exposes the concatenated entry'
+  )
 
   await writeRaw(batch)
   t.same(await db.get(Buffer.from('record_key')), Buffer.from('value-middle-tail'),
