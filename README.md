@@ -127,6 +127,21 @@ report that case as `LEVEL_ABORTED` rather than returning an empty array that
 abstract-level would treat as permanent exhaustion. A `nextv()` caller can retry;
 `all()` follows abstract-level's terminal error cleanup and closes the iterator.
 
+## Raw iterator read limits
+
+The raw `_nextvSync()` and `_nextvAsync()` methods accept per-read
+`highWaterMarkBytes` and `highWaterMarkCount` options. The byte watermark is a
+soft output-size cap: the row that crosses it is included. The count watermark
+limits native rows examined, including rows rejected by `keyFilter` or
+`valueFilter`; `0` still examines one row so a caller can always make progress.
+The iterator-construction `highWaterMarkBytes` option is deprecated and remains
+only as a backwards-compatible default when a read omits its own byte watermark.
+
+A raw result that contains fewer rows than requested has `reason: 'bytes'`,
+`'count'` or `'eof'` when one of those conditions stopped it. `reason` is absent
+when the requested output size was satisfied. Existing `finished` and `limited`
+flags remain available for compatibility.
+
 ## Packed raw reads
 
 The raw `_nextvSync()`, `_nextvAsync()`, `_getManySync()` and
