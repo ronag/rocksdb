@@ -129,11 +129,9 @@ abstract-level would treat as permanent exhaustion. A `nextv()` caller can retry
 
 ## Raw iterator read limits
 
-The raw `_nextvSync()` and `_nextvAsync()` methods accept per-read
-`highWaterMarkBytes` and `highWaterMarkCount` options. The byte watermark is a
-soft output-size cap: the row that crosses it is included. The count watermark
-limits native rows examined, including rows rejected by `keyFilter` or
-`valueFilter`; `0` still examines one row so a caller can always make progress.
+The raw `_nextvSync()` and `_nextvAsync()` methods accept a per-read
+`highWaterMarkBytes` option. It is a soft output-size cap over enabled fields
+from rows that pass the iterator filters; the row that crosses it is included.
 Likewise, a positive `timeout` cannot stop a nonterminal read until it has
 examined at least one native row. A row rejected by a filter still satisfies
 this progress guarantee, even when the read returns no rows.
@@ -145,13 +143,13 @@ to that read, including rows rejected by filters. This allows callers to trace
 scan progress independently of the number of rows returned. If a raw read
 consumes rows previously prefetched by public `next()`, the originating native
 `processed` count is apportioned across the cached rows as they are consumed. A
-`bytes`, `count` or `timeout` result always has `processed > 0`; an EOF result
-can have `processed: 0`.
+`bytes` or `timeout` result always has `processed > 0`; an EOF result can have
+`processed: 0`.
 
 A raw result that contains fewer rows than requested has `reason: 'bytes'`,
-`'count'`, `'timeout'` or `'eof'` when one of those conditions stopped it.
-`reason` is absent when the requested output size was satisfied. Existing
-`finished` and `limited` flags remain available for compatibility.
+`'timeout'` or `'eof'` when one of those conditions stopped it. `reason` is
+absent when the requested output size was satisfied. Existing `finished` and
+`limited` flags remain available for compatibility.
 
 ## Packed raw reads
 

@@ -21,44 +21,6 @@ async function populate (db) {
   ])
 }
 
-test('per-read highWaterMarkCount counts filtered native rows', async function (t) {
-  for (const [name, read] of [
-    ['sync', (iterator, options) => iterator._nextvSync(10, options)],
-    ['async', (iterator, options) => iterator._nextvAsync(10, options)]
-  ]) {
-    const db = testCommon.factory()
-    await db.open()
-    await populate(db)
-
-    const iterator = db._iterator({ valueFilter: '^match-' })
-    const options = { highWaterMarkCount: 2, packed: false }
-
-    const first = await read(iterator, options)
-    t.deepEqual(keys(first), [], `${name}: first two rejected rows produce no output`)
-    t.equal(first.processed, 2, `${name}: processed includes rejected rows`)
-    t.equal(first.reason, 'count', `${name}: short batch reports the processed-row cap`)
-
-    const second = await read(iterator, options)
-    t.deepEqual(keys(second), ['c'], `${name}: next page resumes at the following row`)
-    t.equal(second.processed, 2, `${name}: processed includes matched and rejected rows`)
-    t.equal(second.reason, 'count', `${name}: mixed filtered page reports the count cap`)
-
-    const third = await read(iterator, options)
-    t.deepEqual(keys(third), ['e'], `${name}: final counted page preserves the next match`)
-    t.equal(third.reason, 'count', `${name}: reaching the scan cap precedes the EOF probe`)
-
-    const eof = await read(iterator, options)
-    t.deepEqual(keys(eof), [], `${name}: exhaustion returns no rows`)
-    t.equal(eof.processed, 0, `${name}: repeated EOF examines no native rows`)
-    t.equal(eof.reason, 'eof', `${name}: short terminal batch reports EOF`)
-
-    iterator._closeSync()
-    await db.close()
-  }
-
-  t.end()
-})
-
 test('per-read byte watermark overrides the deprecated iterator default', async function (t) {
   const db = testCommon.factory()
   await db.open()
@@ -88,6 +50,36 @@ test('per-read byte watermark overrides the deprecated iterator default', async 
   t.end()
 })
 
+test('per-read byte watermark counts only enabled filtered output', async function (t) {
+  for (const [name, read] of [
+    ['sync', (iterator, options) => iterator._nextvSync(10, options)],
+    ['async', (iterator, options) => iterator._nextvAsync(10, options)]
+  ]) {
+    const db = testCommon.factory()
+    await db.open()
+    await populate(db)
+
+    const iterator = db._iterator({
+      values: false,
+      valueFilter: '^match-'
+    })
+    const result = await read(iterator, {
+      highWaterMarkBytes: 1,
+      packed: false
+    })
+
+    t.deepEqual(keys(result), ['c', 'e'],
+      `${name}: rejected rows and disabled values do not consume the byte budget`)
+    t.equal(result.processed, 5, `${name}: filtered rows still count as processed`)
+    t.equal(result.reason, 'bytes', `${name}: emitted key bytes cross the byte budget`)
+
+    iterator._closeSync()
+    await db.close()
+  }
+
+  t.end()
+})
+
 test('reason is omitted when the requested output size is satisfied', async function (t) {
   const db = testCommon.factory()
   await db.open()
@@ -95,11 +87,11 @@ test('reason is omitted when the requested output size is satisfied', async func
 
   for (const [name, read] of [
     ['sync', (iterator) => iterator._nextvSync(1, {
-      highWaterMarkCount: 1,
+      highWaterMarkBytes: 100,
       packed: false
     })],
     ['async', (iterator) => iterator._nextvAsync(1, {
-      highWaterMarkCount: 1,
+      highWaterMarkBytes: 100,
       packed: false
     })]
   ]) {
@@ -135,7 +127,7 @@ test('timeout reason is exposed by sync and async raw reads', async function (t)
         finished: false,
         limited: false,
         processed: 1,
-        reason: 4
+        reason: 3
       }
       if (name === 'sync') return result
       process.nextTick(args.at(-1), null, result)
@@ -156,28 +148,26 @@ test('timeout reason is exposed by sync and async raw reads', async function (t)
   t.end()
 })
 
-test('highWaterMarkCount zero makes progress and invalid watermarks fail admission', async function (t) {
+test('zero byte watermark makes progress and invalid watermarks fail admission', async function (t) {
   const db = testCommon.factory()
   await db.open()
   await populate(db)
 
-  const zero = db._iterator({ valueFilter: '^match-' })
-  const options = { highWaterMarkCount: 0, packed: false }
+  const zero = db._iterator()
+  const options = { highWaterMarkBytes: 0, packed: false }
   const first = zero._nextvSync(10, options)
   const second = zero._nextvSync(10, options)
   const third = zero._nextvSync(10, options)
-  t.equal(first.rows.length, 0, 'zero processed-row watermark can return no matching output')
-  t.ok(first.processed > 0, 'count-limited result reports progress')
-  t.equal(first.reason, 'count', 'zero processed-row watermark reports count')
-  t.equal(second.rows.length, 0, 'the next zero-watermark read advances past another rejected row')
+  t.deepEqual(keys(first), ['a'], 'zero byte watermark includes one progress row')
+  t.ok(first.processed > 0, 'byte-limited result reports progress')
+  t.equal(first.reason, 'bytes', 'zero byte watermark reports bytes')
+  t.deepEqual(keys(second), ['b'], 'the next zero-watermark read advances one row')
   t.deepEqual(keys(third), ['c'], 'repeated zero-watermark reads make forward progress')
   zero._closeSync()
 
   for (const [name, value] of [
     ['negative byte watermark', { highWaterMarkBytes: -1 }],
-    ['infinite byte watermark', { highWaterMarkBytes: Infinity }],
-    ['negative count watermark', { highWaterMarkCount: -1 }],
-    ['infinite count watermark', { highWaterMarkCount: Infinity }]
+    ['infinite byte watermark', { highWaterMarkBytes: Infinity }]
   ]) {
     const sync = db._iterator()
     t.throws(() => sync._nextvSync(1, value), undefined, `${name} throws synchronously`)

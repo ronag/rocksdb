@@ -98,7 +98,7 @@ test('filtered native timeout reads resume without skipping rows', async functio
     const result = await collectWithTimeout(iterator, read)
 
     t.ok(result.timeoutPages > 0, `${name}: 1ms deadline interrupts the filtered scan`)
-    t.ok(result.timeoutReasons.every((reason) => reason === 4),
+    t.ok(result.timeoutReasons.every((reason) => reason === 3),
       `${name}: every interrupted page reports the native timeout reason`)
     t.ok(result.timeoutProcessed.every((processed) => processed > 0),
       `${name}: every timeout page examines at least one native row`)

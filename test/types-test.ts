@@ -419,9 +419,10 @@ expectType<RocksPackedIteratorResult>(iterator._nextvSync(10, { packed: true }))
 expectType<Promise<RocksPackedIteratorResult>>(iterator._nextvAsync(10, { packed: true }))
 const boundedIteratorRead = iterator._nextvSync(10, {
   highWaterMarkBytes: 1024,
-  highWaterMarkCount: 100,
   packed: false,
 })
+// @ts-expect-error Iterator reads do not expose a processed-row watermark
+iterator._nextvSync(10, { highWaterMarkCount: 100 })
 expectType<number>(boundedIteratorRead.processed)
 expectType<RocksIteratorStopReason | undefined>(boundedIteratorRead.reason)
 expectType<RocksIteratorStopReason>('timeout')
