@@ -108,3 +108,64 @@ test('_nextvAsync after next() drains the prefetch cache', async function (t) {
   await db.close()
   t.end()
 })
+
+test('cached raw reads apportion filtered native progress', async function (t) {
+  const db = testCommon.factory()
+  await db.open()
+  const keys = await seed(db, 500)
+  const expected = keys.filter((key) => /[02468]$/.test(key))
+
+  for (const [name, read] of [
+    ['sync', (iterator) => iterator._nextvSync(10, {})],
+    ['async', (iterator) => iterator._nextvAsync(10, {})]
+  ]) {
+    const iterator = db.iterator({ valueFilter: '[02468]$' })
+    t.is((await iterator.next())[0], expected[0], `${name}: first public row matches`)
+    t.is((await iterator.next())[0], expected[1], `${name}: second public row matches`)
+    t.ok(iterator.cached > 0, `${name}: filtered native refill left cached rows`)
+
+    const drained = []
+    let processed = 0
+    let finished = false
+    while (!finished) {
+      const result = await read(iterator)
+      for (let index = 0; index < result.rows.length; index += 2) {
+        drained.push(result.rows[index])
+      }
+      processed += result.processed
+      finished = result.finished
+    }
+
+    t.same(drained, expected.slice(2), `${name}: cached rows are returned exactly once`)
+    t.is(processed, 497, `${name}: cached slices retain their filtered native progress`)
+    await iterator.close()
+  }
+
+  await db.close()
+  t.end()
+})
+
+test('cached byte stops retain positive processed progress', async function (t) {
+  const db = testCommon.factory()
+  await db.open()
+  const keys = await seed(db, 10)
+
+  for (const [name, read] of [
+    ['sync', (iterator) => iterator._nextvSync(10, {})],
+    ['async', (iterator) => iterator._nextvAsync(10, {})]
+  ]) {
+    const iterator = db.iterator({ highWaterMarkBytes: 20 })
+    await iterator.next()
+    await iterator.next()
+    t.is(iterator.cached, 1, `${name}: byte-limited refill left one cached row`)
+
+    const result = await read(iterator)
+    t.same(result.rows[0], keys[2], `${name}: cached read returns the next row`)
+    t.is(result.reason, 'bytes', `${name}: cached read retains its originating stop reason`)
+    t.ok(result.processed > 0, `${name}: cached byte stop retains positive progress`)
+    await iterator.close()
+  }
+
+  await db.close()
+  t.end()
+})

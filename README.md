@@ -140,11 +140,13 @@ this progress guarantee, even when the read returns no rows.
 The iterator-construction `highWaterMarkBytes` option is deprecated and remains
 only as a backwards-compatible default when a read omits its own byte watermark.
 
-Every raw read result includes `processed`, the number of native rows examined
-by that read, including rows rejected by filters. This allows callers to trace
-scan progress independently of the number of rows returned. A `bytes`, `count`
-or `timeout` result always has `processed > 0`; an EOF result can have
-`processed: 0`.
+Every raw read result includes `processed`, the native-row progress attributed
+to that read, including rows rejected by filters. This allows callers to trace
+scan progress independently of the number of rows returned. If a raw read
+consumes rows previously prefetched by public `next()`, the originating native
+`processed` count is apportioned across the cached rows as they are consumed. A
+`bytes`, `count` or `timeout` result always has `processed > 0`; an EOF result
+can have `processed: 0`.
 
 A raw result that contains fewer rows than requested has `reason: 'bytes'`,
 `'count'`, `'timeout'` or `'eof'` when one of those conditions stopped it.

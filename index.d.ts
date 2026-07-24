@@ -472,7 +472,7 @@ export interface RocksRawIteratorResult<
   readonly rows: Array<RocksRows<K, V, Keys, Values>>
   readonly finished: boolean
   readonly limited?: boolean
-  /** Native rows examined by this read, including rows rejected by filters. */
+  /** Native-row progress attributed to this read, including filtered and prefetched rows. */
   readonly processed: number
   /** Why this read returned fewer rows than requested. */
   readonly reason?: RocksIteratorStopReason
@@ -492,7 +492,7 @@ export interface RocksPackedIteratorResult<
   readonly count: number
   readonly finished: boolean
   readonly limited: boolean
-  /** Native rows examined by this read, including rows rejected by filters. */
+  /** Native-row progress attributed to this read, including filtered and prefetched rows. */
   readonly processed: number
   /** Why this read returned fewer rows than requested. */
   readonly reason?: RocksIteratorStopReason
