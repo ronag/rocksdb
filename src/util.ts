@@ -3,7 +3,6 @@ const DEBUG = process.env.NODE_ENV !== 'production'
 type PackedMode = boolean | 'auto'
 
 export const iteratorStopReasonStrings = Object.freeze({
-  count: 'count',
   bytes: 'bytes',
   eof: 'eof',
   timeout: 'timeout',
@@ -11,7 +10,6 @@ export const iteratorStopReasonStrings = Object.freeze({
 
 const iteratorStopReasons = Object.freeze([
   undefined,
-  iteratorStopReasonStrings.count,
   iteratorStopReasonStrings.bytes,
   iteratorStopReasonStrings.eof,
   iteratorStopReasonStrings.timeout,

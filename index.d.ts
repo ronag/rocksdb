@@ -534,7 +534,7 @@ export type RocksRawGetManyResult<
   readonly packed: Packed
 }
 
-export type RocksIteratorStopReason = 'eof' | 'count' | 'bytes' | 'timeout'
+export type RocksIteratorStopReason = 'eof' | 'bytes' | 'timeout'
 
 export interface RocksRawIteratorReadOptions<Packed extends RocksPackedReadMode = false> {
   /**
@@ -543,14 +543,11 @@ export interface RocksRawIteratorReadOptions<Packed extends RocksPackedReadMode 
    * progress.
    */
   timeout?: number
-  /** Soft byte cap for this read. The row that crosses the cap is included. */
-  highWaterMarkBytes?: number
   /**
-   * Maximum native rows to examine for this read, including rows rejected by
-   * filters. A value of `0` still examines one row so iteration can make
-   * progress.
+   * Soft byte cap over enabled output fields from rows that pass iterator
+   * filters. The row that crosses the cap is included.
    */
-  highWaterMarkCount?: number
+  highWaterMarkBytes?: number
   packed?: Packed
 }
 

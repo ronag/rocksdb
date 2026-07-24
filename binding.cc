@@ -1946,7 +1946,6 @@ enum class PackedMode {
 
 enum class IteratorStopReason {
   None,
-  Count,
   Bytes,
   Eof,
   Timeout,
@@ -2002,7 +2001,6 @@ struct IteratorOptions {
 struct IteratorNextvOptions {
   uint32_t timeout = 0;
   size_t highWaterMarkBytes = std::numeric_limits<int32_t>::max();
-  size_t highWaterMarkCount = std::numeric_limits<int64_t>::max();
 };
 
 static napi_status GetIteratorNextvOptions(napi_env env,
@@ -2018,15 +2016,6 @@ static napi_status GetIteratorNextvOptions(napi_env env,
     return napi_pending_exception;
   }
   result.highWaterMarkBytes = static_cast<size_t>(highWaterMarkBytes);
-
-  int64_t highWaterMarkCount = static_cast<int64_t>(result.highWaterMarkCount);
-  NAPI_STATUS_RETURN(GetProperty(env, options, "highWaterMarkCount", highWaterMarkCount));
-  if (highWaterMarkCount < 0) {
-    NAPI_STATUS_RETURN(
-        napi_throw_range_error(env, nullptr, "highWaterMarkCount must be non-negative"));
-    return napi_pending_exception;
-  }
-  result.highWaterMarkCount = static_cast<size_t>(highWaterMarkCount);
 
   return napi_ok;
 }
@@ -2295,12 +2284,6 @@ class Iterator final : public BaseIterator, public std::enable_shared_from_this<
               state.reason = IteratorStopReason::Bytes;
               break;
             }
-            if (state.processed > 0 && state.processed >= options.highWaterMarkCount) {
-              state.limited = true;
-              state.reason = IteratorStopReason::Count;
-              break;
-            }
-
             if (state.processed > 0 && deadline > 0 &&
                 scannedSinceDeadlineCheck >= kDeadlineCheckInterval) {
               if (database_->db->GetEnv()->NowMicros() > deadline) {
@@ -2567,12 +2550,6 @@ class Iterator final : public BaseIterator, public std::enable_shared_from_this<
         reason = IteratorStopReason::Bytes;
         break;
       }
-      if (processed > 0 && processed >= options.highWaterMarkCount) {
-        NAPI_STATUS_THROWS(napi_get_boolean(env, true, &limited));
-        reason = IteratorStopReason::Count;
-        break;
-      }
-
       if (processed > 0 && deadline > 0 &&
           scannedSinceDeadlineCheck >= kDeadlineCheckInterval) {
         if (database_->db->GetEnv()->NowMicros() > deadline) {
