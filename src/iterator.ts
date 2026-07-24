@@ -8,6 +8,7 @@ import binding = require('./binding')
 import {
   convertIteratorStopReason,
   getPackedMode,
+  iteratorStopReasonStrings,
   kRegisterCleanupResource,
   kUnregisterCleanupResource,
   setPackedResult,
@@ -188,7 +189,7 @@ function emptyPackedResult(iterator, size) {
     limited: false,
     processed: 0,
   }
-  if (size > 0) result.reason = 'eof'
+  if (size > 0) result.reason = iteratorStopReasonStrings.eof
   return result
 }
 
@@ -782,7 +783,11 @@ class Iterator extends AbstractIterator<any, any, any> {
     const limited = !finished && rows.length >= size * 2
     const drained = this[kPosition] >= this[kCache].length
     const reason =
-      rows.length < size * 2 && drained ? (finished ? 'eof' : this[kCacheReason]) : undefined
+      rows.length < size * 2 && drained
+        ? finished
+          ? iteratorStopReasonStrings.eof
+          : this[kCacheReason]
+        : undefined
     if (drained) this[kCacheReason] = undefined
 
     const result: any = { rows, finished, limited, processed: rows.length / 2 }
@@ -821,7 +826,7 @@ class Iterator extends AbstractIterator<any, any, any> {
         packed === true
           ? emptyPackedResult(this, size)
           : { rows: [], finished: true, processed: 0 }
-      if (packed !== true && size > 0) result.reason = 'eof'
+      if (packed !== true && size > 0) result.reason = iteratorStopReasonStrings.eof
       return setPackedResult(convertIteratorResult(this, result), packed === true)
     }
 
@@ -886,7 +891,7 @@ class Iterator extends AbstractIterator<any, any, any> {
           packed === true
             ? emptyPackedResult(this, size)
             : { rows: [], finished: true, processed: 0 }
-        if (packed !== true && size > 0) result.reason = 'eof'
+        if (packed !== true && size > 0) result.reason = iteratorStopReasonStrings.eof
         this._deferNextResult(callback, null, result, packed === true, unsafe)
       } else {
         const nextv =
