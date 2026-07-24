@@ -138,9 +138,9 @@ The iterator-construction `highWaterMarkBytes` option is deprecated and remains
 only as a backwards-compatible default when a read omits its own byte watermark.
 
 A raw result that contains fewer rows than requested has `reason: 'bytes'`,
-`'count'` or `'eof'` when one of those conditions stopped it. `reason` is absent
-when the requested output size was satisfied. Existing `finished` and `limited`
-flags remain available for compatibility.
+`'count'`, `'timeout'` or `'eof'` when one of those conditions stopped it.
+`reason` is absent when the requested output size was satisfied. Existing
+`finished` and `limited` flags remain available for compatibility.
 
 ## Packed raw reads
 

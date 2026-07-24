@@ -49,16 +49,20 @@ function putEntries (context, entries) {
 async function collectWithTimeout (iterator, read) {
   const keys = []
   let timeoutPages = 0
+  const timeoutReasons = []
 
   for (let page = 0; page < 10_000; page++) {
     const result = await read(iterator)
     keys.push(...resultKeys(result))
 
     if (result.finished) {
-      return { keys, timeoutPages }
+      return { keys, timeoutPages, timeoutReasons }
     }
 
-    if (!result.limited) timeoutPages++
+    if (!result.limited) {
+      timeoutPages++
+      timeoutReasons.push(result.reason)
+    }
   }
 
   throw new Error('iterator did not finish after 10,000 timeout resumptions')
@@ -90,6 +94,8 @@ test('filtered native timeout reads resume without skipping rows', async functio
     const result = await collectWithTimeout(iterator, read)
 
     t.ok(result.timeoutPages > 0, `${name}: 1ms deadline interrupts the filtered scan`)
+    t.ok(result.timeoutReasons.every((reason) => reason === 4),
+      `${name}: every interrupted page reports the native timeout reason`)
     t.deepEqual(result.keys, expected,
       `${name}: every matching key is returned exactly once across timeout resumptions`)
 

@@ -1,6 +1,7 @@
 'use strict'
 
 const test = require('tape')
+const binding = require('../binding')
 const testCommon = require('./common')
 
 function keys (result) {
@@ -104,6 +105,44 @@ test('reason is omitted when the requested output size is satisfied', async func
     t.equal(result.reason, undefined, `${name}: a full batch has no stop reason`)
     t.notOk('reason' in result, `${name}: a full batch omits the reason field`)
     iterator._closeSync()
+  }
+
+  await db.close()
+  t.end()
+})
+
+test('timeout reason is exposed by sync and async raw reads', async function (t) {
+  const db = testCommon.factory()
+  await db.open()
+  await db.put('a', 'value')
+
+  for (const [name, bindingName, read] of [
+    ['sync', 'iterator_nextv_sync', (iterator) => iterator._nextvSync(1, { packed: false })],
+    ['async', 'iterator_nextv', (iterator) => iterator._nextvAsync(1, { packed: false })]
+  ]) {
+    const iterator = db._iterator()
+    await iterator._nextvAsync(0, { packed: false })
+    const original = binding[bindingName]
+
+    binding[bindingName] = function (...args) {
+      const result = {
+        rows: [],
+        finished: false,
+        limited: false,
+        reason: 4
+      }
+      if (name === 'sync') return result
+      process.nextTick(args.at(-1), null, result)
+    }
+
+    try {
+      const result = await read(iterator)
+      t.equal(result.reason, 'timeout', `${name}: native timeout code becomes a string`)
+      t.equal(result.rows.length, 0, `${name}: timeout can return no output rows`)
+    } finally {
+      binding[bindingName] = original
+      iterator._closeSync()
+    }
   }
 
   await db.close()

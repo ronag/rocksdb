@@ -1949,6 +1949,7 @@ enum class IteratorStopReason {
   Count,
   Bytes,
   Eof,
+  Timeout,
 };
 
 static napi_status SetIteratorStopReason(napi_env env,
@@ -2293,6 +2294,7 @@ class Iterator final : public BaseIterator, public std::enable_shared_from_this<
             if (deadline > 0 && scannedSinceDeadlineCheck >= kDeadlineCheckInterval) {
               if (database_->db->GetEnv()->NowMicros() > deadline) {
                 // Timed out: neither finished nor limited; the caller may retry.
+                state.reason = IteratorStopReason::Timeout;
                 break;
               }
               scannedSinceDeadlineCheck = 0;
@@ -2560,6 +2562,7 @@ class Iterator final : public BaseIterator, public std::enable_shared_from_this<
       if (deadline > 0 && scannedSinceDeadlineCheck >= kDeadlineCheckInterval) {
         if (database_->db->GetEnv()->NowMicros() > deadline) {
           // Timed out: neither finished nor limited; the caller may retry.
+          reason = IteratorStopReason::Timeout;
           break;
         }
         scannedSinceDeadlineCheck = 0;

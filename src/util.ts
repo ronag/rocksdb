@@ -2,7 +2,7 @@ const DEBUG = process.env.NODE_ENV !== 'production'
 
 type PackedMode = boolean | 'auto'
 
-const iteratorStopReasons = Object.freeze([undefined, 'count', 'bytes', 'eof'])
+const iteratorStopReasons = Object.freeze([undefined, 'count', 'bytes', 'eof', 'timeout'])
 
 export const kRef = Symbol('ref')
 export const kUnref = Symbol('unref')

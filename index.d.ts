@@ -530,7 +530,7 @@ export type RocksRawGetManyResult<
   readonly packed: Packed
 }
 
-export type RocksIteratorStopReason = 'eof' | 'count' | 'bytes'
+export type RocksIteratorStopReason = 'eof' | 'count' | 'bytes' | 'timeout'
 
 export interface RocksRawIteratorReadOptions<Packed extends RocksPackedReadMode = false> {
   timeout?: number

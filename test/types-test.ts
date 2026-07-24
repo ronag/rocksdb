@@ -423,6 +423,7 @@ const boundedIteratorRead = iterator._nextvSync(10, {
   packed: false,
 })
 expectType<RocksIteratorStopReason | undefined>(boundedIteratorRead.reason)
+expectType<RocksIteratorStopReason>('timeout')
 const packedIteratorKeys = iterator._nextvSync(10, { packed: true })
 expectType<Uint32Array>(packedIteratorKeys.keys)
 expectType<Uint32Array>(packedIteratorKeys.values)
