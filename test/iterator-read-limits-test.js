@@ -35,10 +35,12 @@ test('per-read highWaterMarkCount counts filtered native rows', async function (
 
     const first = await read(iterator, options)
     t.deepEqual(keys(first), [], `${name}: first two rejected rows produce no output`)
+    t.equal(first.processed, 2, `${name}: processed includes rejected rows`)
     t.equal(first.reason, 'count', `${name}: short batch reports the processed-row cap`)
 
     const second = await read(iterator, options)
     t.deepEqual(keys(second), ['c'], `${name}: next page resumes at the following row`)
+    t.equal(second.processed, 2, `${name}: processed includes matched and rejected rows`)
     t.equal(second.reason, 'count', `${name}: mixed filtered page reports the count cap`)
 
     const third = await read(iterator, options)
@@ -47,6 +49,7 @@ test('per-read highWaterMarkCount counts filtered native rows', async function (
 
     const eof = await read(iterator, options)
     t.deepEqual(keys(eof), [], `${name}: exhaustion returns no rows`)
+    t.equal(eof.processed, 0, `${name}: repeated EOF examines no native rows`)
     t.equal(eof.reason, 'eof', `${name}: short terminal batch reports EOF`)
 
     iterator._closeSync()
@@ -67,6 +70,7 @@ test('per-read byte watermark overrides the deprecated iterator default', async 
     packed: false
   })
   t.equal(keys(byteLimited).length, 1, 'per-read zero byte watermark includes one progress row')
+  t.ok(byteLimited.processed > 0, 'byte-limited result reports progress')
   t.equal(byteLimited.reason, 'bytes', 'short byte-limited batch reports bytes')
   smaller._closeSync()
 
@@ -102,6 +106,7 @@ test('reason is omitted when the requested output size is satisfied', async func
     const iterator = db._iterator()
     const result = await read(iterator)
     t.deepEqual(keys(result), ['a'], `${name}: requested row is returned`)
+    t.equal(result.processed, 1, `${name}: full batch reports its processed row`)
     t.equal(result.reason, undefined, `${name}: a full batch has no stop reason`)
     t.notOk('reason' in result, `${name}: a full batch omits the reason field`)
     iterator._closeSync()
@@ -129,6 +134,7 @@ test('timeout reason is exposed by sync and async raw reads', async function (t)
         rows: [],
         finished: false,
         limited: false,
+        processed: 1,
         reason: 4
       }
       if (name === 'sync') return result
@@ -138,6 +144,7 @@ test('timeout reason is exposed by sync and async raw reads', async function (t)
     try {
       const result = await read(iterator)
       t.equal(result.reason, 'timeout', `${name}: native timeout code becomes a string`)
+      t.ok(result.processed > 0, `${name}: timeout result reports progress`)
       t.equal(result.rows.length, 0, `${name}: timeout can return no output rows`)
     } finally {
       binding[bindingName] = original
@@ -160,6 +167,7 @@ test('highWaterMarkCount zero makes progress and invalid watermarks fail admissi
   const second = zero._nextvSync(10, options)
   const third = zero._nextvSync(10, options)
   t.equal(first.rows.length, 0, 'zero processed-row watermark can return no matching output')
+  t.ok(first.processed > 0, 'count-limited result reports progress')
   t.equal(first.reason, 'count', 'zero processed-row watermark reports count')
   t.equal(second.rows.length, 0, 'the next zero-watermark read advances past another rejected row')
   t.deepEqual(keys(third), ['c'], 'repeated zero-watermark reads make forward progress')

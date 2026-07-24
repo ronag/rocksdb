@@ -422,6 +422,7 @@ const boundedIteratorRead = iterator._nextvSync(10, {
   highWaterMarkCount: 100,
   packed: false,
 })
+expectType<number>(boundedIteratorRead.processed)
 expectType<RocksIteratorStopReason | undefined>(boundedIteratorRead.reason)
 expectType<RocksIteratorStopReason>('timeout')
 const packedIteratorKeys = iterator._nextvSync(10, { packed: true })

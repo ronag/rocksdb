@@ -1962,13 +1962,22 @@ static napi_status SetIteratorStopReason(napi_env env,
   return napi_set_named_property(env, result, "reason", value);
 }
 
+static napi_status SetIteratorProcessed(napi_env env,
+                                        napi_value result,
+                                        const size_t processed) {
+  napi_value value;
+  NAPI_STATUS_RETURN(napi_create_double(env, static_cast<double>(processed), &value));
+  return napi_set_named_property(env, result, "processed", value);
+}
+
 static bool SupportsPackedReads(const Encoding encoding) {
   return encoding == Encoding::Buffer || encoding == Encoding::String;
 }
 
 static constexpr size_t kAutoPackedValueBytes = 8 * 1024;
 // Iterator timeouts are best effort. Sampling avoids a clock read for every
-// rejected candidate during heavily filtered scans.
+// rejected candidate during heavily filtered scans. A read always examines at
+// least one native row before checking its deadline so retrying cannot stall.
 static constexpr size_t kDeadlineCheckInterval = 64;
 
 struct IteratorOptions {
@@ -2280,7 +2289,8 @@ class Iterator final : public BaseIterator, public std::enable_shared_from_this<
               state.limited = true;
               break;
             }
-            if (state.bytes > 0 && state.bytes > options.highWaterMarkBytes) {
+            if (state.processed > 0 && state.bytes > 0 &&
+                state.bytes > options.highWaterMarkBytes) {
               state.limited = true;
               state.reason = IteratorStopReason::Bytes;
               break;
@@ -2291,9 +2301,11 @@ class Iterator final : public BaseIterator, public std::enable_shared_from_this<
               break;
             }
 
-            if (deadline > 0 && scannedSinceDeadlineCheck >= kDeadlineCheckInterval) {
+            if (state.processed > 0 && deadline > 0 &&
+                scannedSinceDeadlineCheck >= kDeadlineCheckInterval) {
               if (database_->db->GetEnv()->NowMicros() > deadline) {
-                // Timed out: neither finished nor limited; the caller may retry.
+                // Timed out after progress: neither finished nor limited; the
+                // caller may retry without stalling on the same row.
                 state.reason = IteratorStopReason::Timeout;
                 break;
               }
@@ -2450,6 +2462,7 @@ class Iterator final : public BaseIterator, public std::enable_shared_from_this<
             NAPI_STATUS_RETURN(napi_set_named_property(env, *result, "values", values));
             NAPI_STATUS_RETURN(napi_set_named_property(env, *result, "finished", finished));
             NAPI_STATUS_RETURN(napi_set_named_property(env, *result, "limited", limited));
+            NAPI_STATUS_RETURN(SetIteratorProcessed(env, *result, state.processed));
             NAPI_STATUS_RETURN(SetIteratorStopReason(env, *result, state.reason));
 
             return napi_ok;
@@ -2484,6 +2497,7 @@ class Iterator final : public BaseIterator, public std::enable_shared_from_this<
           NAPI_STATUS_RETURN(napi_set_named_property(env, *result, "rows", rows));
           NAPI_STATUS_RETURN(napi_set_named_property(env, *result, "finished", finished));
           NAPI_STATUS_RETURN(napi_set_named_property(env, *result, "limited", limited));
+          NAPI_STATUS_RETURN(SetIteratorProcessed(env, *result, state.processed));
           NAPI_STATUS_RETURN(SetIteratorStopReason(env, *result, state.reason));
 
           return napi_ok;
@@ -2548,7 +2562,7 @@ class Iterator final : public BaseIterator, public std::enable_shared_from_this<
         NAPI_STATUS_THROWS(napi_get_boolean(env, true, &limited));
         break;
       }
-      if (bytes > 0 && bytes > options.highWaterMarkBytes) {
+      if (processed > 0 && bytes > 0 && bytes > options.highWaterMarkBytes) {
         NAPI_STATUS_THROWS(napi_get_boolean(env, true, &limited));
         reason = IteratorStopReason::Bytes;
         break;
@@ -2559,9 +2573,11 @@ class Iterator final : public BaseIterator, public std::enable_shared_from_this<
         break;
       }
 
-      if (deadline > 0 && scannedSinceDeadlineCheck >= kDeadlineCheckInterval) {
+      if (processed > 0 && deadline > 0 &&
+          scannedSinceDeadlineCheck >= kDeadlineCheckInterval) {
         if (database_->db->GetEnv()->NowMicros() > deadline) {
-          // Timed out: neither finished nor limited; the caller may retry.
+          // Timed out after progress: neither finished nor limited; the caller
+          // may retry without stalling on the same row.
           reason = IteratorStopReason::Timeout;
           break;
         }
@@ -2712,6 +2728,7 @@ class Iterator final : public BaseIterator, public std::enable_shared_from_this<
     }
     NAPI_STATUS_THROWS(napi_set_named_property(env, ret, "finished", finished));
     NAPI_STATUS_THROWS(napi_set_named_property(env, ret, "limited", limited));
+    NAPI_STATUS_THROWS(SetIteratorProcessed(env, ret, processed));
 
     NAPI_STATUS_THROWS(SetIteratorStopReason(env, ret, reason));
     return ret;

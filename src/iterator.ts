@@ -186,6 +186,7 @@ function emptyPackedResult(iterator, size) {
     values: iterator[kValues] ? new Uint32Array() : undefined,
     finished: true,
     limited: false,
+    processed: 0,
   }
   if (size > 0) result.reason = 'eof'
   return result
@@ -286,6 +287,7 @@ function convertIteratorResult(iterator, result) {
     rows,
     finished: result.finished,
     limited: result.limited,
+    processed: result.processed,
   }
   if (result.reason !== undefined) converted.reason = result.reason
   return converted
@@ -783,7 +785,7 @@ class Iterator extends AbstractIterator<any, any, any> {
       rows.length < size * 2 && drained ? (finished ? 'eof' : this[kCacheReason]) : undefined
     if (drained) this[kCacheReason] = undefined
 
-    const result: any = { rows, finished, limited }
+    const result: any = { rows, finished, limited, processed: rows.length / 2 }
     if (reason !== undefined) result.reason = reason
     return result
   }
@@ -818,7 +820,7 @@ class Iterator extends AbstractIterator<any, any, any> {
       const result: any =
         packed === true
           ? emptyPackedResult(this, size)
-          : { rows: [], finished: true }
+          : { rows: [], finished: true, processed: 0 }
       if (packed !== true && size > 0) result.reason = 'eof'
       return setPackedResult(convertIteratorResult(this, result), packed === true)
     }
@@ -883,7 +885,7 @@ class Iterator extends AbstractIterator<any, any, any> {
         const result: any =
           packed === true
             ? emptyPackedResult(this, size)
-            : { rows: [], finished: true }
+            : { rows: [], finished: true, processed: 0 }
         if (packed !== true && size > 0) result.reason = 'eof'
         this._deferNextResult(callback, null, result, packed === true, unsafe)
       } else {
