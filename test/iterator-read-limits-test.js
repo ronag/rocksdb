@@ -1,7 +1,6 @@
 'use strict'
 
 const test = require('tape')
-const { Slice } = require('@nxtedition/slice')
 const testCommon = require('./common')
 
 function keys (result) {
@@ -31,39 +30,23 @@ test('per-read highWaterMarkCount counts filtered native rows', async function (
     await populate(db)
 
     const iterator = db._iterator({ valueFilter: '^match-' })
-    const options = { highWaterMarkCount: 2, lastRow: true, packed: false }
+    const options = { highWaterMarkCount: 2, packed: false }
 
     const first = await read(iterator, options)
     t.deepEqual(keys(first), [], `${name}: first two rejected rows produce no output`)
     t.equal(first.reason, 'count', `${name}: short batch reports the processed-row cap`)
-    t.deepEqual(
-      first.lastRow.map((value) => value.toString()),
-      ['b', 'miss-b'],
-      `${name}: lastRow includes the last rejected row`
-    )
 
     const second = await read(iterator, options)
     t.deepEqual(keys(second), ['c'], `${name}: next page resumes at the following row`)
     t.equal(second.reason, 'count', `${name}: mixed filtered page reports the count cap`)
-    t.deepEqual(
-      second.lastRow.map((value) => value.toString()),
-      ['d', 'miss-d'],
-      `${name}: lastRow ignores the value filter`
-    )
 
     const third = await read(iterator, options)
     t.deepEqual(keys(third), ['e'], `${name}: final counted page preserves the next match`)
     t.equal(third.reason, 'count', `${name}: reaching the scan cap precedes the EOF probe`)
-    t.deepEqual(
-      third.lastRow.map((value) => value.toString()),
-      ['f', 'miss-f'],
-      `${name}: final rejected row is still exposed as progress`
-    )
 
     const eof = await read(iterator, options)
     t.deepEqual(keys(eof), [], `${name}: exhaustion returns no rows`)
     t.equal(eof.reason, 'eof', `${name}: short terminal batch reports EOF`)
-    t.equal(eof.lastRow, undefined, `${name}: no row was examined by the EOF-only read`)
 
     iterator._closeSync()
     await db.close()
@@ -80,16 +63,10 @@ test('per-read byte watermark overrides the deprecated iterator default', async 
   const smaller = db._iterator({ highWaterMarkBytes: 1_000 })
   const byteLimited = smaller._nextvSync(10, {
     highWaterMarkBytes: 0,
-    lastRow: true,
     packed: false
   })
   t.equal(keys(byteLimited).length, 1, 'per-read zero byte watermark includes one progress row')
   t.equal(byteLimited.reason, 'bytes', 'short byte-limited batch reports bytes')
-  t.deepEqual(
-    byteLimited.lastRow.map((value) => value.toString()),
-    ['a', 'miss-a'],
-    'byte-limited batch exposes its last examined row'
-  )
   smaller._closeSync()
 
   const larger = db._iterator({ highWaterMarkBytes: 0 })
@@ -114,12 +91,10 @@ test('reason is omitted when the requested output size is satisfied', async func
   for (const [name, read] of [
     ['sync', (iterator) => iterator._nextvSync(1, {
       highWaterMarkCount: 1,
-      lastRow: true,
       packed: false
     })],
     ['async', (iterator) => iterator._nextvAsync(1, {
       highWaterMarkCount: 1,
-      lastRow: true,
       packed: false
     })]
   ]) {
@@ -128,68 +103,8 @@ test('reason is omitted when the requested output size is satisfied', async func
     t.deepEqual(keys(result), ['a'], `${name}: requested row is returned`)
     t.equal(result.reason, undefined, `${name}: a full batch has no stop reason`)
     t.notOk('reason' in result, `${name}: a full batch omits the reason field`)
-    t.deepEqual(
-      result.lastRow.map((value) => value.toString()),
-      ['a', 'miss-a'],
-      `${name}: full batch can still request lastRow`
-    )
     iterator._closeSync()
   }
-
-  await db.close()
-  t.end()
-})
-
-test('lastRow respects enabled fields and JavaScript raw encodings', async function (t) {
-  const db = testCommon.factory()
-  await db.open()
-  await populate(db)
-
-  const keysOnly = db._iterator({
-    keys: true,
-    values: false,
-    valueFilter: '^never$'
-  })
-  const keyResult = keysOnly._nextvSync(10, {
-    highWaterMarkCount: 1,
-    lastRow: true,
-    packed: false
-  })
-  t.equal(keyResult.lastRow[0].toString(), 'a', 'keys-only lastRow includes the examined key')
-  t.equal(keyResult.lastRow[1], undefined, 'keys-only lastRow omits the value')
-  keysOnly._closeSync()
-
-  const valuesOnly = db._iterator({
-    keys: false,
-    values: true,
-    valueFilter: '^never$'
-  })
-  const valueResult = await valuesOnly._nextvAsync(10, {
-    highWaterMarkCount: 1,
-    lastRow: true,
-    packed: false
-  })
-  t.equal(valueResult.lastRow[0], undefined, 'values-only lastRow omits the key')
-  t.equal(valueResult.lastRow[1].toString(), 'miss-a',
-    'values-only lastRow includes the examined value')
-  valuesOnly._closeSync()
-
-  const slices = db._iterator({
-    keyEncoding: 'slice',
-    valueEncoding: 'slice',
-    valueFilter: '^never$'
-  })
-  const sliceResult = slices._nextvSync(10, {
-    highWaterMarkCount: 1,
-    lastRow: true,
-    packed: true
-  })
-  t.ok(sliceResult.lastRow[0] instanceof Slice, 'packed lastRow converts its key to Slice')
-  t.ok(sliceResult.lastRow[1] instanceof Slice, 'packed lastRow converts its value to Slice')
-  t.equal(sliceResult.lastRow[0].toString(), 'a', 'converted Slice key preserves its bytes')
-  t.equal(sliceResult.lastRow[1].toString(), 'miss-a',
-    'converted Slice value preserves its bytes')
-  slices._closeSync()
 
   await db.close()
   t.end()
@@ -201,18 +116,14 @@ test('highWaterMarkCount zero makes progress and invalid watermarks fail admissi
   await populate(db)
 
   const zero = db._iterator({ valueFilter: '^match-' })
-  const first = zero._nextvSync(10, {
-    highWaterMarkCount: 0,
-    lastRow: true,
-    packed: true
-  })
-  t.equal(first.count, 0, 'zero processed-row watermark can return no matching output')
+  const options = { highWaterMarkCount: 0, packed: false }
+  const first = zero._nextvSync(10, options)
+  const second = zero._nextvSync(10, options)
+  const third = zero._nextvSync(10, options)
+  t.equal(first.rows.length, 0, 'zero processed-row watermark can return no matching output')
   t.equal(first.reason, 'count', 'zero processed-row watermark reports count')
-  t.deepEqual(
-    first.lastRow.map((value) => value.toString()),
-    ['a', 'miss-a'],
-    'zero processed-row watermark still examines one row'
-  )
+  t.equal(second.rows.length, 0, 'the next zero-watermark read advances past another rejected row')
+  t.deepEqual(keys(third), ['c'], 'repeated zero-watermark reads make forward progress')
   zero._closeSync()
 
   for (const [name, value] of [

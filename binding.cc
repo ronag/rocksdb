@@ -2008,7 +2008,6 @@ struct IteratorNextvOptions {
   uint32_t timeout = 0;
   size_t highWaterMarkBytes = std::numeric_limits<int32_t>::max();
   size_t highWaterMarkCount = std::numeric_limits<int64_t>::max();
-  bool lastRow = false;
 };
 
 static napi_status GetIteratorNextvOptions(napi_env env,
@@ -2033,8 +2032,6 @@ static napi_status GetIteratorNextvOptions(napi_env env,
     return napi_pending_exception;
   }
   result.highWaterMarkCount = static_cast<size_t>(highWaterMarkCount);
-
-  NAPI_STATUS_RETURN(GetProperty(env, options, "lastRow", result.lastRow));
 
   return napi_ok;
 }
@@ -2227,11 +2224,6 @@ class Iterator final : public BaseIterator, public std::enable_shared_from_this<
     struct State {
       std::vector<rocksdb::PinnableSlice> keys;
       std::vector<rocksdb::PinnableSlice> values;
-      rocksdb::PinnableSlice lastKey;
-      bool hasLastKey = false;
-      rocksdb::PinnableSlice lastRowKey;
-      rocksdb::PinnableSlice lastRowValue;
-      bool hasLastRow = false;
       rocksdb::PinnableSlice packedData;
       std::vector<uint32_t> keyOffsets;
       std::vector<uint32_t> valueOffsets;
@@ -2347,26 +2339,16 @@ class Iterator final : public BaseIterator, public std::enable_shared_from_this<
             state.processed++;
             if (deadline > 0) scannedSinceDeadlineCheck++;
 
-            if (options.lastRow) {
-              if (keys_) state.lastRowKey.PinSelf(CurrentKey());
-              if (values_) state.lastRowValue.PinSelf(CurrentValue());
-              state.hasLastRow = true;
-            }
-
             // Apply the key/value filters BEFORE charging the user `limit`, so
             // `limit` counts matched (emitted) rows, not rows merely scanned and
             // then discarded. Otherwise a `{ limit, keyFilter }` query could
             // exhaust its budget on non-matching rows and return fewer (or zero)
             // matches than exist.
             if (keyFilter_ && !re2::RE2::PartialMatch(CurrentKey().ToStringView(), *keyFilter_)) {
-              state.lastKey.PinSelf(CurrentKey());
-              state.hasLastKey = true;
               continue;
             }
 
             if (valueFilter_ && !re2::RE2::PartialMatch(CurrentValue().ToStringView(), *valueFilter_)) {
-              state.lastKey.PinSelf(CurrentKey());
-              state.hasLastKey = true;
               continue;
             }
 
@@ -2379,9 +2361,6 @@ class Iterator final : public BaseIterator, public std::enable_shared_from_this<
               state.reason = IteratorStopReason::Eof;
               break;
             }
-
-            state.lastKey.PinSelf(CurrentKey());
-            state.hasLastKey = true;
 
             if (!state.modeDecided) {
               state.packed = ShouldAutoPackCurrent();
@@ -2451,36 +2430,6 @@ class Iterator final : public BaseIterator, public std::enable_shared_from_this<
           napi_value limited;
           NAPI_STATUS_RETURN(napi_get_boolean(env, state.limited, &limited));
 
-          napi_value lastKey;
-          if (state.hasLastKey) {
-            NAPI_STATUS_RETURN(Convert(env, std::move(state.lastKey), Encoding::Buffer, lastKey, true));
-          } else {
-            NAPI_STATUS_RETURN(napi_get_undefined(env, &lastKey));
-          }
-
-          napi_value lastRow;
-          if (state.hasLastRow) {
-            napi_value key;
-            napi_value value;
-            if (keys_) {
-              NAPI_STATUS_RETURN(
-                  Convert(env, std::move(state.lastRowKey), keyEncoding_, key, unsafe_));
-            } else {
-              NAPI_STATUS_RETURN(napi_get_undefined(env, &key));
-            }
-            if (values_) {
-              NAPI_STATUS_RETURN(
-                  Convert(env, std::move(state.lastRowValue), valueEncoding_, value, unsafe_));
-            } else {
-              NAPI_STATUS_RETURN(napi_get_undefined(env, &value));
-            }
-            NAPI_STATUS_RETURN(napi_create_array_with_length(env, 2, &lastRow));
-            NAPI_STATUS_RETURN(napi_set_element(env, lastRow, 0, key));
-            NAPI_STATUS_RETURN(napi_set_element(env, lastRow, 1, value));
-          } else {
-            NAPI_STATUS_RETURN(napi_get_undefined(env, &lastRow));
-          }
-
           if (state.packed) {
             state.packedData.PinSelf();
 
@@ -2514,8 +2463,6 @@ class Iterator final : public BaseIterator, public std::enable_shared_from_this<
             NAPI_STATUS_RETURN(napi_set_named_property(env, *result, "values", values));
             NAPI_STATUS_RETURN(napi_set_named_property(env, *result, "finished", finished));
             NAPI_STATUS_RETURN(napi_set_named_property(env, *result, "limited", limited));
-            NAPI_STATUS_RETURN(napi_set_named_property(env, *result, "lastKey", lastKey));
-            NAPI_STATUS_RETURN(napi_set_named_property(env, *result, "lastRow", lastRow));
             NAPI_STATUS_RETURN(SetIteratorStopReason(env, *result, state.reason));
 
             return napi_ok;
@@ -2550,8 +2497,6 @@ class Iterator final : public BaseIterator, public std::enable_shared_from_this<
           NAPI_STATUS_RETURN(napi_set_named_property(env, *result, "rows", rows));
           NAPI_STATUS_RETURN(napi_set_named_property(env, *result, "finished", finished));
           NAPI_STATUS_RETURN(napi_set_named_property(env, *result, "limited", limited));
-          NAPI_STATUS_RETURN(napi_set_named_property(env, *result, "lastKey", lastKey));
-          NAPI_STATUS_RETURN(napi_set_named_property(env, *result, "lastRow", lastRow));
           NAPI_STATUS_RETURN(SetIteratorStopReason(env, *result, state.reason));
 
           return napi_ok;
@@ -2586,11 +2531,6 @@ class Iterator final : public BaseIterator, public std::enable_shared_from_this<
     NAPI_STATUS_THROWS(napi_get_boolean(env, false, &limited));
 
     napi_value rows = nullptr;
-    rocksdb::PinnableSlice lastKey;
-    bool hasLastKey = false;
-    rocksdb::PinnableSlice lastRowKey;
-    rocksdb::PinnableSlice lastRowValue;
-    bool hasLastRow = false;
     rocksdb::PinnableSlice packedData;
     std::vector<uint32_t> keyOffsets;
     std::vector<uint32_t> valueOffsets;
@@ -2666,23 +2606,13 @@ class Iterator final : public BaseIterator, public std::enable_shared_from_this<
       processed++;
       if (deadline > 0) scannedSinceDeadlineCheck++;
 
-      if (options.lastRow) {
-        if (keys_) lastRowKey.PinSelf(CurrentKey());
-        if (values_) lastRowValue.PinSelf(CurrentValue());
-        hasLastRow = true;
-      }
-
       // Apply the key/value filters BEFORE charging the user `limit`, so `limit`
       // counts matched (emitted) rows, not rows merely scanned and discarded.
       if (keyFilter_ && !re2::RE2::PartialMatch(CurrentKey().ToStringView(), *keyFilter_)) {
-        lastKey.PinSelf(CurrentKey());
-        hasLastKey = true;
         continue;
       }
 
       if (valueFilter_ && !re2::RE2::PartialMatch(CurrentValue().ToStringView(), *valueFilter_)) {
-        lastKey.PinSelf(CurrentKey());
-        hasLastKey = true;
         continue;
       }
 
@@ -2695,9 +2625,6 @@ class Iterator final : public BaseIterator, public std::enable_shared_from_this<
         reason = IteratorStopReason::Eof;
         break;
       }
-
-      lastKey.PinSelf(CurrentKey());
-      hasLastKey = true;
 
       if (!modeDecided) {
         packed = ShouldAutoPackCurrent();
@@ -2798,35 +2725,6 @@ class Iterator final : public BaseIterator, public std::enable_shared_from_this<
     NAPI_STATUS_THROWS(napi_set_named_property(env, ret, "finished", finished));
     NAPI_STATUS_THROWS(napi_set_named_property(env, ret, "limited", limited));
 
-    napi_value lastKeyValue;
-    if (hasLastKey) {
-      NAPI_STATUS_THROWS(Convert(env, std::move(lastKey), Encoding::Buffer, lastKeyValue, true));
-    } else {
-      NAPI_STATUS_THROWS(napi_get_undefined(env, &lastKeyValue));
-    }
-    NAPI_STATUS_THROWS(napi_set_named_property(env, ret, "lastKey", lastKeyValue));
-
-    napi_value lastRowValueResult;
-    if (hasLastRow) {
-      napi_value key;
-      napi_value value;
-      if (keys_) {
-        NAPI_STATUS_THROWS(Convert(env, std::move(lastRowKey), keyEncoding_, key, unsafe_));
-      } else {
-        NAPI_STATUS_THROWS(napi_get_undefined(env, &key));
-      }
-      if (values_) {
-        NAPI_STATUS_THROWS(Convert(env, std::move(lastRowValue), valueEncoding_, value, unsafe_));
-      } else {
-        NAPI_STATUS_THROWS(napi_get_undefined(env, &value));
-      }
-      NAPI_STATUS_THROWS(napi_create_array_with_length(env, 2, &lastRowValueResult));
-      NAPI_STATUS_THROWS(napi_set_element(env, lastRowValueResult, 0, key));
-      NAPI_STATUS_THROWS(napi_set_element(env, lastRowValueResult, 1, value));
-    } else {
-      NAPI_STATUS_THROWS(napi_get_undefined(env, &lastRowValueResult));
-    }
-    NAPI_STATUS_THROWS(napi_set_named_property(env, ret, "lastRow", lastRowValueResult));
     NAPI_STATUS_THROWS(SetIteratorStopReason(env, ret, reason));
     return ret;
   }

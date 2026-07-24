@@ -142,11 +142,6 @@ A raw result that contains fewer rows than requested has `reason: 'bytes'`,
 when the requested output size was satisfied. Existing `finished` and `limited`
 flags remain available for compatibility.
 
-Set the per-read `lastRow: true` option to also return the last native row
-examined as `[key, value]`. Disabled key or value fields are `undefined`.
-`lastRow` is captured before filters run, so it provides a progress boundary
-even when the returned `rows` are empty.
-
 ## Packed raw reads
 
 The raw `_nextvSync()`, `_nextvAsync()`, `_getManySync()` and

@@ -146,8 +146,6 @@ test('native reads remain terminal after filtered exhaustion and limit', async f
       t.deepEqual(resultKeys(terminal), [], `${name}: post-limit read ${repeat} stays empty`)
       t.equal(terminal.finished, true, `${name}: post-limit read ${repeat} stays finished`)
       t.equal(terminal.limited, false, `${name}: post-limit read ${repeat} is not a new limit event`)
-      t.equal(terminal.lastKey, undefined,
-        `${name}: post-limit read ${repeat} does not scan beyond the terminal match`)
     }
     binding.iterator_close_sync(limited)
   }

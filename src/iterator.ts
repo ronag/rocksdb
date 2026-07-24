@@ -19,7 +19,6 @@ const kInitCallbacks = Symbol('initCallbacks')
 const kInitError = Symbol('initError')
 const kInitialTarget = Symbol('initialTarget')
 const kCache = Symbol('cache')
-const kCacheLastKey = Symbol('cacheLastKey')
 const kCacheReason = Symbol('cacheReason')
 const kFinished = Symbol('finished')
 const kFirst = Symbol('first')
@@ -186,8 +185,6 @@ function emptyPackedResult(iterator, size) {
     values: iterator[kValues] ? new Uint32Array() : undefined,
     finished: true,
     limited: false,
-    lastKey: undefined,
-    lastRow: undefined,
   }
   if (size > 0) result.reason = 'eof'
   return result
@@ -247,19 +244,6 @@ function validatePackedEncodings(iterator, packed) {
 }
 
 function convertIteratorResult(iterator, result) {
-  const convertLastRow = () => {
-    if (result.lastRow === undefined) return undefined
-    const [key, value] = result.lastRow
-    return [
-      iterator[kKeys] && iterator[kKeyEncoding] === 'slice' && !(key instanceof Slice)
-        ? new Slice(key)
-        : key,
-      iterator[kValues] && iterator[kValueEncoding] === 'slice' && !(value instanceof Slice)
-        ? new Slice(value)
-        : value,
-    ]
-  }
-
   if ('rows' in result) {
     const convertKey = iterator[kKeys] && iterator[kKeyEncoding] === 'slice'
     const convertValue = iterator[kValues] && iterator[kValueEncoding] === 'slice'
@@ -271,7 +255,7 @@ function convertIteratorResult(iterator, result) {
         ? new Slice(value)
         : value
     })
-    return { ...result, rows, lastRow: convertLastRow() }
+    return { ...result, rows }
   }
 
   const convertKey = iterator[kKeys] && isJavaScriptEncoding(iterator[kKeyEncoding])
@@ -299,18 +283,9 @@ function convertIteratorResult(iterator, result) {
     rows,
     finished: result.finished,
     limited: result.limited,
-    lastKey: result.lastKey,
-    lastRow: convertLastRow(),
   }
   if (result.reason !== undefined) converted.reason = result.reason
   return converted
-}
-
-function encodeCachedKey(key) {
-  if (typeof key === 'string') return Buffer.from(key)
-  if (Buffer.isBuffer(key)) return copyBytesFrom(key)
-  if (key instanceof Slice) return copyBytesFrom(key.buffer, key.byteOffset, key.byteLength)
-  return undefined
 }
 
 class Iterator extends AbstractIterator<any, any, any> {
@@ -343,7 +318,6 @@ class Iterator extends AbstractIterator<any, any, any> {
 
       this[kFirst] = true
       this[kCache] = kEmpty
-      this[kCacheLastKey] = undefined
       this[kCacheReason] = undefined
       this[kFinished] = false
       this[kPosition] = 0
@@ -489,7 +463,6 @@ class Iterator extends AbstractIterator<any, any, any> {
         this[kInitialTarget] = initialTarget
         this[kFirst] = true
         this[kCache] = kEmpty
-        this[kCacheLastKey] = undefined
         this[kCacheReason] = undefined
         this[kFinished] = false
         this[kPosition] = 0
@@ -575,7 +548,6 @@ class Iterator extends AbstractIterator<any, any, any> {
     if (this[kPosition] < this[kCache].length) {
       const key = this[kCache][this[kPosition]++]
       const val = this[kCache][this[kPosition]++]
-      if (this[kPosition] >= this[kCache].length) this[kCacheLastKey] = undefined
       if (this[kPosition] >= this[kCache].length) this[kCacheReason] = undefined
       process.nextTick(callback, null, key, val)
     } else if (this[kFinished]) {
@@ -611,7 +583,6 @@ class Iterator extends AbstractIterator<any, any, any> {
         try {
           result = convertIteratorResult(this, result)
           this[kCache] = result.rows
-          this[kCacheLastKey] = result.rows.length === 0 ? undefined : result.lastKey
           this[kCacheReason] = result.reason
           this[kFinished] = result.finished
           this[kPosition] = 0
@@ -703,7 +674,6 @@ class Iterator extends AbstractIterator<any, any, any> {
 
     this[kFirst] = true
     this[kCache] = kEmpty
-    this[kCacheLastKey] = undefined
     this[kCacheReason] = undefined
     this[kFinished] = false
     this[kPosition] = 0
@@ -732,7 +702,6 @@ class Iterator extends AbstractIterator<any, any, any> {
     const discardedCount = (this[kCache].length - this[kPosition]) / 2
     this[kFirst] = true
     this[kCache] = kEmpty
-    this[kCacheLastKey] = undefined
     this[kCacheReason] = undefined
     this[kFinished] = false
     this[kPosition] = 0
@@ -766,7 +735,6 @@ class Iterator extends AbstractIterator<any, any, any> {
       const reset = () => {
         this[kFirst] = true
         this[kCache] = kEmpty
-        this[kCacheLastKey] = undefined
         this[kCacheReason] = undefined
         this[kFinished] = false
         this[kPosition] = 0
@@ -800,7 +768,7 @@ class Iterator extends AbstractIterator<any, any, any> {
     return promise
   }
 
-  _nextvCached(size, options) {
+  _nextvCached(size) {
     const end = Math.min(this[kCache].length, this[kPosition] + size * 2)
     const rows = this[kCache].slice(this[kPosition], end)
     this[kPosition] = end
@@ -810,21 +778,9 @@ class Iterator extends AbstractIterator<any, any, any> {
     const drained = this[kPosition] >= this[kCache].length
     const reason =
       rows.length < size * 2 && drained ? (finished ? 'eof' : this[kCacheReason]) : undefined
-    const lastKey = drained
-      ? this[kCacheLastKey]
-      : this[kKeys]
-        ? encodeCachedKey(rows[rows.length - 2])
-        : undefined
-    const lastRow =
-      options?.lastRow === true && rows.length >= 2
-        ? [rows[rows.length - 2], rows[rows.length - 1]]
-        : undefined
-    if (drained) {
-      this[kCacheLastKey] = undefined
-      this[kCacheReason] = undefined
-    }
+    if (drained) this[kCacheReason] = undefined
 
-    const result: any = { rows, finished, limited, lastKey, lastRow }
+    const result: any = { rows, finished, limited }
     if (reason !== undefined) result.reason = reason
     return result
   }
@@ -852,14 +808,14 @@ class Iterator extends AbstractIterator<any, any, any> {
 
     if (this[kPosition] < this[kCache].length) {
       if (packed === true) throw packedCacheError()
-      return setPackedResult(convertIteratorResult(this, this._nextvCached(size, options)), false)
+      return setPackedResult(convertIteratorResult(this, this._nextvCached(size)), false)
     }
 
     if (this[kFinished]) {
       const result: any =
         packed === true
           ? emptyPackedResult(this, size)
-          : { rows: [], finished: true, lastKey: undefined, lastRow: undefined }
+          : { rows: [], finished: true }
       if (packed !== true && size > 0) result.reason = 'eof'
       return setPackedResult(convertIteratorResult(this, result), packed === true)
     }
@@ -918,13 +874,13 @@ class Iterator extends AbstractIterator<any, any, any> {
 
       if (this[kPosition] < this[kCache].length) {
         if (packed === true) throw packedCacheError()
-        const result = this._nextvCached(size, options)
+        const result = this._nextvCached(size)
         this._deferNextResult(callback, null, result, false, unsafe)
       } else if (this[kFinished]) {
         const result: any =
           packed === true
             ? emptyPackedResult(this, size)
-            : { rows: [], finished: true, lastKey: undefined, lastRow: undefined }
+            : { rows: [], finished: true }
         if (packed !== true && size > 0) result.reason = 'eof'
         this._deferNextResult(callback, null, result, packed === true, unsafe)
       } else {
@@ -1016,7 +972,6 @@ class Iterator extends AbstractIterator<any, any, any> {
 
   [kCloseNative]() {
     this[kCache] = kEmpty
-    this[kCacheLastKey] = undefined
     this[kCacheReason] = undefined
 
     if (this[kContext]) {

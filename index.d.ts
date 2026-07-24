@@ -474,13 +474,6 @@ export interface RocksRawIteratorResult<
   readonly limited?: boolean
   /** Why this read returned fewer rows than requested. */
   readonly reason?: RocksIteratorStopReason
-  /** Last encoded key safely consumed by this read, or undefined if no safe boundary is available. */
-  readonly lastKey: Buffer | undefined
-  /**
-   * Last native row examined when `lastRow: true`, including rows rejected by
-   * key or value filters.
-   */
-  readonly lastRow: RocksIteratorEntry<K, V, Keys, Values> | undefined
 }
 
 export interface RocksPackedIteratorResult<
@@ -499,13 +492,6 @@ export interface RocksPackedIteratorResult<
   readonly limited: boolean
   /** Why this read returned fewer rows than requested. */
   readonly reason?: RocksIteratorStopReason
-  /** Last encoded key safely consumed by this read, or undefined if no safe boundary is available. */
-  readonly lastKey: Buffer | undefined
-  /**
-   * Last native row examined when `lastRow: true`, including rows rejected by
-   * key or value filters.
-   */
-  readonly lastRow: RocksIteratorEntry<Buffer, Buffer, Keys, Values> | undefined
 }
 
 export interface RocksPackedGetManyResult {
@@ -556,11 +542,6 @@ export interface RocksRawIteratorReadOptions<Packed extends RocksPackedReadMode 
    * progress.
    */
   highWaterMarkCount?: number
-  /**
-   * Include the last native row examined in the result, even when filters
-   * reject it.
-   */
-  lastRow?: boolean
   packed?: Packed
 }
 
@@ -990,8 +971,6 @@ export interface RocksQueryResult<
   readonly rows: Array<RocksRows<K, V, Keys, Values>>
   readonly finished: boolean
   readonly limited: boolean
-  /** Last encoded key safely consumed by the query, or undefined if no key was consumed. */
-  readonly lastKey: Buffer | undefined
 }
 
 export interface RocksUpdatesOptions<

@@ -392,7 +392,6 @@ expectTrue<Equal<Awaited<typeof annotatedBoundedValues>, Array<string | undefine
 
 const query = db.querySync({ gte: slice, lt: Buffer.from('z') })
 expectType<Array<Buffer>>(query.rows)
-expectType<Buffer | undefined>(query.lastKey)
 expectType<Array<string>>(db.querySync({ keyEncoding: 'utf8', valueEncoding: 'utf8' }).rows)
 expectType<Array<string>>(db.querySync({ keyEncoding: 'utf-8', valueEncoding: 'utf-8' }).rows)
 expectType<
@@ -421,13 +420,10 @@ expectType<Promise<RocksPackedIteratorResult>>(iterator._nextvAsync(10, { packed
 const boundedIteratorRead = iterator._nextvSync(10, {
   highWaterMarkBytes: 1024,
   highWaterMarkCount: 100,
-  lastRow: true,
   packed: false,
 })
 expectType<RocksIteratorStopReason | undefined>(boundedIteratorRead.reason)
-expectType<[Buffer, Buffer] | undefined>(boundedIteratorRead.lastRow)
 const packedIteratorKeys = iterator._nextvSync(10, { packed: true })
-expectType<Buffer | undefined>(packedIteratorKeys.lastKey)
 expectType<Uint32Array>(packedIteratorKeys.keys)
 expectType<Uint32Array>(packedIteratorKeys.values)
 expectType<RocksUnexposedGetManyReadResult<'buffer', 'auto', false>>(
@@ -462,9 +458,6 @@ iterator._nextvSync(1, { packed: 'sometimes' })
 
 const sliceIterator = db._iterator({ keyEncoding: 'slice', valueEncoding: 'slice' })
 expectType<RocksRawIteratorResult<Slice, Slice, true, true, boolean>>(sliceIterator._nextvSync(10))
-expectType<[Slice, Slice] | undefined>(
-  sliceIterator._nextvSync(10, { lastRow: true }).lastRow
-)
 expectType<RocksRawIteratorResult<Slice, Slice, true, true, true>>(
   sliceIterator._nextvSync(10, { packed: true })
 )
