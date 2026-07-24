@@ -1956,23 +1956,8 @@ static napi_status SetIteratorStopReason(napi_env env,
                                          const IteratorStopReason reason) {
   if (reason == IteratorStopReason::None) return napi_ok;
 
-  const char* name;
-  switch (reason) {
-    case IteratorStopReason::Count:
-      name = "count";
-      break;
-    case IteratorStopReason::Bytes:
-      name = "bytes";
-      break;
-    case IteratorStopReason::Eof:
-      name = "eof";
-      break;
-    case IteratorStopReason::None:
-      return napi_ok;
-  }
-
   napi_value value;
-  NAPI_STATUS_RETURN(napi_create_string_utf8(env, name, NAPI_AUTO_LENGTH, &value));
+  NAPI_STATUS_RETURN(napi_create_uint32(env, static_cast<uint32_t>(reason), &value));
   return napi_set_named_property(env, result, "reason", value);
 }
 
@@ -2294,7 +2279,7 @@ class Iterator final : public BaseIterator, public std::enable_shared_from_this<
               state.limited = true;
               break;
             }
-            if (state.bytes > options.highWaterMarkBytes) {
+            if (state.bytes > 0 && state.bytes > options.highWaterMarkBytes) {
               state.limited = true;
               state.reason = IteratorStopReason::Bytes;
               break;
@@ -2561,7 +2546,7 @@ class Iterator final : public BaseIterator, public std::enable_shared_from_this<
         NAPI_STATUS_THROWS(napi_get_boolean(env, true, &limited));
         break;
       }
-      if (bytes > options.highWaterMarkBytes) {
+      if (bytes > 0 && bytes > options.highWaterMarkBytes) {
         NAPI_STATUS_THROWS(napi_get_boolean(env, true, &limited));
         reason = IteratorStopReason::Bytes;
         break;

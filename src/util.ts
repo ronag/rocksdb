@@ -2,6 +2,8 @@ const DEBUG = process.env.NODE_ENV !== 'production'
 
 type PackedMode = boolean | 'auto'
 
+const iteratorStopReasons = Object.freeze([undefined, 'count', 'bytes', 'eof'])
+
 export const kRef = Symbol('ref')
 export const kUnref = Symbol('unref')
 export const kRegisterCleanupResource = Symbol('registerCleanupResource')
@@ -21,5 +23,12 @@ export function getPackedMode(
 
 export function setPackedResult(result, packed) {
   Object.defineProperty(result, 'packed', { value: packed })
+  return result
+}
+
+export function convertIteratorStopReason(result) {
+  if (typeof result.reason === 'number') {
+    result.reason = iteratorStopReasons[result.reason]
+  }
   return result
 }

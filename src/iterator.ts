@@ -6,6 +6,7 @@ import { fromCallback } from 'catering'
 import ModuleError = require('module-error')
 import binding = require('./binding')
 import {
+  convertIteratorStopReason,
   getPackedMode,
   kRegisterCleanupResource,
   kUnregisterCleanupResource,
@@ -244,6 +245,8 @@ function validatePackedEncodings(iterator, packed) {
 }
 
 function convertIteratorResult(iterator, result) {
+  convertIteratorStopReason(result)
+
   if ('rows' in result) {
     const convertKey = iterator[kKeys] && iterator[kKeyEncoding] === 'slice'
     const convertValue = iterator[kValues] && iterator[kValueEncoding] === 'slice'

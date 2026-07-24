@@ -10,6 +10,7 @@ import { ChainedBatch, resolveBatchColumns } from './chained-batch'
 import { Iterator, KeyIterator, ValueIterator } from './iterator'
 import { RocksStatistics, getStatisticsContext } from './statistics'
 import {
+  convertIteratorStopReason,
   getPackedMode,
   kRef,
   kRegisterCleanupResource,
@@ -879,7 +880,7 @@ class RocksLevel extends AbstractLevel<any, any, any> {
     this[kRef]()
     const complete = once((err, value) => {
       this[kUnref]()
-      callback(err, value)
+      callback(err, err ? value : convertIteratorStopReason(value))
     })
 
     try {
@@ -898,7 +899,7 @@ class RocksLevel extends AbstractLevel<any, any, any> {
       })
     }
 
-    return binding.db_query_sync(this[kContext], options ?? kEmpty)
+    return convertIteratorStopReason(binding.db_query_sync(this[kContext], options ?? kEmpty))
   }
 
   async *updates(options) {

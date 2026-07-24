@@ -30,6 +30,8 @@ make('async query matches sync HWM and limit semantics', async function (db, t, 
   const sync = db.querySync(options)
   const asyncResult = await db.query(options)
   t.same(asyncResult, sync, 'promise query matches querySync at the high-water mark')
+  t.equal(sync.reason, 'bytes', 'sync query converts the native stop code')
+  t.equal(asyncResult.reason, 'bytes', 'async query converts the native stop code')
   t.equal(asyncResult.finished, false, 'high-water mark leaves the query unfinished')
   t.equal(asyncResult.limited, true, 'high-water mark reports a limited result')
 
