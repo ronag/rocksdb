@@ -48,20 +48,28 @@ function putEntries (context, entries) {
 
 async function collectWithTimeout (iterator, read) {
   const keys = []
+  let processed = 0
   let timeoutPages = 0
+  const timeoutReasons = []
+  const timeoutProcessed = []
 
-  for (let page = 0; page < 10_000; page++) {
+  for (let page = 0; page < 100_001; page++) {
     const result = await read(iterator)
     keys.push(...resultKeys(result))
+    processed += result.processed
 
     if (result.finished) {
-      return { keys, timeoutPages }
+      return { keys, pages: page + 1, processed, timeoutPages, timeoutProcessed, timeoutReasons }
     }
 
-    if (!result.limited) timeoutPages++
+    if (!result.limited) {
+      timeoutPages++
+      timeoutProcessed.push(result.processed)
+      timeoutReasons.push(result.reason)
+    }
   }
 
-  throw new Error('iterator did not finish after 10,000 timeout resumptions')
+  throw new Error('iterator did not finish after one read per native row')
 }
 
 test('filtered native timeout reads resume without skipping rows', async function (t) {
@@ -90,10 +98,34 @@ test('filtered native timeout reads resume without skipping rows', async functio
     const result = await collectWithTimeout(iterator, read)
 
     t.ok(result.timeoutPages > 0, `${name}: 1ms deadline interrupts the filtered scan`)
+    t.ok(result.timeoutReasons.every((reason) => reason === 4),
+      `${name}: every interrupted page reports the native timeout reason`)
+    t.ok(result.timeoutProcessed.every((processed) => processed > 0),
+      `${name}: every timeout page examines at least one native row`)
+    t.equal(result.processed, entries.length,
+      `${name}: processed totals every native row exactly once`)
     t.deepEqual(result.keys, expected,
       `${name}: every matching key is returned exactly once across timeout resumptions`)
 
     binding.iterator_close_sync(iterator)
+
+    const fullyFiltered = binding.iterator_create(context, {
+      valueFilter: '^never-match$'
+    })
+    const filteredResult = await collectWithTimeout(fullyFiltered, read)
+
+    t.ok(filteredResult.timeoutPages > 0,
+      `${name}: timeout can return no output after examining filtered rows`)
+    t.deepEqual(filteredResult.keys, [],
+      `${name}: an all-filtered scan completes without output`)
+    t.ok(filteredResult.timeoutProcessed.every((processed) => processed > 0),
+      `${name}: empty timeout pages still report native-row progress`)
+    t.equal(filteredResult.processed, entries.length,
+      `${name}: all filtered native rows are included in processed`)
+    t.ok(filteredResult.pages <= entries.length + 1,
+      `${name}: timeout retries always make native-row progress`)
+
+    binding.iterator_close_sync(fullyFiltered)
   }
 
   await close(context)

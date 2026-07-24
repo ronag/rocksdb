@@ -472,6 +472,8 @@ export interface RocksRawIteratorResult<
   readonly rows: Array<RocksRows<K, V, Keys, Values>>
   readonly finished: boolean
   readonly limited?: boolean
+  /** Native-row progress attributed to this read, including filtered and prefetched rows. */
+  readonly processed: number
   /** Why this read returned fewer rows than requested. */
   readonly reason?: RocksIteratorStopReason
 }
@@ -490,6 +492,8 @@ export interface RocksPackedIteratorResult<
   readonly count: number
   readonly finished: boolean
   readonly limited: boolean
+  /** Native-row progress attributed to this read, including filtered and prefetched rows. */
+  readonly processed: number
   /** Why this read returned fewer rows than requested. */
   readonly reason?: RocksIteratorStopReason
 }
@@ -530,9 +534,14 @@ export type RocksRawGetManyResult<
   readonly packed: Packed
 }
 
-export type RocksIteratorStopReason = 'eof' | 'count' | 'bytes'
+export type RocksIteratorStopReason = 'eof' | 'count' | 'bytes' | 'timeout'
 
 export interface RocksRawIteratorReadOptions<Packed extends RocksPackedReadMode = false> {
+  /**
+   * Best-effort deadline in milliseconds. Before reporting a timeout, the read
+   * examines at least one native row; rows rejected by filters count as
+   * progress.
+   */
   timeout?: number
   /** Soft byte cap for this read. The row that crosses the cap is included. */
   highWaterMarkBytes?: number

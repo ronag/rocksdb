@@ -8,6 +8,7 @@ import binding = require('./binding')
 import {
   convertIteratorStopReason,
   getPackedMode,
+  iteratorStopReasonStrings,
   kRegisterCleanupResource,
   kUnregisterCleanupResource,
   setPackedResult,
@@ -20,6 +21,7 @@ const kInitCallbacks = Symbol('initCallbacks')
 const kInitError = Symbol('initError')
 const kInitialTarget = Symbol('initialTarget')
 const kCache = Symbol('cache')
+const kCacheProcessed = Symbol('cacheProcessed')
 const kCacheReason = Symbol('cacheReason')
 const kFinished = Symbol('finished')
 const kFirst = Symbol('first')
@@ -56,6 +58,18 @@ const kFailed = 3
 const kClosed = 4
 
 const identity = (value) => value
+
+function consumeCachedProcessed(iterator, count) {
+  const remaining = (iterator[kCache].length - iterator[kPosition]) / 2
+  if (count === 0 || remaining === 0) return 0
+
+  const processed =
+    count >= remaining
+      ? iterator[kCacheProcessed]
+      : Math.floor((iterator[kCacheProcessed] * count) / remaining)
+  iterator[kCacheProcessed] -= processed
+  return processed
+}
 
 function once(callback) {
   let called = false
@@ -186,8 +200,9 @@ function emptyPackedResult(iterator, size) {
     values: iterator[kValues] ? new Uint32Array() : undefined,
     finished: true,
     limited: false,
+    processed: 0,
   }
-  if (size > 0) result.reason = 'eof'
+  if (size > 0) result.reason = iteratorStopReasonStrings.eof
   return result
 }
 
@@ -286,6 +301,7 @@ function convertIteratorResult(iterator, result) {
     rows,
     finished: result.finished,
     limited: result.limited,
+    processed: result.processed,
   }
   if (result.reason !== undefined) converted.reason = result.reason
   return converted
@@ -321,6 +337,7 @@ class Iterator extends AbstractIterator<any, any, any> {
 
       this[kFirst] = true
       this[kCache] = kEmpty
+      this[kCacheProcessed] = 0
       this[kCacheReason] = undefined
       this[kFinished] = false
       this[kPosition] = 0
@@ -466,6 +483,7 @@ class Iterator extends AbstractIterator<any, any, any> {
         this[kInitialTarget] = initialTarget
         this[kFirst] = true
         this[kCache] = kEmpty
+        this[kCacheProcessed] = 0
         this[kCacheReason] = undefined
         this[kFinished] = false
         this[kPosition] = 0
@@ -549,6 +567,7 @@ class Iterator extends AbstractIterator<any, any, any> {
     if (DEBUG) assert(this[kContext])
 
     if (this[kPosition] < this[kCache].length) {
+      consumeCachedProcessed(this, 1)
       const key = this[kCache][this[kPosition]++]
       const val = this[kCache][this[kPosition]++]
       if (this[kPosition] >= this[kCache].length) this[kCacheReason] = undefined
@@ -586,6 +605,7 @@ class Iterator extends AbstractIterator<any, any, any> {
         try {
           result = convertIteratorResult(this, result)
           this[kCache] = result.rows
+          this[kCacheProcessed] = result.rows.length === 0 ? 0 : result.processed
           this[kCacheReason] = result.reason
           this[kFinished] = result.finished
           this[kPosition] = 0
@@ -677,6 +697,7 @@ class Iterator extends AbstractIterator<any, any, any> {
 
     this[kFirst] = true
     this[kCache] = kEmpty
+    this[kCacheProcessed] = 0
     this[kCacheReason] = undefined
     this[kFinished] = false
     this[kPosition] = 0
@@ -705,6 +726,7 @@ class Iterator extends AbstractIterator<any, any, any> {
     const discardedCount = (this[kCache].length - this[kPosition]) / 2
     this[kFirst] = true
     this[kCache] = kEmpty
+    this[kCacheProcessed] = 0
     this[kCacheReason] = undefined
     this[kFinished] = false
     this[kPosition] = 0
@@ -738,6 +760,7 @@ class Iterator extends AbstractIterator<any, any, any> {
       const reset = () => {
         this[kFirst] = true
         this[kCache] = kEmpty
+        this[kCacheProcessed] = 0
         this[kCacheReason] = undefined
         this[kFinished] = false
         this[kPosition] = 0
@@ -774,16 +797,21 @@ class Iterator extends AbstractIterator<any, any, any> {
   _nextvCached(size) {
     const end = Math.min(this[kCache].length, this[kPosition] + size * 2)
     const rows = this[kCache].slice(this[kPosition], end)
+    const processed = consumeCachedProcessed(this, rows.length / 2)
     this[kPosition] = end
 
     const finished = this[kFinished] && this[kPosition] >= this[kCache].length
     const limited = !finished && rows.length >= size * 2
     const drained = this[kPosition] >= this[kCache].length
     const reason =
-      rows.length < size * 2 && drained ? (finished ? 'eof' : this[kCacheReason]) : undefined
+      rows.length < size * 2 && drained
+        ? finished
+          ? iteratorStopReasonStrings.eof
+          : this[kCacheReason]
+        : undefined
     if (drained) this[kCacheReason] = undefined
 
-    const result: any = { rows, finished, limited }
+    const result: any = { rows, finished, limited, processed }
     if (reason !== undefined) result.reason = reason
     return result
   }
@@ -818,8 +846,8 @@ class Iterator extends AbstractIterator<any, any, any> {
       const result: any =
         packed === true
           ? emptyPackedResult(this, size)
-          : { rows: [], finished: true }
-      if (packed !== true && size > 0) result.reason = 'eof'
+          : { rows: [], finished: true, processed: 0 }
+      if (packed !== true && size > 0) result.reason = iteratorStopReasonStrings.eof
       return setPackedResult(convertIteratorResult(this, result), packed === true)
     }
 
@@ -883,8 +911,8 @@ class Iterator extends AbstractIterator<any, any, any> {
         const result: any =
           packed === true
             ? emptyPackedResult(this, size)
-            : { rows: [], finished: true }
-        if (packed !== true && size > 0) result.reason = 'eof'
+            : { rows: [], finished: true, processed: 0 }
+        if (packed !== true && size > 0) result.reason = iteratorStopReasonStrings.eof
         this._deferNextResult(callback, null, result, packed === true, unsafe)
       } else {
         const nextv =
@@ -975,6 +1003,7 @@ class Iterator extends AbstractIterator<any, any, any> {
 
   [kCloseNative]() {
     this[kCache] = kEmpty
+    this[kCacheProcessed] = 0
     this[kCacheReason] = undefined
 
     if (this[kContext]) {

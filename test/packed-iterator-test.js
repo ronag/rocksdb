@@ -35,6 +35,7 @@ test('packed nextv returns one byte arena and separate field offsets', async fun
   t.same(first.keys, new Uint32Array([0, 1, 4, 1]), 'async result locates its key fields')
   t.same(first.values, new Uint32Array([1, 3, 5, 3]), 'async result locates its value fields')
   t.equal(first.count, 2, 'reports logical row count')
+  t.equal(first.processed, 2, 'reports processed rows separately from packed output')
   t.same(fields(first, first.keys), [Buffer.from('a'), Buffer.from('b')],
     'key offsets reconstruct the original keys')
   t.same(fields(first, first.values), [Buffer.from('one'), Buffer.from('two')],
@@ -66,6 +67,7 @@ test('packed nextv supports synchronous reads', async function (t) {
   t.same(result.keys, new Uint32Array([0, 1, 4, 1]), 'sync result locates its key fields')
   t.same(result.values, new Uint32Array([1, 3, 5, 3]), 'sync result locates its value fields')
   t.equal(result.count, 2, 'reports logical row count')
+  t.equal(result.processed, 2, 'reports processed rows separately from packed output')
   t.same(fields(result, result.keys), [Buffer.from('a'), Buffer.from('b')],
     'sync key offsets reconstruct the original keys')
   t.same(fields(result, result.values), [Buffer.from('one'), Buffer.from('two')],
