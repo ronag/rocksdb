@@ -11,6 +11,7 @@ import {
   RocksFormat,
   RocksGetManyOptions,
   RocksGetManyUnsafe,
+  RocksIteratorStopReason,
   RocksLevel,
   RocksPackedGetManyResult,
   RocksPackedIteratorResult,
@@ -417,6 +418,14 @@ expectType<Promise<RocksPackedIteratorResult | RocksRawIteratorResult<Buffer, Bu
 )
 expectType<RocksPackedIteratorResult>(iterator._nextvSync(10, { packed: true }))
 expectType<Promise<RocksPackedIteratorResult>>(iterator._nextvAsync(10, { packed: true }))
+const boundedIteratorRead = iterator._nextvSync(10, {
+  highWaterMarkBytes: 1024,
+  highWaterMarkCount: 100,
+  lastRow: true,
+  packed: false,
+})
+expectType<RocksIteratorStopReason | undefined>(boundedIteratorRead.reason)
+expectType<[Buffer, Buffer] | undefined>(boundedIteratorRead.lastRow)
 const packedIteratorKeys = iterator._nextvSync(10, { packed: true })
 expectType<Buffer | undefined>(packedIteratorKeys.lastKey)
 expectType<Uint32Array>(packedIteratorKeys.keys)
@@ -453,6 +462,9 @@ iterator._nextvSync(1, { packed: 'sometimes' })
 
 const sliceIterator = db._iterator({ keyEncoding: 'slice', valueEncoding: 'slice' })
 expectType<RocksRawIteratorResult<Slice, Slice, true, true, boolean>>(sliceIterator._nextvSync(10))
+expectType<[Slice, Slice] | undefined>(
+  sliceIterator._nextvSync(10, { lastRow: true }).lastRow
+)
 expectType<RocksRawIteratorResult<Slice, Slice, true, true, true>>(
   sliceIterator._nextvSync(10, { packed: true })
 )

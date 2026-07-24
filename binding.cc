@@ -1944,6 +1944,38 @@ enum class PackedMode {
   Auto,
 };
 
+enum class IteratorStopReason {
+  None,
+  Count,
+  Bytes,
+  Eof,
+};
+
+static napi_status SetIteratorStopReason(napi_env env,
+                                         napi_value result,
+                                         const IteratorStopReason reason) {
+  if (reason == IteratorStopReason::None) return napi_ok;
+
+  const char* name;
+  switch (reason) {
+    case IteratorStopReason::Count:
+      name = "count";
+      break;
+    case IteratorStopReason::Bytes:
+      name = "bytes";
+      break;
+    case IteratorStopReason::Eof:
+      name = "eof";
+      break;
+    case IteratorStopReason::None:
+      return napi_ok;
+  }
+
+  napi_value value;
+  NAPI_STATUS_RETURN(napi_create_string_utf8(env, name, NAPI_AUTO_LENGTH, &value));
+  return napi_set_named_property(env, result, "reason", value);
+}
+
 static bool SupportsPackedReads(const Encoding encoding) {
   return encoding == Encoding::Buffer || encoding == Encoding::String;
 }
@@ -1971,6 +2003,41 @@ struct IteratorOptions {
   Encoding valueEncoding = Encoding::Buffer;
   rocksdb::ReadOptions readOptions;
 };
+
+struct IteratorNextvOptions {
+  uint32_t timeout = 0;
+  size_t highWaterMarkBytes = std::numeric_limits<int32_t>::max();
+  size_t highWaterMarkCount = std::numeric_limits<int64_t>::max();
+  bool lastRow = false;
+};
+
+static napi_status GetIteratorNextvOptions(napi_env env,
+                                           napi_value options,
+                                           IteratorNextvOptions& result) {
+  NAPI_STATUS_RETURN(GetProperty(env, options, "timeout", result.timeout));
+
+  int64_t highWaterMarkBytes = static_cast<int64_t>(result.highWaterMarkBytes);
+  NAPI_STATUS_RETURN(GetProperty(env, options, "highWaterMarkBytes", highWaterMarkBytes));
+  if (highWaterMarkBytes < 0) {
+    NAPI_STATUS_RETURN(
+        napi_throw_range_error(env, nullptr, "highWaterMarkBytes must be non-negative"));
+    return napi_pending_exception;
+  }
+  result.highWaterMarkBytes = static_cast<size_t>(highWaterMarkBytes);
+
+  int64_t highWaterMarkCount = static_cast<int64_t>(result.highWaterMarkCount);
+  NAPI_STATUS_RETURN(GetProperty(env, options, "highWaterMarkCount", highWaterMarkCount));
+  if (highWaterMarkCount < 0) {
+    NAPI_STATUS_RETURN(
+        napi_throw_range_error(env, nullptr, "highWaterMarkCount must be non-negative"));
+    return napi_pending_exception;
+  }
+  result.highWaterMarkCount = static_cast<size_t>(highWaterMarkCount);
+
+  NAPI_STATUS_RETURN(GetProperty(env, options, "lastRow", result.lastRow));
+
+  return napi_ok;
+}
 
 static napi_status GetIteratorOptions(napi_env env,
                                       napi_value options,
@@ -2142,9 +2209,15 @@ class Iterator final : public BaseIterator, public std::enable_shared_from_this<
     return iterator;
   }
 
+  IteratorNextvOptions DefaultNextvOptions() const {
+    IteratorNextvOptions options;
+    options.highWaterMarkBytes = highWaterMarkBytes_;
+    return options;
+  }
+
   napi_value nextv(napi_env env,
                    uint32_t count,
-                   uint32_t timeout,
+                   const IteratorNextvOptions options,
                    napi_value callback,
                    const PackedMode mode = PackedMode::Unpacked,
                    const bool initialize = false,
@@ -2156,6 +2229,9 @@ class Iterator final : public BaseIterator, public std::enable_shared_from_this<
       std::vector<rocksdb::PinnableSlice> values;
       rocksdb::PinnableSlice lastKey;
       bool hasLastKey = false;
+      rocksdb::PinnableSlice lastRowKey;
+      rocksdb::PinnableSlice lastRowValue;
+      bool hasLastRow = false;
       rocksdb::PinnableSlice packedData;
       std::vector<uint32_t> keyOffsets;
       std::vector<uint32_t> valueOffsets;
@@ -2165,6 +2241,8 @@ class Iterator final : public BaseIterator, public std::enable_shared_from_this<
       bool limited = false;
       bool packed = false;
       bool modeDecided = false;
+      size_t processed = 0;
+      IteratorStopReason reason = IteratorStopReason::None;
     };
 
     napi_value resourceName;
@@ -2176,7 +2254,7 @@ class Iterator final : public BaseIterator, public std::enable_shared_from_this<
 
     NAPI_STATUS_THROWS(runAsync<State>(
         resourceName, env, callback,
-        [self, this, count, timeout, databaseOperation, mode, initialize,
+        [self, this, count, options, databaseOperation, mode, initialize,
          initialTarget = std::move(initialTarget)](auto& state) {
           const DatabaseOperationScope operationScope(databaseOperation);
 
@@ -2206,21 +2284,32 @@ class Iterator final : public BaseIterator, public std::enable_shared_from_this<
           if (state.packed) {
             if (keys_) state.keyOffsets.reserve(initialCapacity * 2);
             if (values_) state.valueOffsets.reserve(initialCapacity * 2);
-            state.packedData.GetSelf()->reserve(std::min<size_t>(highWaterMarkBytes_, initialCapacity * 128));
+            state.packedData.GetSelf()->reserve(
+                std::min<size_t>(options.highWaterMarkBytes, initialCapacity * 128));
           } else if (state.modeDecided) {
             state.keys.reserve(initialCapacity);
             state.values.reserve(initialCapacity);
           }
 
           const auto deadline =
-              timeout ? database_->db->GetEnv()->NowMicros() + static_cast<uint64_t>(timeout) * 1000 : 0;
+              options.timeout ? database_->db->GetEnv()->NowMicros() +
+                                    static_cast<uint64_t>(options.timeout) * 1000
+                              : 0;
           size_t scannedSinceDeadlineCheck = kDeadlineCheckInterval;
 
           while (true) {
-            if (state.count >= count || state.bytes > highWaterMarkBytes_) {
-              // Batch cap (size/bytes) reached: more data may exist, so this is
-              // "limited", not "finished".
+            if (state.count >= count) {
               state.limited = true;
+              break;
+            }
+            if (state.bytes > options.highWaterMarkBytes) {
+              state.limited = true;
+              state.reason = IteratorStopReason::Bytes;
+              break;
+            }
+            if (state.processed > 0 && state.processed >= options.highWaterMarkCount) {
+              state.limited = true;
+              state.reason = IteratorStopReason::Count;
               break;
             }
 
@@ -2237,6 +2326,7 @@ class Iterator final : public BaseIterator, public std::enable_shared_from_this<
             // invalid RocksDB iterator or repeat the range checks.
             if (terminal_) {
               state.finished = true;
+              state.reason = IteratorStopReason::Eof;
               break;
             }
 
@@ -2251,9 +2341,17 @@ class Iterator final : public BaseIterator, public std::enable_shared_from_this<
               // Iterator naturally exhausted.
               terminal_ = true;
               state.finished = true;
+              state.reason = IteratorStopReason::Eof;
               break;
             }
+            state.processed++;
             if (deadline > 0) scannedSinceDeadlineCheck++;
+
+            if (options.lastRow) {
+              if (keys_) state.lastRowKey.PinSelf(CurrentKey());
+              if (values_) state.lastRowValue.PinSelf(CurrentValue());
+              state.hasLastRow = true;
+            }
 
             // Apply the key/value filters BEFORE charging the user `limit`, so
             // `limit` counts matched (emitted) rows, not rows merely scanned and
@@ -2278,6 +2376,7 @@ class Iterator final : public BaseIterator, public std::enable_shared_from_this<
               terminal_ = true;
               state.finished = true;
               state.limited = true;
+              state.reason = IteratorStopReason::Eof;
               break;
             }
 
@@ -2291,7 +2390,7 @@ class Iterator final : public BaseIterator, public std::enable_shared_from_this<
                 if (keys_) state.keyOffsets.reserve(initialCapacity * 2);
                 if (values_) state.valueOffsets.reserve(initialCapacity * 2);
                 state.packedData.GetSelf()->reserve(
-                    std::min<size_t>(highWaterMarkBytes_, initialCapacity * 128));
+                    std::min<size_t>(options.highWaterMarkBytes, initialCapacity * 128));
               } else {
                 state.keys.reserve(initialCapacity);
                 state.values.reserve(initialCapacity);
@@ -2359,6 +2458,29 @@ class Iterator final : public BaseIterator, public std::enable_shared_from_this<
             NAPI_STATUS_RETURN(napi_get_undefined(env, &lastKey));
           }
 
+          napi_value lastRow;
+          if (state.hasLastRow) {
+            napi_value key;
+            napi_value value;
+            if (keys_) {
+              NAPI_STATUS_RETURN(
+                  Convert(env, std::move(state.lastRowKey), keyEncoding_, key, unsafe_));
+            } else {
+              NAPI_STATUS_RETURN(napi_get_undefined(env, &key));
+            }
+            if (values_) {
+              NAPI_STATUS_RETURN(
+                  Convert(env, std::move(state.lastRowValue), valueEncoding_, value, unsafe_));
+            } else {
+              NAPI_STATUS_RETURN(napi_get_undefined(env, &value));
+            }
+            NAPI_STATUS_RETURN(napi_create_array_with_length(env, 2, &lastRow));
+            NAPI_STATUS_RETURN(napi_set_element(env, lastRow, 0, key));
+            NAPI_STATUS_RETURN(napi_set_element(env, lastRow, 1, value));
+          } else {
+            NAPI_STATUS_RETURN(napi_get_undefined(env, &lastRow));
+          }
+
           if (state.packed) {
             state.packedData.PinSelf();
 
@@ -2393,6 +2515,8 @@ class Iterator final : public BaseIterator, public std::enable_shared_from_this<
             NAPI_STATUS_RETURN(napi_set_named_property(env, *result, "finished", finished));
             NAPI_STATUS_RETURN(napi_set_named_property(env, *result, "limited", limited));
             NAPI_STATUS_RETURN(napi_set_named_property(env, *result, "lastKey", lastKey));
+            NAPI_STATUS_RETURN(napi_set_named_property(env, *result, "lastRow", lastRow));
+            NAPI_STATUS_RETURN(SetIteratorStopReason(env, *result, state.reason));
 
             return napi_ok;
           }
@@ -2427,6 +2551,8 @@ class Iterator final : public BaseIterator, public std::enable_shared_from_this<
           NAPI_STATUS_RETURN(napi_set_named_property(env, *result, "finished", finished));
           NAPI_STATUS_RETURN(napi_set_named_property(env, *result, "limited", limited));
           NAPI_STATUS_RETURN(napi_set_named_property(env, *result, "lastKey", lastKey));
+          NAPI_STATUS_RETURN(napi_set_named_property(env, *result, "lastRow", lastRow));
+          NAPI_STATUS_RETURN(SetIteratorStopReason(env, *result, state.reason));
 
           return napi_ok;
         }));
@@ -2436,7 +2562,7 @@ class Iterator final : public BaseIterator, public std::enable_shared_from_this<
 
   napi_value nextv(napi_env env,
                    uint32_t count,
-                   const uint32_t timeout = 0,
+                   const IteratorNextvOptions options,
                    const PackedMode mode = PackedMode::Unpacked) {
     if (!ValidatePackedEncodings(env, mode)) return nullptr;
 
@@ -2462,6 +2588,9 @@ class Iterator final : public BaseIterator, public std::enable_shared_from_this<
     napi_value rows = nullptr;
     rocksdb::PinnableSlice lastKey;
     bool hasLastKey = false;
+    rocksdb::PinnableSlice lastRowKey;
+    rocksdb::PinnableSlice lastRowValue;
+    bool hasLastRow = false;
     rocksdb::PinnableSlice packedData;
     std::vector<uint32_t> keyOffsets;
     std::vector<uint32_t> valueOffsets;
@@ -2471,22 +2600,35 @@ class Iterator final : public BaseIterator, public std::enable_shared_from_this<
       const auto initialCapacity = std::min<size_t>(count, 4096);
       if (keys_) keyOffsets.reserve(initialCapacity * 2);
       if (values_) valueOffsets.reserve(initialCapacity * 2);
-      packedData.GetSelf()->reserve(std::min<size_t>(highWaterMarkBytes_, initialCapacity * 128));
+      packedData.GetSelf()->reserve(
+          std::min<size_t>(options.highWaterMarkBytes, initialCapacity * 128));
     } else if (modeDecided) {
       NAPI_STATUS_THROWS(napi_create_array(env, &rows));
     }
 
     const auto deadline =
-        timeout ? database_->db->GetEnv()->NowMicros() + static_cast<uint64_t>(timeout) * 1000 : 0;
+        options.timeout
+            ? database_->db->GetEnv()->NowMicros() + static_cast<uint64_t>(options.timeout) * 1000
+            : 0;
     size_t scannedSinceDeadlineCheck = kDeadlineCheckInterval;
 
     size_t rowCount = 0;
     size_t bytes = 0;
+    size_t processed = 0;
+    IteratorStopReason reason = IteratorStopReason::None;
     while (true) {
-      if (rowCount >= count || bytes > highWaterMarkBytes_) {
-        // Batch cap (size/bytes) reached: more data may exist, so this is
-        // "limited", not "finished".
+      if (rowCount >= count) {
         NAPI_STATUS_THROWS(napi_get_boolean(env, true, &limited));
+        break;
+      }
+      if (bytes > options.highWaterMarkBytes) {
+        NAPI_STATUS_THROWS(napi_get_boolean(env, true, &limited));
+        reason = IteratorStopReason::Bytes;
+        break;
+      }
+      if (processed > 0 && processed >= options.highWaterMarkCount) {
+        NAPI_STATUS_THROWS(napi_get_boolean(env, true, &limited));
+        reason = IteratorStopReason::Count;
         break;
       }
 
@@ -2503,6 +2645,7 @@ class Iterator final : public BaseIterator, public std::enable_shared_from_this<
       // invalid RocksDB iterator or repeat the range checks.
       if (terminal_) {
         NAPI_STATUS_THROWS(napi_get_boolean(env, true, &finished));
+        reason = IteratorStopReason::Eof;
         break;
       }
 
@@ -2517,9 +2660,17 @@ class Iterator final : public BaseIterator, public std::enable_shared_from_this<
         // Iterator naturally exhausted.
         terminal_ = true;
         NAPI_STATUS_THROWS(napi_get_boolean(env, true, &finished));
+        reason = IteratorStopReason::Eof;
         break;
       }
+      processed++;
       if (deadline > 0) scannedSinceDeadlineCheck++;
+
+      if (options.lastRow) {
+        if (keys_) lastRowKey.PinSelf(CurrentKey());
+        if (values_) lastRowValue.PinSelf(CurrentValue());
+        hasLastRow = true;
+      }
 
       // Apply the key/value filters BEFORE charging the user `limit`, so `limit`
       // counts matched (emitted) rows, not rows merely scanned and discarded.
@@ -2541,6 +2692,7 @@ class Iterator final : public BaseIterator, public std::enable_shared_from_this<
         terminal_ = true;
         NAPI_STATUS_THROWS(napi_get_boolean(env, true, &finished));
         NAPI_STATUS_THROWS(napi_get_boolean(env, true, &limited));
+        reason = IteratorStopReason::Eof;
         break;
       }
 
@@ -2554,7 +2706,8 @@ class Iterator final : public BaseIterator, public std::enable_shared_from_this<
           const auto initialCapacity = std::min<size_t>(count, 4096);
           if (keys_) keyOffsets.reserve(initialCapacity * 2);
           if (values_) valueOffsets.reserve(initialCapacity * 2);
-          packedData.GetSelf()->reserve(std::min<size_t>(highWaterMarkBytes_, initialCapacity * 128));
+          packedData.GetSelf()->reserve(
+              std::min<size_t>(options.highWaterMarkBytes, initialCapacity * 128));
         } else {
           NAPI_STATUS_THROWS(napi_create_array(env, &rows));
         }
@@ -2652,6 +2805,29 @@ class Iterator final : public BaseIterator, public std::enable_shared_from_this<
       NAPI_STATUS_THROWS(napi_get_undefined(env, &lastKeyValue));
     }
     NAPI_STATUS_THROWS(napi_set_named_property(env, ret, "lastKey", lastKeyValue));
+
+    napi_value lastRowValueResult;
+    if (hasLastRow) {
+      napi_value key;
+      napi_value value;
+      if (keys_) {
+        NAPI_STATUS_THROWS(Convert(env, std::move(lastRowKey), keyEncoding_, key, unsafe_));
+      } else {
+        NAPI_STATUS_THROWS(napi_get_undefined(env, &key));
+      }
+      if (values_) {
+        NAPI_STATUS_THROWS(Convert(env, std::move(lastRowValue), valueEncoding_, value, unsafe_));
+      } else {
+        NAPI_STATUS_THROWS(napi_get_undefined(env, &value));
+      }
+      NAPI_STATUS_THROWS(napi_create_array_with_length(env, 2, &lastRowValueResult));
+      NAPI_STATUS_THROWS(napi_set_element(env, lastRowValueResult, 0, key));
+      NAPI_STATUS_THROWS(napi_set_element(env, lastRowValueResult, 1, value));
+    } else {
+      NAPI_STATUS_THROWS(napi_get_undefined(env, &lastRowValueResult));
+    }
+    NAPI_STATUS_THROWS(napi_set_named_property(env, ret, "lastRow", lastRowValueResult));
+    NAPI_STATUS_THROWS(SetIteratorStopReason(env, ret, reason));
     return ret;
   }
 };
@@ -2857,7 +3033,8 @@ NAPI_METHOD(db_query_sync) {
     if (!iterator) {
       return nullptr;
     }
-    return iterator->nextv(env, std::numeric_limits<uint32_t>::max());
+    return iterator->nextv(
+        env, std::numeric_limits<uint32_t>::max(), iterator->DefaultNextvOptions());
   } catch (const std::exception& e) {
     napi_throw_error(env, nullptr, e.what());
     return nullptr;
@@ -2872,7 +3049,8 @@ NAPI_METHOD(db_query) {
     if (!iterator) {
       return nullptr;
     }
-    return iterator->nextv(env, std::numeric_limits<uint32_t>::max(), 0, argv[2]);
+    return iterator->nextv(
+        env, std::numeric_limits<uint32_t>::max(), iterator->DefaultNextvOptions(), argv[2]);
   } catch (const std::exception& e) {
     napi_throw_error(env, nullptr, e.what());
     return nullptr;
@@ -4893,10 +5071,10 @@ NAPI_METHOD(iterator_init_nextv) {
     uint32_t count = 1024;
     NAPI_STATUS_THROWS(GetValue(env, argv[2], count));
 
-    uint32_t timeout = 0;
-    NAPI_STATUS_THROWS(GetProperty(env, argv[3], "timeout", timeout));
+    auto options = iterator->DefaultNextvOptions();
+    NAPI_STATUS_THROWS(GetIteratorNextvOptions(env, argv[3], options));
 
-    return iterator->nextv(env, count, timeout, argv[4], PackedMode::Unpacked, true,
+    return iterator->nextv(env, count, options, argv[4], PackedMode::Unpacked, true,
                            std::move(initialTarget));
   } catch (const std::exception& e) {
     napi_throw_error(env, nullptr, e.what());
@@ -5072,10 +5250,10 @@ NAPI_METHOD(iterator_nextv) {
     uint32_t count = 1024;
     NAPI_STATUS_THROWS(GetValue(env, argv[1], count));
 
-    uint32_t timeout = 0;
-    NAPI_STATUS_THROWS(GetProperty(env, argv[2], "timeout", timeout));
+    auto options = iterator->DefaultNextvOptions();
+    NAPI_STATUS_THROWS(GetIteratorNextvOptions(env, argv[2], options));
 
-    return iterator->nextv(env, count, timeout, argv[3]);
+    return iterator->nextv(env, count, options, argv[3]);
   } catch (const std::exception& e) {
     napi_throw_error(env, nullptr, e.what());
     return nullptr;
@@ -5092,10 +5270,10 @@ NAPI_METHOD(iterator_nextv_packed) {
     uint32_t count = 1024;
     NAPI_STATUS_THROWS(GetValue(env, argv[1], count));
 
-    uint32_t timeout = 0;
-    NAPI_STATUS_THROWS(GetProperty(env, argv[2], "timeout", timeout));
+    auto options = iterator->DefaultNextvOptions();
+    NAPI_STATUS_THROWS(GetIteratorNextvOptions(env, argv[2], options));
 
-    return iterator->nextv(env, count, timeout, argv[3], PackedMode::Packed);
+    return iterator->nextv(env, count, options, argv[3], PackedMode::Packed);
   } catch (const std::exception& e) {
     napi_throw_error(env, nullptr, e.what());
     return nullptr;
@@ -5112,10 +5290,10 @@ NAPI_METHOD(iterator_nextv_auto) {
     uint32_t count = 1024;
     NAPI_STATUS_THROWS(GetValue(env, argv[1], count));
 
-    uint32_t timeout = 0;
-    NAPI_STATUS_THROWS(GetProperty(env, argv[2], "timeout", timeout));
+    auto options = iterator->DefaultNextvOptions();
+    NAPI_STATUS_THROWS(GetIteratorNextvOptions(env, argv[2], options));
 
-    return iterator->nextv(env, count, timeout, argv[3], PackedMode::Auto);
+    return iterator->nextv(env, count, options, argv[3], PackedMode::Auto);
   } catch (const std::exception& e) {
     napi_throw_error(env, nullptr, e.what());
     return nullptr;
@@ -5132,10 +5310,10 @@ NAPI_METHOD(iterator_nextv_sync) {
     uint32_t count = 1024;
     NAPI_STATUS_THROWS(GetValue(env, argv[1], count));
 
-    uint32_t timeout = 0;
-    NAPI_STATUS_THROWS(GetProperty(env, argv[2], "timeout", timeout));
+    auto options = iterator->DefaultNextvOptions();
+    NAPI_STATUS_THROWS(GetIteratorNextvOptions(env, argv[2], options));
 
-    return iterator->nextv(env, count, timeout);
+    return iterator->nextv(env, count, options);
   } catch (const std::exception& e) {
     napi_throw_error(env, nullptr, e.what());
     return nullptr;
@@ -5152,10 +5330,10 @@ NAPI_METHOD(iterator_nextv_packed_sync) {
     uint32_t count = 1024;
     NAPI_STATUS_THROWS(GetValue(env, argv[1], count));
 
-    uint32_t timeout = 0;
-    NAPI_STATUS_THROWS(GetProperty(env, argv[2], "timeout", timeout));
+    auto options = iterator->DefaultNextvOptions();
+    NAPI_STATUS_THROWS(GetIteratorNextvOptions(env, argv[2], options));
 
-    return iterator->nextv(env, count, timeout, PackedMode::Packed);
+    return iterator->nextv(env, count, options, PackedMode::Packed);
   } catch (const std::exception& e) {
     napi_throw_error(env, nullptr, e.what());
     return nullptr;
@@ -5172,10 +5350,10 @@ NAPI_METHOD(iterator_nextv_auto_sync) {
     uint32_t count = 1024;
     NAPI_STATUS_THROWS(GetValue(env, argv[1], count));
 
-    uint32_t timeout = 0;
-    NAPI_STATUS_THROWS(GetProperty(env, argv[2], "timeout", timeout));
+    auto options = iterator->DefaultNextvOptions();
+    NAPI_STATUS_THROWS(GetIteratorNextvOptions(env, argv[2], options));
 
-    return iterator->nextv(env, count, timeout, PackedMode::Auto);
+    return iterator->nextv(env, count, options, PackedMode::Auto);
   } catch (const std::exception& e) {
     napi_throw_error(env, nullptr, e.what());
     return nullptr;

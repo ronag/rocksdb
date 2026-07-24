@@ -302,6 +302,11 @@ export interface RocksClearOptions<K> extends AbstractClearOptions<K>, RocksWrit
 
 export interface RocksIteratorReadOptions extends RocksColumnOperationOptions {
   unsafe?: boolean
+  /**
+   * @deprecated Pass `highWaterMarkBytes` to each `_nextvSync()` or
+   * `_nextvAsync()` read instead. This value remains the default for backwards
+   * compatibility when the per-read option is omitted.
+   */
   highWaterMarkBytes?: number
   keyFilter?: string
   valueFilter?: string
@@ -467,8 +472,15 @@ export interface RocksRawIteratorResult<
   readonly rows: Array<RocksRows<K, V, Keys, Values>>
   readonly finished: boolean
   readonly limited?: boolean
+  /** Why this read returned fewer rows than requested. */
+  readonly reason?: RocksIteratorStopReason
   /** Last encoded key safely consumed by this read, or undefined if no safe boundary is available. */
   readonly lastKey: Buffer | undefined
+  /**
+   * Last native row examined when `lastRow: true`, including rows rejected by
+   * key or value filters.
+   */
+  readonly lastRow: RocksIteratorEntry<K, V, Keys, Values> | undefined
 }
 
 export interface RocksPackedIteratorResult<
@@ -485,8 +497,15 @@ export interface RocksPackedIteratorResult<
   readonly count: number
   readonly finished: boolean
   readonly limited: boolean
+  /** Why this read returned fewer rows than requested. */
+  readonly reason?: RocksIteratorStopReason
   /** Last encoded key safely consumed by this read, or undefined if no safe boundary is available. */
   readonly lastKey: Buffer | undefined
+  /**
+   * Last native row examined when `lastRow: true`, including rows rejected by
+   * key or value filters.
+   */
+  readonly lastRow: RocksIteratorEntry<Buffer, Buffer, Keys, Values> | undefined
 }
 
 export interface RocksPackedGetManyResult {
@@ -525,8 +544,23 @@ export type RocksRawGetManyResult<
   readonly packed: Packed
 }
 
+export type RocksIteratorStopReason = 'eof' | 'count' | 'bytes'
+
 export interface RocksRawIteratorReadOptions<Packed extends RocksPackedReadMode = false> {
   timeout?: number
+  /** Soft byte cap for this read. The row that crosses the cap is included. */
+  highWaterMarkBytes?: number
+  /**
+   * Maximum native rows to examine for this read, including rows rejected by
+   * filters. A value of `0` still examines one row so iteration can make
+   * progress.
+   */
+  highWaterMarkCount?: number
+  /**
+   * Include the last native row examined in the result, even when filters
+   * reject it.
+   */
+  lastRow?: boolean
   packed?: Packed
 }
 
