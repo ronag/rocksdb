@@ -50,6 +50,36 @@ test('per-read byte watermark overrides the deprecated iterator default', async 
   t.end()
 })
 
+test('per-read byte watermark counts only enabled filtered output', async function (t) {
+  for (const [name, read] of [
+    ['sync', (iterator, options) => iterator._nextvSync(10, options)],
+    ['async', (iterator, options) => iterator._nextvAsync(10, options)]
+  ]) {
+    const db = testCommon.factory()
+    await db.open()
+    await populate(db)
+
+    const iterator = db._iterator({
+      values: false,
+      valueFilter: '^match-'
+    })
+    const result = await read(iterator, {
+      highWaterMarkBytes: 1,
+      packed: false
+    })
+
+    t.deepEqual(keys(result), ['c', 'e'],
+      `${name}: rejected rows and disabled values do not consume the byte budget`)
+    t.equal(result.processed, 5, `${name}: filtered rows still count as processed`)
+    t.equal(result.reason, 'bytes', `${name}: emitted key bytes cross the byte budget`)
+
+    iterator._closeSync()
+    await db.close()
+  }
+
+  t.end()
+})
+
 test('reason is omitted when the requested output size is satisfied', async function (t) {
   const db = testCommon.factory()
   await db.open()
