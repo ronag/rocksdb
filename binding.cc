@@ -3058,10 +3058,16 @@ napi_status InitOptions(napi_env env, T& columnOptions, const U& options) {
 
   NAPI_STATUS_RETURN(GetProperty(env, options, "optimizeFiltersForHits", columnOptions.optimize_filters_for_hits));
   NAPI_STATUS_RETURN(GetProperty(env, options, "periodicCompactionSeconds", columnOptions.periodic_compaction_seconds));
+  NAPI_STATUS_RETURN(
+      GetProperty(env, options, "readTriggeredCompactionThreshold", columnOptions.read_triggered_compaction_threshold));
   // memtable_huge_page_size is a column-family option: when the DB is opened
   // with explicit column descriptors the copy read into dbOptions in db_open is
   // sliced away, so it must be settable per column to take effect at all.
   NAPI_STATUS_RETURN(GetProperty(env, options, "memTableHugePageSize", columnOptions.memtable_huge_page_size));
+  NAPI_STATUS_RETURN(GetProperty(env, options, "memTableVerifyPerKeyChecksumOnSeek",
+                                 columnOptions.memtable_verify_per_key_checksum_on_seek));
+  NAPI_STATUS_RETURN(GetProperty(env, options, "minTombstonesForRangeConversion",
+                                 columnOptions.min_tombstones_for_range_conversion));
 
   NAPI_STATUS_RETURN(GetProperty(env, options, "blobFiles", columnOptions.enable_blob_files));
   NAPI_STATUS_RETURN(GetProperty(env, options, "blobMinSize", columnOptions.min_blob_size));
@@ -3075,6 +3081,15 @@ napi_status InitOptions(napi_env env, T& columnOptions, const U& options) {
       GetProperty(env, options, "blobCompactionReadaheadSize", columnOptions.blob_compaction_readahead_size));
   NAPI_STATUS_RETURN(GetProperty(env, options, "blobFileStartingLevel", columnOptions.blob_file_starting_level));
   NAPI_STATUS_RETURN(GetProperty(env, options, "blobCompression", columnOptions.blob_compression_type));
+  NAPI_STATUS_RETURN(
+      GetProperty(env, options, "blobCompressionLevel", columnOptions.blob_compression_opts.level));
+  NAPI_STATUS_RETURN(
+      GetProperty(env, options, "blobMaxDictBytes", columnOptions.blob_compression_opts.max_dict_bytes));
+  NAPI_STATUS_RETURN(GetProperty(env, options, "blobZstdMaxTrainBytes",
+                                 columnOptions.blob_compression_opts.zstd_max_train_bytes));
+  NAPI_STATUS_RETURN(GetProperty(env, options, "blobDirectWrite", columnOptions.enable_blob_direct_write));
+  NAPI_STATUS_RETURN(
+      GetProperty(env, options, "blobDirectWritePartitions", columnOptions.blob_direct_write_partitions));
 
   rocksdb::BlockBasedTableOptions tableOptions;
   tableOptions.decouple_partitioned_filters = true;
@@ -3360,6 +3375,10 @@ NAPI_METHOD(db_open) {
         walCompression ? rocksdb::CompressionType::kZSTD : rocksdb::CompressionType::kNoCompression;
 
     NAPI_STATUS_THROWS(GetProperty(env, options, "atomicFlush", dbOptions.atomic_flush));
+    NAPI_STATUS_THROWS(GetProperty(env, options, "asyncWalPrecreate", dbOptions.async_wal_precreate));
+    NAPI_STATUS_THROWS(
+        GetProperty(env, options, "optimizeManifestForRecovery", dbOptions.optimize_manifest_for_recovery));
+    NAPI_STATUS_THROWS(GetProperty(env, options, "reuseManifestOnOpen", dbOptions.reuse_manifest_on_open));
 
     dbOptions.avoid_unnecessary_blocking_io = true;
     NAPI_STATUS_THROWS(
@@ -3402,7 +3421,17 @@ NAPI_METHOD(db_open) {
     NAPI_STATUS_THROWS(GetProperty(env, options, "useDirectIOForFlushAndCompaction",
                                    dbOptions.use_direct_io_for_flush_and_compaction));
 
+    NAPI_STATUS_THROWS(GetProperty(env, options, "useDirectIOForCompactionReads",
+                                   dbOptions.use_direct_io_for_compaction_reads));
+
     NAPI_STATUS_THROWS(GetProperty(env, options, "compactionReadaheadSize", dbOptions.compaction_readahead_size));
+
+    NAPI_STATUS_THROWS(GetProperty(env, options, "maxCompactionTriggerWakeupSeconds",
+                                   dbOptions.max_compaction_trigger_wakeup_seconds));
+
+    NAPI_STATUS_THROWS(GetProperty(env, options, "fastSSTOpen", dbOptions.fast_sst_open));
+
+    NAPI_STATUS_THROWS(GetProperty(env, options, "readIOExecutorThreads", dbOptions.read_io_executor_threads));
 
     NAPI_STATUS_THROWS(GetProperty(env, options, "useAdaptiveMutex", dbOptions.use_adaptive_mutex));
 
