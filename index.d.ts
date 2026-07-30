@@ -165,6 +165,9 @@ export interface RocksColumnOptions {
     | 'roundRobin'
   optimizeFiltersForHits?: boolean
   periodicCompactionSeconds?: number
+  readTriggeredCompactionThreshold?: number
+  memTableVerifyPerKeyChecksumOnSeek?: boolean
+  minTombstonesForRangeConversion?: number
   blobFiles?: boolean
   blobMinSize?: number
   blobGarbageCollection?: boolean
@@ -174,6 +177,11 @@ export interface RocksColumnOptions {
   blobCompactionReadaheadSize?: number
   blobFileStartingLevel?: number
   blobCompression?: RocksCompression
+  blobCompressionLevel?: number
+  blobMaxDictBytes?: number
+  blobZstdMaxTrainBytes?: number
+  blobDirectWrite?: boolean
+  blobDirectWritePartitions?: number
   cache?: RocksCache | bigint | null
   cacheSize?: number
   cacheCompressedRatio?: number
@@ -216,6 +224,9 @@ export interface RocksOpenOptions extends AbstractOpenOptions, RocksColumnOption
   walCompression?: boolean
   /** Atomically flush all selected column families together. This option cannot be changed after open. */
   atomicFlush?: boolean
+  asyncWalPrecreate?: boolean
+  optimizeManifestForRecovery?: boolean
+  reuseManifestOnOpen?: boolean
   avoidUnnecessaryBlockingIO?: boolean
   createMissingColumnFamilies?: boolean
   writeDbIdToManifest?: boolean
@@ -231,7 +242,12 @@ export interface RocksOpenOptions extends AbstractOpenOptions, RocksColumnOption
   allowMmapWrites?: boolean
   useDirectIOReads?: boolean
   useDirectIOForFlushAndCompaction?: boolean
+  /** Use direct I/O for compaction input reads. Opening fails on filesystems without direct I/O support. */
+  useDirectIOForCompactionReads?: boolean
   compactionReadaheadSize?: number
+  maxCompactionTriggerWakeupSeconds?: number
+  fastSSTOpen?: boolean
+  readIOExecutorThreads?: number
   useAdaptiveMutex?: boolean
   writeBufferSize?: number
   writeBufferManager?: RocksWriteBufferManager | bigint | null
