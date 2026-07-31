@@ -436,6 +436,25 @@ export interface RocksRawGetManyOptions<
   exposePacked?: boolean
 }
 
+export interface RocksRawGetManyPrefixOptions<E extends RocksRawEncoding = RocksRawEncoding>
+  extends RocksRawGetManyOptions<E, true> {
+  packed: true
+  /**
+   * Maximum bytes copied from each successful value into the packed result.
+   * RocksDB still resolves and budgets the complete value; this only bounds
+   * the JavaScript arena materialized after the read. Values shorter than the
+   * limit are returned whole, and `0` returns an empty field while preserving
+   * its successful status.
+   */
+  valuePrefixBytes: number
+}
+
+type RocksRawGetManyCallOptions =
+  | (RocksRawGetManyOptions<RocksRawEncoding, RocksPackedReadMode> & {
+      valuePrefixBytes?: never
+    })
+  | RocksRawGetManyPrefixOptions
+
 export type RocksRawUnboundedGetManyOptions<
   E extends RocksRawEncoding = RocksRawEncoding,
   Packed extends RocksPackedReadMode = RocksDefaultPackedMode<E>,
@@ -1104,12 +1123,12 @@ export class RocksLevel<KDefault = string, VDefault = string> extends AbstractLe
    *
    * Promise form: omit the callback.
    */
-  _getManyAsync<const O extends RocksRawGetManyOptions<RocksRawEncoding, RocksPackedReadMode> = {}>(
+  _getManyAsync<const O extends RocksRawGetManyCallOptions = {}>(
     keys: readonly RocksSlice[] | RocksPackedGetManyInput,
     options?: O
   ): Promise<RocksRawGetManyResultFor<O>>
   /** Callback form: the same contract, delivering the result to `callback`. */
-  _getManyAsync<const O extends RocksRawGetManyOptions<RocksRawEncoding, RocksPackedReadMode> = {}>(
+  _getManyAsync<const O extends RocksRawGetManyCallOptions = {}>(
     keys: readonly RocksSlice[] | RocksPackedGetManyInput,
     options: O | undefined,
     callback: RocksPackedReadCallback<
@@ -1128,7 +1147,7 @@ export class RocksLevel<KDefault = string, VDefault = string> extends AbstractLe
    * infers its result shape from them. An incomplete read with `allowPartial`
    * disabled throws a `LEVEL_ABORTED` error rather than rejecting a promise.
    */
-  _getManySync<const O extends RocksRawGetManyOptions<RocksRawEncoding, RocksPackedReadMode> = {}>(
+  _getManySync<const O extends RocksRawGetManyCallOptions = {}>(
     keys: readonly RocksSlice[] | RocksPackedGetManyInput,
     options?: O
   ): RocksRawGetManyResultFor<O>

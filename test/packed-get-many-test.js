@@ -43,6 +43,58 @@ test('packed getMany sync and async preserve values, empty values and misses', a
   t.end()
 })
 
+test('packed getMany can bound the value bytes copied into JavaScript', async function (t) {
+  const db = testCommon.factory({ keyEncoding: 'buffer', valueEncoding: 'buffer' })
+  await db.open()
+  await db.batch([
+    { type: 'put', key: Buffer.from('long'), value: Buffer.from('abcdefgh') },
+    { type: 'put', key: Buffer.from('short'), value: Buffer.from('xy') },
+    { type: 'put', key: Buffer.from('empty'), value: Buffer.alloc(0) }
+  ])
+
+  const keys = ['long', 'missing', 'short', 'empty']
+  for (const [name, result] of [
+    ['sync', db._getManySync(keys, { packed: true, valuePrefixBytes: 3 })],
+    ['async', await db._getManyAsync(keys, { packed: true, valuePrefixBytes: 3 })]
+  ]) {
+    t.same(result.statuses, new Uint8Array([0, 1, 0, 0]),
+      `${name} preserves successful and missing statuses`)
+    t.same(result.offsets, new Int32Array([0, 3, -1, 0, 3, 2, 5, 0]),
+      `${name} reports the bounded field lengths`)
+    t.same(unpack(result), [Buffer.from('abc'), undefined, Buffer.from('xy'), Buffer.alloc(0)],
+      `${name} copies at most the requested prefix`)
+  }
+
+  const zero = db._getManySync(['long'], { packed: true, valuePrefixBytes: 0 })
+  t.same(zero.statuses, new Uint8Array([0]), 'a zero-byte prefix remains a successful value')
+  t.same(unpack(zero), [Buffer.alloc(0)], 'a zero-byte prefix copies no value bytes')
+
+  const boundedOptions = { packed: true, fillCache: false, highWaterMarkBytes: 4 }
+  const bounded = await db._getManyAsync(['long', 'short', 'empty'], boundedOptions)
+  const boundedPrefix = await db._getManyAsync(
+    ['long', 'short', 'empty'],
+    { ...boundedOptions, valuePrefixBytes: 3 }
+  )
+  t.same(bounded.statuses, new Uint8Array([0, 2, 0]),
+    'the full long value exhausts the watermark for another nonempty value')
+  t.same(boundedPrefix.statuses, bounded.statuses,
+    'a shorter copied prefix does not admit reads past the full-value watermark')
+
+  t.throws(
+    () => db._getManySync(['long'], { packed: false, valuePrefixBytes: 3 }),
+    /valuePrefixBytes requires packed: true/,
+    'unpacked sync reads reject value truncation'
+  )
+  const asyncError = await db
+    ._getManyAsync(['long'], { packed: 'auto', valuePrefixBytes: 3 })
+    .then(() => null, (err) => err)
+  t.match(asyncError.message, /valuePrefixBytes requires packed: true/,
+    'automatic async reads reject value truncation')
+
+  await db.close()
+  t.end()
+})
+
 test('getMany sync and async preserve UTF-8 string-key slab boundaries', async function (t) {
   const db = testCommon.factory({ keyEncoding: 'buffer', valueEncoding: 'buffer' })
   await db.open()

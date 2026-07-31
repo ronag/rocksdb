@@ -3728,7 +3728,8 @@ static bool ShouldAutoPackGetMany(const std::vector<rocksdb::Status>& statuses,
 
 static rocksdb::Status PackGetManyResult(const std::vector<rocksdb::Status>& statuses,
                                          const std::vector<rocksdb::PinnableSlice>& values,
-                                         PackedGetManyResult& result) {
+                                         PackedGetManyResult& result,
+                                         const std::optional<uint32_t> valuePrefixBytes) {
   result.offsets.reserve(statuses.size() * 2);
   result.statuses.reserve(statuses.size());
 
@@ -3745,13 +3746,15 @@ static rocksdb::Status PackGetManyResult(const std::vector<rocksdb::Status>& sta
       result.offsets.push_back(-1);
     } else {
       ROCKS_STATUS_RETURN(status);
+      const auto valueBytes =
+          valuePrefixBytes ? std::min<size_t>(values[n].size(), *valuePrefixBytes) : values[n].size();
       constexpr auto maxPackedSize = static_cast<size_t>(std::numeric_limits<int32_t>::max());
-      if (data->size() > maxPackedSize || values[n].size() > maxPackedSize - data->size()) {
+      if (data->size() > maxPackedSize || valueBytes > maxPackedSize - data->size()) {
         return rocksdb::Status::InvalidArgument("Packed getMany result exceeds 2 GiB");
       }
       result.offsets.push_back(static_cast<int32_t>(data->size()));
-      result.offsets.push_back(static_cast<int32_t>(values[n].size()));
-      data->append(values[n].data(), values[n].size());
+      result.offsets.push_back(static_cast<int32_t>(valueBytes));
+      data->append(values[n].data(), valueBytes);
       result.statuses.push_back(static_cast<uint8_t>(PackedGetManyStatus::Value));
     }
   }
@@ -4258,6 +4261,13 @@ static napi_value db_get_many_sync_impl(napi_env env, napi_callback_info info, c
   uint32_t unsafe = 0;
   NAPI_STATUS_THROWS(GetGetManyUnsafe(env, argv[2], unsafe));
 
+  std::optional<uint32_t> valuePrefixBytes;
+  NAPI_STATUS_THROWS(GetProperty(env, argv[2], "valuePrefixBytes", valuePrefixBytes));
+  if (valuePrefixBytes && mode != PackedMode::Packed) {
+    napi_throw_type_error(env, nullptr, "valuePrefixBytes requires packed: true");
+    return nullptr;
+  }
+
   const auto unsafeOutput = HasGetManyUnsafe(unsafe, GetManyUnsafe::Output);
   ReusableSyncGetManyStringSlabLease slabLease(reusableSyncGetManyStringSlab);
   GetManyInputKeys inputKeys;
@@ -4299,7 +4309,7 @@ static napi_value db_get_many_sync_impl(napi_env env, napi_callback_info info, c
                       (mode == PackedMode::Auto && ShouldAutoPackGetMany(statuses, values));
   if (packed) {
     PackedGetManyResult packedResult;
-    ROCKS_STATUS_THROWS_NAPI(PackGetManyResult(statuses, values, packedResult));
+    ROCKS_STATUS_THROWS_NAPI(PackGetManyResult(statuses, values, packedResult, valuePrefixBytes));
 
     napi_value result;
     NAPI_STATUS_THROWS(ConvertPackedGetManyResult(env, packedResult, &result, unsafeOutput));
@@ -4365,6 +4375,13 @@ static napi_value db_get_many_impl(napi_env env, napi_callback_info info, const 
   const auto unsafeInput = HasGetManyUnsafe(unsafe, GetManyUnsafe::Input);
   const auto unsafeOutput = HasGetManyUnsafe(unsafe, GetManyUnsafe::Output);
 
+  std::optional<uint32_t> valuePrefixBytes;
+  NAPI_STATUS_THROWS(GetProperty(env, argv[2], "valuePrefixBytes", valuePrefixBytes));
+  if (valuePrefixBytes && mode != PackedMode::Packed) {
+    napi_throw_type_error(env, nullptr, "valuePrefixBytes requires packed: true");
+    return nullptr;
+  }
+
   auto callback = argv[3];
 
   // Safe async work snapshots keys on the JS thread. INPUT permits borrowing
@@ -4424,8 +4441,10 @@ static napi_value db_get_many_impl(napi_env env, napi_callback_info info, const 
 
         state.packed = mode == PackedMode::Packed ||
                        (mode == PackedMode::Auto && ShouldAutoPackGetMany(state.statuses, state.values));
-        return state.packed ? PackGetManyResult(state.statuses, state.values, state.packedResult)
-                            : rocksdb::Status::OK();
+        return state.packed
+                   ? PackGetManyResult(
+                         state.statuses, state.values, state.packedResult, valuePrefixBytes)
+                   : rocksdb::Status::OK();
       },
       [=](auto& state, napi_env env, napi_value* result) {
         if (state.packed) {

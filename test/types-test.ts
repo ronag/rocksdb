@@ -17,6 +17,7 @@ import {
   RocksPackedIteratorResult,
   RocksRawBoundedGetManyOptions,
   RocksRawGetManyOptions,
+  RocksRawGetManyPrefixOptions,
   RocksRawGetManyResult,
   RocksRawGetManyValues,
   RocksRawUnboundedGetManyOptions,
@@ -238,6 +239,27 @@ expectType<Promise<RocksRawGetManyValues<'utf8', true>>>(
 )
 expectType<RocksUnexposedPackedGetManyResult>(db._getManySync([slice], { packed: true }))
 expectType<Promise<RocksUnexposedPackedGetManyResult>>(db._getManyAsync([slice], { packed: true }))
+expectType<RocksUnexposedPackedGetManyResult>(
+  db._getManySync([slice], { packed: true, valuePrefixBytes: 16 })
+)
+interface ExtendedPackedGetManyOptions extends RocksRawGetManyOptions<'buffer', true> {
+  readonly source?: 'extension'
+}
+const extendedPackedOptions: ExtendedPackedGetManyOptions = {
+  packed: true,
+}
+expectType<RocksUnexposedPackedGetManyResult>(db._getManySync([slice], extendedPackedOptions))
+const prefixOptions: RocksRawGetManyPrefixOptions<'buffer'> = {
+  packed: true,
+  valuePrefixBytes: 16,
+}
+expectType<RocksUnexposedPackedGetManyResult>(db._getManySync([slice], prefixOptions))
+// @ts-expect-error Value prefixes require an explicitly packed result
+db._getManySync([slice], { packed: false, valuePrefixBytes: 16 })
+// @ts-expect-error Automatic packing cannot promise a prefix-only result
+db._getManyAsync([slice], { packed: 'auto', valuePrefixBytes: 16 })
+// @ts-expect-error Omitting packed does not opt into the prefix-only contract
+db._getManySync([slice], { valuePrefixBytes: 16 })
 expectType<RocksUnexposedGetManyReadResult<'buffer', boolean, false>>(
   db._getManySync([slice], { packed: booleanFlag })
 )
