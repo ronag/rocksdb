@@ -42,10 +42,15 @@ and Zen 1 or newer), while `ROCKS_LEVEL_MTUNE` defaults to `znver3`. `-march`
 sets the instruction-set floor the artifact requires; `-mtune` only biases
 scheduling, so the Zen 3 tuning costs no compatibility. Both can be overridden:
 
-- `ROCKS_LEVEL_MARCH=znver3 ./build.sh`
-- `ROCKS_LEVEL_MTUNE=znver4 ./build.sh`
+- `ROCKS_LEVEL_MARCH=x86-64-v4 ./build.sh` to raise the instruction-set floor
+  (here to AVX-512), narrowing the CPUs the artifact runs on
+- `ROCKS_LEVEL_MTUNE=sapphirerapids ./build.sh` to schedule for a different CPU
+  without moving that floor
 - `ROCKS_LEVEL_MARCH= ./build.sh` for a portable x86-64 artifact (an empty
   `-march` drops `-mtune` too)
+
+Overrides must name a CPU the build image's GCC knows; Bookworm ships GCC 12,
+which predates `znver4`.
 
 `ROCKS_LEVEL_MTUNE` follows `ROCKS_LEVEL_MARCH` when unset, so the same pair of
 flags reaches abseil/re2/zstd, RocksDB and the addon.
