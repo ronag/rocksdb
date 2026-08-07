@@ -4,10 +4,12 @@ const fs = require('node:fs')
 const os = require('node:os')
 const path = require('node:path')
 const test = require('tape')
+const { execFileSync } = require('node:child_process')
 const {
   EXPECTED_PREBUILDS,
   NATIVE_TEST_FAULT_HOOKS,
   listEntries,
+  validateNoDotDirectories,
   validateNoNativeTestFaultHooks,
   validatePrebuildPaths
 } = require('../scripts/check-release-prebuilds.js')
@@ -171,6 +173,60 @@ test('release prebuild validation scans the file opened before a path swap', fun
     fs.fstatSync = originalFstat
     fs.closeSync = originalClose
     fs.rmSync(root, { recursive: true, force: true })
+  }
+
+  t.end()
+})
+
+test('release pack validation rejects dot-directories but keeps dot-files', function (t) {
+  t.doesNotThrow(
+    () => validateNoDotDirectories([
+      '.editorconfig',
+      'lib/index.js',
+      'deps/rocksdb/rocksdb/.clang-tidy',
+      'deps/rocksdb/rocksdb/unreleased_history/bug_fixes/.gitkeep'
+    ]),
+    'published dot-files are unaffected'
+  )
+
+  t.throws(
+    () => validateNoDotDirectories(['lib/index.js', '.codex-private/worktree/src/secret.js']),
+    /dot-directories: \.codex-private \(1 files\)/,
+    'a root dot-directory is reported by its own name, not the leaf path'
+  )
+
+  t.throws(
+    () => validateNoDotDirectories(['deps/.prefix/lib/libz.a', 'deps/.prefix/include/z.h']),
+    /dot-directories: deps\/\.prefix \(2 files\)/,
+    'a nested dot-directory is reported at the offending segment'
+  )
+  t.end()
+})
+
+// The guard above only fires if npm pack still hands it the offending paths, so
+// pin the packaging rule itself: an untracked dot-directory (an agent worktree,
+// a cache) must not reach the tarball in the first place.
+test('npm pack excludes an untracked dot-directory from the published tarball', function (t) {
+  const root = path.join(__dirname, '..')
+  const fixture = path.join(root, '.rocks-level-pack-fixture')
+
+  try {
+    fs.mkdirSync(path.join(fixture, 'nested'), { recursive: true })
+    fs.writeFileSync(path.join(fixture, 'nested', 'private.txt'), 'private')
+    fs.writeFileSync(path.join(fixture, 'top.txt'), 'private')
+
+    const output = execFileSync('npm', ['pack', '--dry-run', '--json', '--ignore-scripts'], {
+      cwd: root,
+      encoding: 'utf8',
+      stdio: ['ignore', 'pipe', 'inherit']
+    })
+    const files = JSON.parse(output)[0].files.map((entry) => entry.path)
+
+    t.deepEqual(files.filter((entry) => entry.includes('rocks-level-pack-fixture')), [])
+    t.doesNotThrow(() => validateNoDotDirectories(files), 'the real pack list is dot-directory free')
+    t.ok(files.includes('.editorconfig'), 'root dot-files still publish')
+  } finally {
+    fs.rmSync(fixture, { recursive: true, force: true })
   }
 
   t.end()

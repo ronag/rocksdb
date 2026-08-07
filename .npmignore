@@ -58,13 +58,13 @@ benchmarks/
 .benchmarks/
 *.csv
 
+# Dot-directories are local tooling only (agent worktrees, editor/CI config,
+# caches). Publishing one leaks whatever an untracked tool dropped in the
+# working tree, so exclude every directory whose name starts with a dot at any
+# depth. Dot-files (.editorconfig, deps' .clang-tidy, .gitkeep) still publish.
+.*/
+
 # Misc
-.claude/
-.tap/
-.vscode/
-.nyc_output/
-.cache/
-.github/
 yarn.lock
 .gitmodules
 .travis.yml

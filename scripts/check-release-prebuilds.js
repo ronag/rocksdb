@@ -86,7 +86,30 @@ function validateNoNativeTestFaultHooks (root, paths = EXPECTED_PREBUILDS) {
   }
 }
 
-function packPrebuildPaths (root) {
+// Dot-directories hold local tooling only, and an untracked one (agent
+// worktrees, caches) is invisible to git status. Publishing whatever it holds
+// is a leak, so fail the release instead of trusting .npmignore to stay right.
+// Dot-files are published on purpose and stay allowed.
+function validateNoDotDirectories (paths) {
+  const packed = paths.filter((entry) => entry.split('/').slice(0, -1).some(isDotSegment))
+
+  if (packed.length !== 0) {
+    const directories = [...new Set(packed.map((entry) =>
+      entry.split('/').slice(0, entry.split('/').findIndex(isDotSegment) + 1).join('/')
+    ))]
+
+    throw new Error(
+      `npm pack includes dot-directories: ${directories.join(', ')} ` +
+      `(${packed.length} files)`
+    )
+  }
+}
+
+function isDotSegment (segment) {
+  return segment.startsWith('.')
+}
+
+function packPaths (root) {
   const output = execFileSync('npm', ['pack', '--dry-run', '--json', '--ignore-scripts'], {
     cwd: root,
     encoding: 'utf8',
@@ -98,16 +121,19 @@ function packPrebuildPaths (root) {
     throw new Error('npm pack returned an unexpected manifest')
   }
 
-  return manifests[0].files
-    .map((entry) => entry.path)
-    .filter((entry) => entry.startsWith('prebuilds/') || entry.endsWith('.node'))
+  return manifests[0].files.map((entry) => entry.path)
 }
 
 function main () {
   const root = path.join(__dirname, '..')
+  const packed = packPaths(root)
   validatePrebuildPaths(listEntries(root), 'working tree')
   validateNoNativeTestFaultHooks(root)
-  validatePrebuildPaths(packPrebuildPaths(root), 'npm pack')
+  validatePrebuildPaths(
+    packed.filter((entry) => entry.startsWith('prebuilds/') || entry.endsWith('.node')),
+    'npm pack'
+  )
+  validateNoDotDirectories(packed)
   console.log(`Checked release prebuild manifest: ${EXPECTED_PREBUILDS.join(', ')}`)
 }
 
@@ -124,6 +150,7 @@ module.exports = {
   EXPECTED_PREBUILDS,
   NATIVE_TEST_FAULT_HOOKS,
   listEntries,
+  validateNoDotDirectories,
   validateNoNativeTestFaultHooks,
   validatePrebuildPaths
 }
