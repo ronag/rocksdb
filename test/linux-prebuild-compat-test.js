@@ -78,8 +78,8 @@ test('linux prebuild compatibility restricts runtime libraries and search paths'
 test('linux prebuild compatibility validates baseline CPU configuration', function (t) {
   t.deepEqual(nonBaselineCpuFlags('CFLAGS = -O3 -std=c++20'), [])
   t.deepEqual(
-    nonBaselineCpuFlags('CFLAGS = -O3 -march=znver3 -mtune=znver3\\\n'),
-    ['-march=znver3', '-mtune=znver3']
+    nonBaselineCpuFlags('CFLAGS = -O3 -march=x86-64-v3 -mtune=znver3\\\n'),
+    ['-march=x86-64-v3', '-mtune=znver3']
   )
   t.deepEqual(
     nonBaselineCpuFlags('CFLAGS = -march=$(TARGET_ARCH) -mcpu=$(CPU)'),

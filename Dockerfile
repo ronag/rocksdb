@@ -26,10 +26,10 @@ WORKDIR /rocks-level
 # emulation on an arm64 host.
 ARG JOBS=8
 
-# Linux prebuilds target AMD Zen 3 by default. build.sh forwards an explicitly
-# set ROCKS_LEVEL_MARCH so private builds can select another CPU or use an empty
-# value for a portable x86-64 artifact.
-ARG ROCKS_LEVEL_MARCH=znver3
+# Linux prebuilds target the x86-64-v3 microarchitecture level by default.
+# build.sh forwards an explicitly set ROCKS_LEVEL_MARCH so private builds can
+# select another CPU or use an empty value for a portable x86-64 artifact.
+ARG ROCKS_LEVEL_MARCH=x86-64-v3
 
 # Route every compiler invocation (cmake for the deps, node-gyp for the addon)
 # through ccache. Debian's ccache package ships masquerade symlinks in

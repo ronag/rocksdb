@@ -57,7 +57,7 @@ fi
 # publish, so a build failure aborts the release with nothing changed.
 
 # Ignore caller-specific CPU tuning for the public Linux artifact. With no
-# override, build.sh uses the Dockerfile's audited Zen 3 default.
+# override, build.sh uses the Dockerfile's audited x86-64-v3 default.
 unset ROCKS_LEVEL_MARCH
 
 # A caller may use ROCKS_LEVEL_DEPS_PREFIX for a one-off source build. Public

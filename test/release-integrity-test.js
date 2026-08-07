@@ -121,7 +121,7 @@ test('Linux prebuild base is pinned to the audited amd64 image manifest', functi
     /FROM scratch AS artifact\nCOPY --from=build \/rocks-level\/prebuilds\/linux-x64\/@nxtedition\+rocksdb\.node \/@nxtedition\+rocksdb\.node/,
     'the final stage exports exactly the validated addon'
   )
-  t.match(dockerfile, /^ARG ROCKS_LEVEL_MARCH=znver3$/m, 'Linux prebuilds default to Zen 3')
+  t.match(dockerfile, /^ARG ROCKS_LEVEL_MARCH=x86-64-v3$/m, 'Linux prebuilds default to x86-64-v3')
   t.end()
 })
 
@@ -295,7 +295,7 @@ test('release stages and atomically installs only its known Darwin platform dire
   t.end()
 })
 
-test('release uses Zen 3 for Linux and portable tuning for Darwin', function (t) {
+test('release uses x86-64-v3 for Linux and portable tuning for Darwin', function (t) {
   const script = fs.readFileSync(path.join(__dirname, '..', 'release.sh'), 'utf8')
   const useLinuxDefault = script.indexOf('unset ROCKS_LEVEL_MARCH')
   const linuxBuild = script.indexOf('./build.sh', useLinuxDefault)
