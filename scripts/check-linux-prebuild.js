@@ -241,15 +241,24 @@ function findPrebuild (root) {
   return path.join(directory, candidates[0])
 }
 
+function requestedTuning () {
+  const march = process.env.ROCKS_LEVEL_MARCH || ''
+  // Mirrors build-deps.js: -mtune follows -march unless overridden, and a
+  // portable (no -march) build carries no tuning at all.
+  return { march, mtune: march ? process.env.ROCKS_LEVEL_MTUNE || march : '' }
+}
+
 function checkDependencyTuning () {
   const stamp = JSON.parse(fs.readFileSync(path.join(persistentPrefixDir(), '.stamp.json'), 'utf8'))
-  const expected = process.env.ROCKS_LEVEL_MARCH || ''
+  const expected = requestedTuning()
 
-  if (stamp.march !== expected) {
-    throw new Error(
-      `dependency tuning mismatch: stamp has ${JSON.stringify(stamp.march)}, ` +
-      `build requested ${JSON.stringify(expected)}`
-    )
+  for (const flag of ['march', 'mtune']) {
+    if (stamp[flag] !== expected[flag]) {
+      throw new Error(
+        `dependency ${flag} mismatch: stamp has ${JSON.stringify(stamp[flag])}, ` +
+        `build requested ${JSON.stringify(expected[flag])}`
+      )
+    }
   }
 }
 
@@ -290,11 +299,11 @@ function main () {
 
   const root = path.join(__dirname, '..')
   checkDependencyTuning()
-  const tuning = process.env.ROCKS_LEVEL_MARCH || ''
-  if (tuning === '') checkPortableBuildFlags(root)
+  const { march, mtune } = requestedTuning()
+  if (march === '') checkPortableBuildFlags(root)
   const binary = findPrebuild(root)
   const required = checkPrebuild(binary)
-  const cpu = tuning || 'x86-64 baseline'
+  const cpu = march ? `${march} (tuned for ${mtune})` : 'x86-64 baseline'
 
   console.log(
     `Checked ${path.relative(root, binary)}: ` +
@@ -319,6 +328,7 @@ module.exports = {
   assertX64ElfHeader,
   compareVersions,
   nonBaselineCpuFlags,
+  requestedTuning,
   requiredAbiVersions,
   validateDynamicDependencies
 }

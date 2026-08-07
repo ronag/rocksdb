@@ -1,7 +1,10 @@
 {
   "variables": {
     "openssl_fips": "0",
-    "rocks_level_march%": "<!(node -p \"process.env.ROCKS_LEVEL_MARCH || ''\")"
+    "rocks_level_march%": "<!(node -p \"process.env.ROCKS_LEVEL_MARCH || ''\")",
+    # -mtune defaults to the -march value; set ROCKS_LEVEL_MTUNE to bias
+    # scheduling for a narrower CPU than the instruction-set baseline.
+    "rocks_level_mtune%": "<!(node -p \"process.env.ROCKS_LEVEL_MARCH ? (process.env.ROCKS_LEVEL_MTUNE || process.env.ROCKS_LEVEL_MARCH) : ''\")"
   },
   "targets": [
     {
@@ -93,8 +96,8 @@
               [
                 "target_arch == 'x64' and rocks_level_march != ''",
                 {
-                  "cflags": ["-march=<(rocks_level_march)", "-mtune=<(rocks_level_march)"],
-                  "cflags_cc+": ["-march=<(rocks_level_march)", "-mtune=<(rocks_level_march)"],
+                  "cflags": ["-march=<(rocks_level_march)", "-mtune=<(rocks_level_mtune)"],
+                  "cflags_cc+": ["-march=<(rocks_level_march)", "-mtune=<(rocks_level_mtune)"],
                 }
               ]
             ]

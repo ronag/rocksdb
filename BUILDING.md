@@ -26,7 +26,7 @@ npm installs both dependency sets before running `prepare` for Git installs.
 
 - `./build.sh`
 
-Builds an `x86-64-v3`-tuned x86-64 prebuild inside Docker (see
+Builds an `x86-64-v3`, Zen 3-tuned x86-64 prebuild inside Docker (see
 [Dockerfile](Dockerfile)) and exports it to `prebuilds/linux-x64`. This requires
 Docker with BuildKit's `type=local` output support; `build.sh` enables BuildKit
 explicitly and exports the final scratch artifact stage without creating a
@@ -38,13 +38,21 @@ newer than Bookworm's glibc/libstdc++ ABI.
 Uses the local Docker daemon; point `DOCKER_HOST=ssh://user@host` at a remote
 amd64 host to avoid emulation on Apple Silicon. `ROCKS_LEVEL_MARCH` defaults to
 the GCC/Clang microarchitecture level `x86-64-v3` (AVX2/BMI2/FMA, i.e. Haswell
-and Zen 1 or newer) and can be overridden:
+and Zen 1 or newer), while `ROCKS_LEVEL_MTUNE` defaults to `znver3`. `-march`
+sets the instruction-set floor the artifact requires; `-mtune` only biases
+scheduling, so the Zen 3 tuning costs no compatibility. Both can be overridden:
 
 - `ROCKS_LEVEL_MARCH=znver3 ./build.sh`
-- `ROCKS_LEVEL_MARCH= ./build.sh` for a portable x86-64 artifact
+- `ROCKS_LEVEL_MTUNE=znver4 ./build.sh`
+- `ROCKS_LEVEL_MARCH= ./build.sh` for a portable x86-64 artifact (an empty
+  `-march` drops `-mtune` too)
 
-`release.sh` ignores caller overrides and uses the `x86-64-v3` default for Linux,
-then clears the variable so the Darwin arm64 build remains portable.
+`ROCKS_LEVEL_MTUNE` follows `ROCKS_LEVEL_MARCH` when unset, so the same pair of
+flags reaches abseil/re2/zstd, RocksDB and the addon.
+
+`release.sh` ignores caller overrides and uses the `x86-64-v3`/`znver3` defaults
+for Linux, then clears both variables so the Darwin arm64 build remains
+portable.
 
 To keep repeated releases fast, the Docker build routes every compiler
 invocation through `ccache` on a BuildKit cache mount. `build.sh` uploads the

@@ -18,8 +18,10 @@
 // Linux and macOS only, matching the Dockerfile/BUILDING.md-documented build.
 // Portable by default (no CPU-specific `-march`), so the end-user from-source
 // path works on any machine. Set ROCKS_LEVEL_MARCH=<arch> (e.g. znver3) to
-// tune the deps for an explicit build. The Docker prebuild flow supplies its
-// own x86-64-v3 default for the public Linux artifact.
+// tune the deps for an explicit build, optionally with ROCKS_LEVEL_MTUNE=<cpu>
+// to bias scheduling for a narrower CPU than the -march baseline. The Docker
+// prebuild flow supplies its own x86-64-v3/znver3 defaults for the public
+// Linux artifact.
 //
 // The prefix carries a .stamp.json recording the exact upstream commits and
 // tuning that built it; ensure() wipes and rebuilds a prefix whose stamp
@@ -174,9 +176,18 @@ function marchValue () {
   return process.env.ROCKS_LEVEL_MARCH || ''
 }
 
+// -mtune only biases scheduling; it never emits instructions the -march
+// baseline lacks. ROCKS_LEVEL_MTUNE therefore selects a specific CPU to
+// optimize for while -march keeps the artifact runnable on a wider range.
+// It defaults to the -march value and is ignored without one, so the portable
+// from-source path stays free of CPU flags.
+function mtuneValue () {
+  return marchValue() ? process.env.ROCKS_LEVEL_MTUNE || marchValue() : ''
+}
+
 function marchFlags () {
   const march = marchValue()
-  return march ? `-march=${march} -mtune=${march}` : ''
+  return march ? `-march=${march} -mtune=${mtuneValue()}` : ''
 }
 
 function cmakeMarchFlags () {
@@ -235,6 +246,7 @@ function stampPath (prefix) {
 function currentStamp () {
   return {
     march: marchValue(),
+    mtune: mtuneValue(),
     macosDeploymentTarget: process.platform === 'darwin' ? MACOS_DEPLOYMENT_TARGET : null,
     abseil: DEPENDENCIES.abseil.commit,
     re2: DEPENDENCIES.re2.commit,

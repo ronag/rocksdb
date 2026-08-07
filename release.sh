@@ -57,8 +57,9 @@ fi
 # publish, so a build failure aborts the release with nothing changed.
 
 # Ignore caller-specific CPU tuning for the public Linux artifact. With no
-# override, build.sh uses the Dockerfile's audited x86-64-v3 default.
+# override, build.sh uses the Dockerfile's audited x86-64-v3/znver3 defaults.
 unset ROCKS_LEVEL_MARCH
+unset ROCKS_LEVEL_MTUNE
 
 # A caller may use ROCKS_LEVEL_DEPS_PREFIX for a one-off source build. Public
 # builds must instead use the dependencies created by their pinned build path:
@@ -80,6 +81,7 @@ echo "Building darwin-arm64 prebuilds (node $NODE_TARGET)..."
 # directory and atomically install only the validated known platform, preserving
 # the previous artifact if generation or installation fails.
 export ROCKS_LEVEL_MARCH=
+export ROCKS_LEVEL_MTUNE=
 npm run build-deps
 JOBS=16 ./scripts/build-darwin-prebuild.sh "$NODE_TARGET"
 

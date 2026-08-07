@@ -7,6 +7,7 @@ const {
   assertX64ElfHeader,
   compareVersions,
   nonBaselineCpuFlags,
+  requestedTuning,
   requiredAbiVersions,
   validateDynamicDependencies
 } = require('../scripts/check-linux-prebuild.js')
@@ -120,6 +121,45 @@ test('linux prebuild compatibility validates baseline CPU configuration', functi
   t.throws(
     () => assertBaselineCompilerMacros(baseline + '#define __AVX2__ 1\n'),
     /non-baseline x86-64 features/
+  )
+  t.end()
+})
+
+test('linux prebuild compatibility resolves -mtune against the -march baseline', function (t) {
+  const resolve = (march, mtune) => {
+    const previous = { march: process.env.ROCKS_LEVEL_MARCH, mtune: process.env.ROCKS_LEVEL_MTUNE }
+    for (const [name, value] of [['ROCKS_LEVEL_MARCH', march], ['ROCKS_LEVEL_MTUNE', mtune]]) {
+      if (value === undefined) delete process.env[name]
+      else process.env[name] = value
+    }
+
+    try {
+      return requestedTuning()
+    } finally {
+      for (const [name, value] of [
+        ['ROCKS_LEVEL_MARCH', previous.march],
+        ['ROCKS_LEVEL_MTUNE', previous.mtune]
+      ]) {
+        if (value === undefined) delete process.env[name]
+        else process.env[name] = value
+      }
+    }
+  }
+
+  t.deepEqual(
+    resolve('x86-64-v3', 'znver3'),
+    { march: 'x86-64-v3', mtune: 'znver3' },
+    'the release default tunes for Zen 3 above an x86-64-v3 baseline'
+  )
+  t.deepEqual(
+    resolve('znver2', undefined),
+    { march: 'znver2', mtune: 'znver2' },
+    '-mtune follows -march when unset'
+  )
+  t.deepEqual(
+    resolve(undefined, 'znver3'),
+    { march: '', mtune: '' },
+    'a portable build carries no tuning even with an explicit -mtune'
   )
   t.end()
 })

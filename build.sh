@@ -1,7 +1,7 @@
 #!/bin/bash
 set -euo pipefail
 
-# The published prebuild targets x86-64 (x86-64-v3 by default), so the build must
+# The published prebuild targets x86-64 (x86-64-v3, Zen 3-tuned, by default), so the build must
 # use linux/amd64 even on arm64 hosts (e.g. Apple Silicon under emulation).
 PLATFORM=linux/amd64
 TARGET_DIR=prebuilds/linux-x64
@@ -115,8 +115,9 @@ mkdir -p "$CCACHE_LOCAL_DIR"
 echo "Building and exporting prebuild..."
 # JOBS caps build parallelism for the memory-heavy rocksdb compile (default 8,
 # see Dockerfile). Lower it (e.g. JOBS=4 ./build.sh) on a memory-constrained
-# Docker host. The Dockerfile defaults ROCKS_LEVEL_MARCH to x86-64-v3; an explicitly
-# set value overrides it, including an empty value for a portable x86-64 build.
+# Docker host. The Dockerfile defaults ROCKS_LEVEL_MARCH to x86-64-v3 and
+# ROCKS_LEVEL_MTUNE to znver3; an explicitly set value overrides either,
+# including an empty ROCKS_LEVEL_MARCH for a portable x86-64 build.
 BUILD_ARGS=(
   --platform "$PLATFORM"
   --target artifact
@@ -135,6 +136,9 @@ if [ -n "${JOBS:-}" ]; then
 fi
 if [ "${ROCKS_LEVEL_MARCH+x}" = x ]; then
   BUILD_ARGS+=(--build-arg "ROCKS_LEVEL_MARCH=$ROCKS_LEVEL_MARCH")
+fi
+if [ "${ROCKS_LEVEL_MTUNE+x}" = x ]; then
+  BUILD_ARGS+=(--build-arg "ROCKS_LEVEL_MTUNE=$ROCKS_LEVEL_MTUNE")
 fi
 DOCKER_BUILDKIT=1 docker build "${BUILD_ARGS[@]}" .
 

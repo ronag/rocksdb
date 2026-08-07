@@ -2,6 +2,9 @@
     "variables": {
         "openssl_fips": "0",
         "rocks_level_march%": "<!(node -p \"process.env.ROCKS_LEVEL_MARCH || ''\")",
+        # -mtune defaults to the -march value; set ROCKS_LEVEL_MTUNE to bias
+        # scheduling for a narrower CPU than the instruction-set baseline.
+        "rocks_level_mtune%": "<!(node -p \"process.env.ROCKS_LEVEL_MARCH ? (process.env.ROCKS_LEVEL_MTUNE || process.env.ROCKS_LEVEL_MARCH) : ''\")",
         # Native fault hooks are compiled only for explicit fault-test builds.
         # Published binaries have neither exports nor hot-path branches.
         "rocks_level_test_faults": "<!(node -p \"process.env.ROCKS_LEVEL_TEST_FAULTS === '1' ? '1' : '0'\")",
@@ -60,8 +63,8 @@
                             [
                                 "target_arch == 'x64' and rocks_level_march != ''",
                                 {
-                                    "cflags": ["-march=<(rocks_level_march)", "-mtune=<(rocks_level_march)"],
-                                    "cflags_cc": ["-march=<(rocks_level_march)", "-mtune=<(rocks_level_march)"],
+                                    "cflags": ["-march=<(rocks_level_march)", "-mtune=<(rocks_level_mtune)"],
+                                    "cflags_cc": ["-march=<(rocks_level_march)", "-mtune=<(rocks_level_mtune)"],
                                 },
                             ],
                         ],

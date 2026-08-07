@@ -122,6 +122,7 @@ test('Linux prebuild base is pinned to the audited amd64 image manifest', functi
     'the final stage exports exactly the validated addon'
   )
   t.match(dockerfile, /^ARG ROCKS_LEVEL_MARCH=x86-64-v3$/m, 'Linux prebuilds default to x86-64-v3')
+  t.match(dockerfile, /^ARG ROCKS_LEVEL_MTUNE=znver3$/m, 'Linux prebuilds stay tuned for Zen 3')
   t.end()
 })
 
@@ -222,6 +223,9 @@ test('dependency cache stamp contains commits and rejects the old tag stamp', fu
   const prefix = fs.mkdtempSync(path.join(os.tmpdir(), 'rocks-level-stamp-'))
   const stamp = (dependencies) => ({
     march: process.env.ROCKS_LEVEL_MARCH || '',
+    mtune: process.env.ROCKS_LEVEL_MARCH
+      ? process.env.ROCKS_LEVEL_MTUNE || process.env.ROCKS_LEVEL_MARCH
+      : '',
     macosDeploymentTarget: process.platform === 'darwin' ? '13.4.0' : null,
     ...dependencies
   })
@@ -298,8 +302,10 @@ test('release stages and atomically installs only its known Darwin platform dire
 test('release uses x86-64-v3 for Linux and portable tuning for Darwin', function (t) {
   const script = fs.readFileSync(path.join(__dirname, '..', 'release.sh'), 'utf8')
   const useLinuxDefault = script.indexOf('unset ROCKS_LEVEL_MARCH')
+  const useLinuxTuneDefault = script.indexOf('unset ROCKS_LEVEL_MTUNE')
   const linuxBuild = script.indexOf('./build.sh', useLinuxDefault)
   const clearTuning = script.indexOf('export ROCKS_LEVEL_MARCH=', linuxBuild)
+  const clearTuneTuning = script.indexOf('export ROCKS_LEVEL_MTUNE=', linuxBuild)
   const darwinDependencies = script.indexOf('npm run build-deps', clearTuning)
   const darwinBuild = script.indexOf(
     'JOBS=16 ./scripts/build-darwin-prebuild.sh "$NODE_TARGET"',
@@ -307,14 +313,23 @@ test('release uses x86-64-v3 for Linux and portable tuning for Darwin', function
   )
 
   t.ok(useLinuxDefault >= 0, 'the release ignores caller tuning for Linux')
+  t.ok(useLinuxTuneDefault >= 0, 'the release ignores caller -mtune for Linux')
   t.ok(linuxBuild > useLinuxDefault, 'Linux uses the Dockerfile default')
+  t.ok(linuxBuild > useLinuxTuneDefault, 'Linux uses the Dockerfile -mtune default')
   t.ok(clearTuning > linuxBuild, 'CPU tuning is cleared after the Linux build')
+  t.ok(clearTuneTuning > linuxBuild, '-mtune is cleared after the Linux build')
   t.ok(darwinDependencies > clearTuning, 'Darwin dependencies inherit the cleared value')
+  t.ok(darwinDependencies > clearTuneTuning, 'Darwin dependencies inherit the cleared -mtune')
   t.ok(darwinBuild > darwinDependencies, 'Darwin prebuild uses the portable dependencies')
   t.equal(
     (script.match(/^\s*(?:export\s+)?ROCKS_LEVEL_MARCH=/gm) || []).length,
     1,
     'there is one portable tuning assignment'
+  )
+  t.equal(
+    (script.match(/^\s*(?:export\s+)?ROCKS_LEVEL_MTUNE=/gm) || []).length,
+    1,
+    'there is one portable -mtune assignment'
   )
   t.end()
 })

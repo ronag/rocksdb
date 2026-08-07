@@ -31,6 +31,12 @@ ARG JOBS=8
 # select another CPU or use an empty value for a portable x86-64 artifact.
 ARG ROCKS_LEVEL_MARCH=x86-64-v3
 
+# -mtune never emits instructions outside the -march baseline, so tuning for
+# Zen 3 keeps the artifact runnable on every x86-64-v3 CPU while scheduling for
+# the CPU the prebuild actually runs on. Defaults to ROCKS_LEVEL_MARCH when
+# empty; ignored entirely for a portable (empty ROCKS_LEVEL_MARCH) build.
+ARG ROCKS_LEVEL_MTUNE=znver3
+
 # Route every compiler invocation (cmake for the deps, node-gyp for the addon)
 # through ccache. Debian's ccache package ships masquerade symlinks in
 # /usr/lib/ccache; prepending it to PATH transparently caches gcc/g++/cc/c++.
@@ -54,7 +60,8 @@ COPY scripts/build-deps.js scripts/deps-prefix.js ./scripts/
 RUN --mount=type=cache,target=/ccache,id=rocks-level-ccache,sharing=locked \
     --mount=type=bind,from=ccache,target=/ccache-seed,ro \
     cp -an /ccache-seed/. /ccache/ 2>/dev/null || true; \
-    ROCKS_LEVEL_MARCH="$ROCKS_LEVEL_MARCH" JOBS="$JOBS" node scripts/build-deps.js
+    ROCKS_LEVEL_MARCH="$ROCKS_LEVEL_MARCH" ROCKS_LEVEL_MTUNE="$ROCKS_LEVEL_MTUNE" \
+    JOBS="$JOBS" node scripts/build-deps.js
 
 COPY package.json ./
 # @nxtedition/slice is a private npm package, so npm needs registry auth to
@@ -71,7 +78,8 @@ COPY . .
 RUN --mount=type=cache,target=/ccache,id=rocks-level-ccache,sharing=locked \
     --mount=type=bind,from=ccache,target=/ccache-seed,ro \
     cp -an /ccache-seed/. /ccache/ 2>/dev/null || true; \
-    ROCKS_LEVEL_MARCH="$ROCKS_LEVEL_MARCH" JOBS="$JOBS" MAKEFLAGS="-j$JOBS" \
+    ROCKS_LEVEL_MARCH="$ROCKS_LEVEL_MARCH" ROCKS_LEVEL_MTUNE="$ROCKS_LEVEL_MTUNE" \
+    JOBS="$JOBS" MAKEFLAGS="-j$JOBS" \
     npm_config_build_from_source=true node scripts/install.js
 
 # The addon uses the stable Node-API and node-gyp built it for this image's
@@ -84,7 +92,8 @@ RUN mkdir -p prebuilds/linux-x64 \
 # Reject accidental toolchain ABI drift before an artifact can leave the
 # image. The checker also verifies that dependency tuning matches the build
 # argument, preventing a cached prefix with different tuning from being reused.
-RUN ROCKS_LEVEL_MARCH="$ROCKS_LEVEL_MARCH" node scripts/check-linux-prebuild.js
+RUN ROCKS_LEVEL_MARCH="$ROCKS_LEVEL_MARCH" ROCKS_LEVEL_MTUNE="$ROCKS_LEVEL_MTUNE" \
+    node scripts/check-linux-prebuild.js
 
 # test-prebuild sets PREBUILDS_ONLY=1, which node-gyp-build's loader honors: it
 # skips build/Release and loads the addon from prebuilds/, so the tests exercise

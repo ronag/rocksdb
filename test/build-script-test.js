@@ -384,6 +384,30 @@ test('build script preserves explicit CPU tuning overrides, including portable b
   t.end()
 })
 
+test('build script forwards an explicit -mtune override on its own', function (t) {
+  for (const [mtune, expected] of [
+    ['znver4', '--build-arg ROCKS_LEVEL_MTUNE=znver4'],
+    ['', '--build-arg ROCKS_LEVEL_MTUNE= ']
+  ]) {
+    const context = fixture()
+
+    try {
+      const { log, result } = runBuild(context, { ROCKS_LEVEL_MTUNE: mtune })
+
+      t.equal(result.status, 0, result.stderr || `build with ${JSON.stringify(mtune)} succeeds`)
+      t.ok(log.includes(expected), `forwards ${JSON.stringify(mtune)} to Docker`)
+      t.notOk(
+        log.includes('--build-arg ROCKS_LEVEL_MARCH'),
+        'an unset -march keeps the Dockerfile default'
+      )
+    } finally {
+      fs.rmSync(context.root, { recursive: true, force: true })
+    }
+  }
+
+  t.end()
+})
+
 test('build script preserves the old platform on build failure or interruption', function (t) {
   for (const mode of ['fail-before-output', 'fail-after-output', 'term-after-output']) {
     const context = fixture()
