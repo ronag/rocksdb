@@ -12,3 +12,7 @@
 /deps/.prefix
 *.md
 prebuilds.*
+.claude
+# Private scratch workspaces created by AI coding agents (.codex-private/,
+# .claude-private/, ...).
+**/.*-private

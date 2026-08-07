@@ -64,6 +64,11 @@ benchmarks/
 # depth. Dot-files (.editorconfig, deps' .clang-tidy, .gitkeep) still publish.
 .*/
 
+# Redundant with the rule above, but kept explicit so the private scratch
+# workspaces AI coding agents create (.codex-private/, .claude-private/, ...)
+# stay excluded even if `.*/` is ever narrowed.
+.*-private/
+
 # Misc
 yarn.lock
 .gitmodules

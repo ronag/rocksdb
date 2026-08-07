@@ -32,4 +32,6 @@ tmp/
 yarn-error.log
 prebuilds.zip
 .claude/settings.local.json
-.codex-private/
+# Private scratch workspaces created by AI coding agents (.codex-private/,
+# .claude-private/, ...). Never tracked, never published.
+.*-private/
