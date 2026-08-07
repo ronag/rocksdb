@@ -165,17 +165,27 @@ esac
   return { bin, darwin, linux, root }
 }
 
+// build.sh forwards a tuning variable only when it is set, so a case that
+// leaves one unset must really start from unset. Docker exposes an image's
+// build ARGs to its RUN commands, which means the Dockerfile's own
+// `npm run test-prebuild` runs with ROCKS_LEVEL_MARCH/ROCKS_LEVEL_MTUNE
+// already in the environment.
+const TUNING_VARIABLES = ['ROCKS_LEVEL_MARCH', 'ROCKS_LEVEL_MTUNE']
+
 function runBuild (context, extraEnv = {}) {
   const log = path.join(context.root, 'docker.log')
+  const env = {
+    ...process.env,
+    FAKE_DOCKER_LOG: log,
+    PATH: `${context.bin}${path.delimiter}${process.env.PATH}`
+  }
+  for (const name of TUNING_VARIABLES) delete env[name]
+  Object.assign(env, extraEnv)
+
   const result = spawnSync('/bin/bash', ['./build.sh'], {
     cwd: context.root,
     encoding: 'utf8',
-    env: {
-      ...process.env,
-      ...extraEnv,
-      FAKE_DOCKER_LOG: log,
-      PATH: `${context.bin}${path.delimiter}${process.env.PATH}`
-    }
+    env
   })
 
   return { log: fs.readFileSync(log, 'utf8'), result }
@@ -376,6 +386,10 @@ test('build script preserves explicit CPU tuning overrides, including portable b
 
       t.equal(result.status, 0, result.stderr || `build with ${JSON.stringify(march)} succeeds`)
       t.ok(log.includes(expected), `forwards ${JSON.stringify(march)} to Docker`)
+      t.notOk(
+        log.includes('--build-arg ROCKS_LEVEL_MTUNE'),
+        'an unset -mtune keeps the Dockerfile default'
+      )
     } finally {
       fs.rmSync(context.root, { recursive: true, force: true })
     }
