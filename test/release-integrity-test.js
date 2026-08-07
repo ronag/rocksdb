@@ -13,6 +13,7 @@ const {
   supportsSha1ObjectFormat,
   verifyCheckout
 } = require('../scripts/build-deps.js')
+const cpuFlags = require('../scripts/cpu-flags.js')
 
 function git (args) {
   return execFileSync('git', args, {
@@ -222,10 +223,8 @@ test('dependency checkout is detached at and verified against the requested comm
 test('dependency cache stamp contains commits and rejects the old tag stamp', function (t) {
   const prefix = fs.mkdtempSync(path.join(os.tmpdir(), 'rocks-level-stamp-'))
   const stamp = (dependencies) => ({
-    march: process.env.ROCKS_LEVEL_MARCH || '',
-    mtune: process.env.ROCKS_LEVEL_MARCH
-      ? process.env.ROCKS_LEVEL_MTUNE || process.env.ROCKS_LEVEL_MARCH
-      : '',
+    march: cpuFlags.march(),
+    mtune: cpuFlags.mtune(),
     macosDeploymentTarget: process.platform === 'darwin' ? '13.4.0' : null,
     ...dependencies
   })
@@ -359,6 +358,47 @@ test('release clears private dependency prefix overrides before public builds', 
     1,
     'there is one release-wide dependency override reset'
   )
+  t.end()
+})
+
+// The dependency layer is built before the source tree is copied, from an
+// explicit list of scripts, so a new local require in build-deps.js only fails
+// once the Docker build reaches that stage.
+test('the dependency stage copies every script build-deps.js requires', function (t) {
+  const root = path.join(__dirname, '..')
+  const dockerfile = fs.readFileSync(path.join(root, 'Dockerfile'), 'utf8')
+  const buildDeps = fs.readFileSync(path.join(root, 'scripts', 'build-deps.js'), 'utf8')
+  const copy = /^COPY ((?:scripts\/\S+ )+)\.\/scripts\/$/m.exec(dockerfile)
+
+  t.ok(copy, 'the dependency stage copies a fixed list of scripts')
+  const copied = new Set(copy[1].trim().split(' '))
+  t.ok(copied.has('scripts/build-deps.js'), 'the dependency build script itself is copied')
+
+  for (const [, required] of buildDeps.matchAll(/require\('\.\/([^']+)'\)/g)) {
+    t.ok(copied.has(`scripts/${required}`), `scripts/${required} reaches the dependency stage`)
+  }
+  t.end()
+})
+
+// The addon, rocksdb and the dependency prefix must agree on one baseline: a
+// mismatch links objects compiled for different instruction sets into a single
+// artifact. Keeping the flag list in one script is what makes that true, so no
+// .gyp file may spell the flags out again.
+test('every compiled part of a tuned build takes its CPU flags from one place', function (t) {
+  const gypFiles = {
+    'binding.gyp': 'node scripts/cpu-flags.js',
+    'deps/rocksdb/rocksdb.gyp': 'node ../../scripts/cpu-flags.js'
+  }
+
+  for (const [file, command] of Object.entries(gypFiles)) {
+    const source = fs.readFileSync(path.join(__dirname, '..', file), 'utf8')
+    const code = source.replaceAll(/^\s*#.*$/gm, '')
+    t.ok(source.includes(`"<!@(${command})"`), `${file} resolves its CPU flags through cpu-flags.js`)
+    t.notOk(/-m(?:arch|tune|pclmul)\b/.test(code), `${file} spells out no CPU flags of its own`)
+  }
+
+  const buildDeps = fs.readFileSync(path.join(__dirname, '..', 'scripts', 'build-deps.js'), 'utf8')
+  t.match(buildDeps, /cpuFlags\.flags\(\)/, 'the dependency build uses the same resolver')
   t.end()
 })
 

@@ -17,11 +17,12 @@
 //
 // Linux and macOS only, matching the Dockerfile/BUILDING.md-documented build.
 // Portable by default (no CPU-specific `-march`), so the end-user from-source
-// path works on any machine. Set ROCKS_LEVEL_MARCH=<arch> (e.g. znver3) to
-// tune the deps for an explicit build, optionally with ROCKS_LEVEL_MTUNE=<cpu>
-// to bias scheduling for a narrower CPU than the -march baseline. The Docker
-// prebuild flow supplies its own x86-64-v3/znver3 defaults for the public
-// Linux artifact.
+// path works on any machine. On linux-x64, ROCKS_LEVEL_MARCH=<arch> (e.g.
+// znver3) tunes the deps for an explicit build, optionally with
+// ROCKS_LEVEL_MTUNE=<cpu> to bias scheduling for a narrower CPU than the
+// -march baseline; cpu-flags.js ignores both elsewhere, since only the
+// linux-x64 .gyp path applies them. The Docker prebuild flow supplies its own
+// x86-64-v3/znver3 defaults for the public Linux artifact.
 //
 // The prefix carries a .stamp.json recording the exact upstream commits and
 // tuning that built it; ensure() wipes and rebuilds a prefix whose stamp
@@ -33,6 +34,7 @@ const os = require('node:os')
 const path = require('node:path')
 const { execFileSync } = require('node:child_process')
 const { persistentPrefixDir } = require('./deps-prefix.js')
+const cpuFlags = require('./cpu-flags.js')
 
 const DEPENDENCIES = Object.freeze({
   abseil: Object.freeze({
@@ -172,22 +174,10 @@ function macOsDeploymentFlags () {
 // unset so the deps stay portable across whatever CPU runs `yarn install`.
 // Private prebuild-generation flows can set ROCKS_LEVEL_MARCH so the native
 // dependencies match the tuning applied to rocksdb + binding.cc on linux-x64.
-function marchValue () {
-  return process.env.ROCKS_LEVEL_MARCH || ''
-}
-
-// -mtune only biases scheduling; it never emits instructions the -march
-// baseline lacks. ROCKS_LEVEL_MTUNE therefore selects a specific CPU to
-// optimize for while -march keeps the artifact runnable on a wider range.
-// It defaults to the -march value and is ignored without one, so the portable
-// from-source path stays free of CPU flags.
-function mtuneValue () {
-  return marchValue() ? process.env.ROCKS_LEVEL_MTUNE || marchValue() : ''
-}
-
+// cpu-flags.js resolves the exact flag list the .gyp files use, so the deps and
+// the addon can never end up on different baselines.
 function marchFlags () {
-  const march = marchValue()
-  return march ? `-march=${march} -mtune=${mtuneValue()}` : ''
+  return cpuFlags.flags().join(' ')
 }
 
 function cmakeMarchFlags () {
@@ -245,8 +235,8 @@ function stampPath (prefix) {
 
 function currentStamp () {
   return {
-    march: marchValue(),
-    mtune: mtuneValue(),
+    march: cpuFlags.march(),
+    mtune: cpuFlags.mtune(),
     macosDeploymentTarget: process.platform === 'darwin' ? MACOS_DEPLOYMENT_TARGET : null,
     abseil: DEPENDENCIES.abseil.commit,
     re2: DEPENDENCIES.re2.commit,

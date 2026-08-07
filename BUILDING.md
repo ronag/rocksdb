@@ -52,8 +52,18 @@ scheduling, so the Zen 3 tuning costs no compatibility. Both can be overridden:
 Overrides must name a CPU the build image's GCC knows; Bookworm ships GCC 12,
 which predates `znver4`.
 
-`ROCKS_LEVEL_MTUNE` follows `ROCKS_LEVEL_MARCH` when unset, so the same pair of
-flags reaches abseil/re2/zstd, RocksDB and the addon.
+`ROCKS_LEVEL_MTUNE` follows `ROCKS_LEVEL_MARCH` when unset, and
+[scripts/cpu-flags.js](scripts/cpu-flags.js) resolves the final flag list for
+abseil/re2/zstd, RocksDB and the addon alike, so one artifact can never mix
+baselines. Both variables apply to linux-x64 only and are ignored on every other
+platform, matching the `.gyp` conditions that carry the flags.
+
+That resolver also appends `-mpclmul` to the `x86-64-v3`/`x86-64-v4` levels.
+Those levels mandate AVX without mandating PCLMUL, while RocksDB's `port/lang.h`
+treats `__AVX__` as implying `__PCLMUL__` and compiles `crc32c.cc`'s 3-way
+pipelined CRC32C on that basis — which fails to build unless PCLMUL is really
+enabled. No AVX-capable CPU lacks PCLMUL, so this keeps the fast CRC32C path
+without narrowing the artifact.
 
 `release.sh` ignores caller overrides and uses the `x86-64-v3`/`znver3` defaults
 for Linux, then clears both variables so the Darwin arm64 build remains

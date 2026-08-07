@@ -2,9 +2,6 @@
     "variables": {
         "openssl_fips": "0",
         "rocks_level_march%": "<!(node -p \"process.env.ROCKS_LEVEL_MARCH || ''\")",
-        # -mtune defaults to the -march value; set ROCKS_LEVEL_MTUNE to bias
-        # scheduling for a narrower CPU than the instruction-set baseline.
-        "rocks_level_mtune%": "<!(node -p \"process.env.ROCKS_LEVEL_MARCH ? (process.env.ROCKS_LEVEL_MTUNE || process.env.ROCKS_LEVEL_MARCH) : ''\")",
         # Native fault hooks are compiled only for explicit fault-test builds.
         # Published binaries have neither exports nor hot-path branches.
         "rocks_level_test_faults": "<!(node -p \"process.env.ROCKS_LEVEL_TEST_FAULTS === '1' ? '1' : '0'\")",
@@ -57,14 +54,16 @@
                             "-fuse-linker-plugin",
                         ],
                         # CPU tuning is opt-in for deployment prebuilds. Local
-                        # source builds stay portable, and the flag is only
-                        # valid on x64.
+                        # source builds stay portable, and the flags are only
+                        # valid on x64. cpu-flags.js prints the same -march /
+                        # -mtune (/ -mpclmul) list that built the dependency
+                        # prefix, one flag per line for GYP to split.
                         "conditions": [
                             [
                                 "target_arch == 'x64' and rocks_level_march != ''",
                                 {
-                                    "cflags": ["-march=<(rocks_level_march)", "-mtune=<(rocks_level_mtune)"],
-                                    "cflags_cc": ["-march=<(rocks_level_march)", "-mtune=<(rocks_level_mtune)"],
+                                    "cflags": ["<!@(node scripts/cpu-flags.js)"],
+                                    "cflags_cc": ["<!@(node scripts/cpu-flags.js)"],
                                 },
                             ],
                         ],

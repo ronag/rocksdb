@@ -5,6 +5,7 @@ const fs = require('node:fs')
 const path = require('node:path')
 const { execFileSync } = require('node:child_process')
 const { persistentPrefixDir } = require('./deps-prefix.js')
+const cpuFlags = require('./cpu-flags.js')
 
 // Bookworm toolchain ABI ceilings: the newest symbol versions the base
 // image's glibc 2.36 and GCC 12 libstdc++ can emit. The published prebuild
@@ -241,11 +242,14 @@ function findPrebuild (root) {
   return path.join(directory, candidates[0])
 }
 
+// Same resolver build-deps.js and the .gyp files use: -mtune follows -march
+// unless overridden, and a portable (no -march) build carries no tuning. The
+// target is stated rather than taken from the host so the unit tests can run
+// anywhere; main() already refuses to check an artifact off linux-x64.
+const LINUX_X64 = Object.freeze({ platform: 'linux', arch: 'x64' })
+
 function requestedTuning () {
-  const march = process.env.ROCKS_LEVEL_MARCH || ''
-  // Mirrors build-deps.js: -mtune follows -march unless overridden, and a
-  // portable (no -march) build carries no tuning at all.
-  return { march, mtune: march ? process.env.ROCKS_LEVEL_MTUNE || march : '' }
+  return { march: cpuFlags.march(LINUX_X64), mtune: cpuFlags.mtune(LINUX_X64) }
 }
 
 function checkDependencyTuning () {

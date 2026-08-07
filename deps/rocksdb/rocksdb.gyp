@@ -1,10 +1,7 @@
 {
   "variables": {
     "openssl_fips": "0",
-    "rocks_level_march%": "<!(node -p \"process.env.ROCKS_LEVEL_MARCH || ''\")",
-    # -mtune defaults to the -march value; set ROCKS_LEVEL_MTUNE to bias
-    # scheduling for a narrower CPU than the instruction-set baseline.
-    "rocks_level_mtune%": "<!(node -p \"process.env.ROCKS_LEVEL_MARCH ? (process.env.ROCKS_LEVEL_MTUNE || process.env.ROCKS_LEVEL_MARCH) : ''\")"
+    "rocks_level_march%": "<!(node -p \"process.env.ROCKS_LEVEL_MARCH || ''\")"
   },
   "targets": [
     {
@@ -92,12 +89,16 @@
             # x64-only: an unconditional -march would hard-fail gcc on
             # linux-arm64 from-source installs. (gyp's darwin generator takes
             # flags from xcode_settings, so this block never applied on mac.)
+            # cpu-flags.js prints the same -march / -mtune (/ -mpclmul) list
+            # that built the dependency prefix, one flag per line for GYP to
+            # split; paths are relative to this .gyp file's dir, which is the
+            # cwd gyp runs <!() commands in.
             "conditions": [
               [
                 "target_arch == 'x64' and rocks_level_march != ''",
                 {
-                  "cflags": ["-march=<(rocks_level_march)", "-mtune=<(rocks_level_mtune)"],
-                  "cflags_cc+": ["-march=<(rocks_level_march)", "-mtune=<(rocks_level_mtune)"],
+                  "cflags": ["<!@(node ../../scripts/cpu-flags.js)"],
+                  "cflags_cc+": ["<!@(node ../../scripts/cpu-flags.js)"],
                 }
               ]
             ]

@@ -56,7 +56,7 @@ ENV ROCKS_LEVEL_CCACHE=0
 # dependency layer survives both source edits and package-only changes. These
 # scripts use only Node built-ins; npm dependencies are installed afterward for
 # the addon build.
-COPY scripts/build-deps.js scripts/deps-prefix.js ./scripts/
+COPY scripts/build-deps.js scripts/cpu-flags.js scripts/deps-prefix.js ./scripts/
 RUN --mount=type=cache,target=/ccache,id=rocks-level-ccache,sharing=locked \
     --mount=type=bind,from=ccache,target=/ccache-seed,ro \
     cp -an /ccache-seed/. /ccache/ 2>/dev/null || true; \
