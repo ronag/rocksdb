@@ -5,19 +5,11 @@ deps/rocksdb/rocksdb/arcanist_util/
 deps/rocksdb/rocksdb/buckifier/
 deps/rocksdb/rocksdb/build_tools/
 deps/rocksdb/rocksdb/coverage/
-deps/rocksdb/rocksdb/docs/
 deps/rocksdb/rocksdb/examples/
 deps/rocksdb/rocksdb/fuzz/
 deps/rocksdb/rocksdb/hdfs/setup.sh
 deps/rocksdb/rocksdb/java/
 deps/rocksdb/rocksdb/third-party/gtest-*/
-deps/rocksdb/rocksdb/tools/advisor/
-deps/rocksdb/rocksdb/tools/rdb/
-deps/rocksdb/rocksdb/tools/dbench_monitor
-deps/rocksdb/rocksdb/tools/pflag
-deps/rocksdb/rocksdb/tools/*.sh
-deps/rocksdb/rocksdb/tools/*.py
-deps/rocksdb/rocksdb/tools/*.dmp
 deps/rocksdb/rocksdb/README.md
 deps/rocksdb/rocksdb/HISTORY.md
 deps/rocksdb/rocksdb/.circleci/
@@ -25,10 +17,42 @@ deps/rocksdb/rocksdb/.github/
 deps/rocksdb/rocksdb/.lgtm.yml
 deps/rocksdb/rocksdb/defs.bzl
 
+# NOTE: ineffective, kept so it starts working if upstream ever drops the
+# negation. rocksdb's own .gitignore ends with `!docs/` + `!docs/**`, and
+# npm-packlist applies a nested ignore file *after* the parent's rules, so that
+# negation re-includes docs/ (~10 MB of Jekyll site and PNGs) no matter what we
+# write here. Excluding it needs a `.npmignore` inside the submodule itself.
+deps/rocksdb/rocksdb/docs/
+
+# Programs and build systems we never compile. rocksdb.gyp lists its sources
+# explicitly (every tools/ and db_stress_tool/ entry is commented out) and none
+# of these are in the include closure of the 360 sources it does build.
+deps/rocksdb/rocksdb/tools/
+deps/rocksdb/rocksdb/db_stress_tool/
+deps/rocksdb/rocksdb/c_api_gen/
+deps/rocksdb/rocksdb/microbench/
+deps/rocksdb/rocksdb/unreleased_history/
+deps/rocksdb/rocksdb/githooks/
+deps/rocksdb/rocksdb/cmake/
+deps/rocksdb/rocksdb/BUCK
+deps/rocksdb/rocksdb/Directory.Build.props
+deps/rocksdb/rocksdb/ccache_msvc_compiler.bat
+deps/rocksdb/rocksdb/thirdparty.inc
+deps/rocksdb/rocksdb/crash_test.mk
+deps/rocksdb/rocksdb/folly.mk
+
+# Tests and benchmarks left in the source dirs we do compile. Note `*_test.c`
+# is a separate rule from `*_test.cc`: db/c_test.c (274 KB) is the only one, and
+# it hid behind the extension for years. Deliberately narrow — test_util/ holds
+# transaction_test_util.cc and testutil.cc, which rocksdb.gyp does compile.
+deps/rocksdb/rocksdb/**/*_test.cc
+deps/rocksdb/rocksdb/**/*_test.c
+deps/rocksdb/rocksdb/**/*_bench.cc
+deps/rocksdb/rocksdb/**/*_bench_tool.cc
+
 deps/snappy/snappy*/testdata/
 deps/snappy/snappy*/*.txt
 deps/snappy/snappy*/README.md
-deps/rocksdb/rocksdb/**/*_test.cc
 
 README
 INSTALL
@@ -77,6 +101,11 @@ appveyor.yml
 .appveyor.yml
 Dockerfile
 .dockerignore
+# Maintainer-only release plumbing: build.sh drives the Docker prebuild (and the
+# Dockerfile it needs is excluded above), release.sh publishes. Anchored, so a
+# vendored deps/*/build.sh would still ship.
+/build.sh
+/release.sh
 Vagrantfile
 .arcconfig
 .clang-format
