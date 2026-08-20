@@ -22,7 +22,7 @@
     "release": "./release.sh",
     "test": "standard && npm run typecheck && npm run build && npm run test:types && (nyc -s tape test/*-test.js | faucet) && nyc report && npm run test-gc",
     "test:close-faults": "cross-env-shell ROCKS_LEVEL_TEST_FAULTS=1 \"npm run rebuild && tape test/close-error-lifetime-test.js test/close-error-native-fault-test.js\"",
-    "test:native-faults": "cross-env-shell ROCKS_LEVEL_TEST_FAULTS=1 \"npm run rebuild && tape test/native-completion-exception-fault-test.js test/io-uring-native-fault-test.js test/batch-append-many-native-fault-test.js\"",
+    "test:native-faults": "cross-env-shell ROCKS_LEVEL_TEST_FAULTS=1 \"npm run rebuild && tape test/native-completion-exception-fault-test.js test/io-uring-native-fault-test.js test/batch-append-many-native-fault-test.js test/many-key-may-exist-native-fault-test.js\"",
     "test:types": "tsc -p test/tsconfig.json",
     "test-gc": "node --expose-gc test/gc.js",
     "test-prebuild": "cross-env PREBUILDS_ONLY=1 npm t",

@@ -108,12 +108,13 @@ caller must explicitly clear or close the raw-managed batch after writing.
 
 `_manyKeyMayExistAsync(keys, options)` and `_manyKeyMayExistSync(keys, options)`
 admit an array or packed table of encoded keys once and probe all of them with
-RocksDB's `KeyMayExist` API in native code. They return a `Uint8Array` in input
-order: `0` means RocksDB proved that the key is absent, while `1` means the key
-may exist. Positive results can be false positives. The probes perform no disk
-I/O and do not copy values into JavaScript. `options.column` selects a column
-family. The asynchronous form copies its inputs before returning and performs
-the probes on a native worker.
+status-aware cache-tier point reads in native code. They return a `Uint8Array`
+in input order: `0` means RocksDB returned `NotFound`, while `1` means the key
+may exist. Positive results can be false positives. Unexpected RocksDB errors
+are thrown or rejected rather than reported as absence. The probes perform no
+disk I/O and do not copy values into JavaScript. `options.column` selects a
+column family. The asynchronous form copies its inputs before returning and
+performs the probes on a native worker.
 
 These methods are useful only as a guard for more expensive reads: skip a read
 for `0`, and preserve the normal read path for `1`. It is not an existence test

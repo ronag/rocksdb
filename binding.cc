@@ -99,6 +99,8 @@ static std::atomic<int> databaseOpenAfterColumnExceptionCountdownForTest{
     ExceptionCountdownForTest("ROCKS_LEVEL_TEST_DB_OPEN_EXCEPTION_AFTER_COLUMN_COUNTDOWN")};
 static std::atomic<int> databaseOpenCleanupExceptionCountdownForTest{
     ExceptionCountdownForTest("ROCKS_LEVEL_TEST_DB_OPEN_CLEANUP_EXCEPTION_COUNTDOWN")};
+static std::atomic<int> manyKeyMayExistErrorCountdownForTest{
+    ExceptionCountdownForTest("ROCKS_LEVEL_TEST_MANY_KEY_MAY_EXIST_ERROR_COUNTDOWN")};
 
 static bool InjectUpdatesCloseExceptionForTest() {
   auto current = updatesCloseExceptionCountdownForTest.load(std::memory_order_relaxed);
@@ -173,6 +175,17 @@ static bool InjectDatabaseOpenCleanupExceptionForTest() {
   }
   return false;
 }
+
+static bool InjectManyKeyMayExistErrorForTest() {
+  auto current = manyKeyMayExistErrorCountdownForTest.load(std::memory_order_relaxed);
+  while (current > 0) {
+    if (manyKeyMayExistErrorCountdownForTest.compare_exchange_weak(
+            current, current - 1, std::memory_order_relaxed, std::memory_order_relaxed)) {
+      return current == 1;
+    }
+  }
+  return false;
+}
 #else
 static constexpr bool InjectUpdatesCloseExceptionForTest() { return false; }
 static constexpr bool InjectDatabaseCloseColumnExceptionForTest() { return false; }
@@ -180,6 +193,7 @@ static constexpr bool InjectDatabaseCloseAfterTransferExceptionForTest() { retur
 static constexpr bool InjectDatabaseCloseBeforeTransferExceptionForTest() { return false; }
 static constexpr bool InjectDatabaseOpenAfterColumnExceptionForTest() { return false; }
 static constexpr bool InjectDatabaseOpenCleanupExceptionForTest() { return false; }
+static constexpr bool InjectManyKeyMayExistErrorForTest() { return false; }
 #endif
 
 static std::mutex& GetBackgroundParallelismMutex() {
@@ -4239,14 +4253,28 @@ static napi_status GetGetManyInputKeys(napi_env env,
   return napi_ok;
 }
 
-static void ManyKeyMayExist(rocksdb::DB* database,
-                            rocksdb::ColumnFamilyHandle* column,
-                            const std::vector<rocksdb::Slice>& keys,
-                            uint8_t* result) {
+static rocksdb::Status ManyKeyMayExist(rocksdb::DB* database,
+                                      rocksdb::ColumnFamilyHandle* column,
+                                      const std::vector<rocksdb::Slice>& keys,
+                                      uint8_t* result) {
   rocksdb::ReadOptions readOptions;
+  readOptions.read_tier = rocksdb::kBlockCacheTier;
+  rocksdb::PinnableSlice value;
   for (size_t index = 0; index < keys.size(); ++index) {
-    result[index] = database->KeyMayExist(readOptions, column, keys[index], nullptr) ? 1 : 0;
+    if (InjectManyKeyMayExistErrorForTest()) {
+      return rocksdb::Status::Corruption("Injected key-may-exist read error");
+    }
+    value.Reset();
+    const auto status = database->Get(readOptions, column, keys[index], &value);
+    if (status.IsNotFound()) {
+      result[index] = 0;
+    } else if (status.ok() || status.IsIncomplete()) {
+      result[index] = 1;
+    } else {
+      return status;
+    }
   }
+  return rocksdb::Status::OK();
 }
 
 static napi_status ConvertManyKeyMayExistResult(napi_env env,
@@ -4293,8 +4321,7 @@ NAPI_METHOD(db_many_key_may_exist) {
         (void)databaseOperation;
         const auto keys = inputKeys.slices();
         state.values.resize(keys.size());
-        ManyKeyMayExist(database->db.get(), column, keys, state.values.data());
-        return rocksdb::Status::OK();
+        return ManyKeyMayExist(database->db.get(), column, keys, state.values.data());
       },
       [](auto& state, napi_env env, napi_value* result) {
         return ConvertManyKeyMayExistResult(env, state.values, result);
@@ -4332,7 +4359,8 @@ NAPI_METHOD(db_many_key_may_exist_sync) {
   NAPI_STATUS_THROWS(napi_create_arraybuffer(env, count, &data, &backing));
   NAPI_STATUS_THROWS(napi_create_typedarray(env, napi_uint8_array, count, backing, 0, &result));
 
-  ManyKeyMayExist(database->db.get(), column, keys, static_cast<uint8_t*>(data));
+  ROCKS_STATUS_THROWS_NAPI(
+      ManyKeyMayExist(database->db.get(), column, keys, static_cast<uint8_t*>(data)));
 
   return result;
 }
