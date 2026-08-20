@@ -1092,6 +1092,27 @@ export class RocksLevel<KDefault = string, VDefault = string> extends AbstractLe
   clear<K = KDefault>(options: RocksClearOptions<K>): Promise<void>
 
   /**
+   * Probe encoded keys on a native worker without performing disk I/O. Each
+   * result byte is `0` when RocksDB can prove the key is absent and `1` when
+   * the key may exist. Positive results can be false positives; negative
+   * results are definitive. Inputs are copied before this method returns, but
+   * the database must already be open and remain open until settlement.
+   *
+   * This bypasses public codecs, prefixes, hooks, events and queues. Array and
+   * packed inputs preserve their input order.
+   */
+  _manyKeyMayExistAsync(
+    keys: readonly RocksSlice[] | RocksPackedGetManyInput,
+    options?: RocksManyKeyMayExistOptions
+  ): Promise<Uint8Array>
+  /** Callback form of {@link _manyKeyMayExistAsync}. */
+  _manyKeyMayExistAsync(
+    keys: readonly RocksSlice[] | RocksPackedGetManyInput,
+    options: RocksManyKeyMayExistOptions | undefined,
+    callback: RocksNodeCallback<Uint8Array>
+  ): void
+
+  /**
    * Probe encoded keys synchronously without performing disk I/O. Each result
    * byte is `0` when RocksDB can prove the key is absent and `1` when the key
    * may exist. Positive results can be false positives; negative results are

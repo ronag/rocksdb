@@ -49,6 +49,16 @@ test('manyKeyMayExist preserves key order for array and packed inputs', async fu
     expectedDefault,
     'packed input preserves the same result order'
   )
+  t.same(
+    await db._manyKeyMayExistAsync(defaultKeys),
+    expectedDefault,
+    'async array input preserves the same result order'
+  )
+  t.same(
+    await db._manyKeyMayExistAsync(packKeys(defaultKeys)),
+    expectedDefault,
+    'async packed input preserves the same result order'
+  )
 
   await db._flushAsync()
   const flushed = db._manyKeyMayExistSync(defaultKeys)
@@ -62,9 +72,21 @@ test('manyKeyMayExist preserves key order for array and packed inputs', async fu
     'column selection probes only the requested column family'
   )
   t.same(
+    await db._manyKeyMayExistAsync(['default-present', 'secondary-present'], {
+      column: secondary
+    }),
+    new Uint8Array([0, 1]),
+    'async column selection probes only the requested column family'
+  )
+  t.same(
     db._manyKeyMayExistSync([]),
     new Uint8Array(),
     'empty input returns an empty typed array'
+  )
+  t.same(
+    await db._manyKeyMayExistAsync([]),
+    new Uint8Array(),
+    'async empty input returns an empty typed array'
   )
 
   const location = db.location
@@ -77,12 +99,50 @@ test('manyKeyMayExist preserves key order for array and packed inputs', async fu
     1,
     'a present key is never a definite miss after reopen with a cold cache'
   )
+  t.equal(
+    (await reopened._manyKeyMayExistAsync(['default-present']))[0],
+    1,
+    'the async probe preserves a cold-cache possible hit after reopen'
+  )
   await reopened.close()
   t.throws(
     () => reopened._manyKeyMayExistSync(['default-present']),
     /requires an open database/,
     'the raw probe rejects a closed database in development'
   )
+  t.end()
+})
+
+test('manyKeyMayExist async snapshots inputs and supports callbacks', async function (t) {
+  const db = testCommon.factory()
+  await db.open()
+  await db.put('present', 'value')
+
+  const arrayKey = Buffer.from('present')
+  const arrayResult = db._manyKeyMayExistAsync([arrayKey])
+  arrayKey.fill(0)
+
+  const packed = packKeys(['present'])
+  const packedResult = db._manyKeyMayExistAsync(packed)
+  packed.offsets.fill(0)
+  packed.buffer.fill(0)
+
+  t.same(await arrayResult, new Uint8Array([1]), 'array bytes are copied before return')
+  t.same(await packedResult, new Uint8Array([1]), 'packed bytes are copied before return')
+
+  const callbackResult = await new Promise((resolve, reject) => {
+    const returned = db._manyKeyMayExistAsync(['present'], undefined, (err, result) => {
+      if (err) reject(err)
+      else resolve(result)
+    })
+    t.equal(returned, undefined, 'callback form does not return a promise')
+  })
+  t.same(callbackResult, new Uint8Array([1]), 'callback form returns the typed result')
+
+  const closingResult = db._manyKeyMayExistAsync(['present'])
+  const closing = db.close()
+  t.same(await closingResult, new Uint8Array([1]), 'admitted work completes during database close')
+  await closing
   t.end()
 })
 
@@ -128,6 +188,17 @@ test('manyKeyMayExist rejects a column owned by another database', async functio
     { code: 'LEVEL_INVALID_COLUMN' },
     'foreign column handles are rejected before probing'
   )
+  let asyncColumnError
+  try {
+    await second._manyKeyMayExistAsync(['key'], { column: first.columns.secondary })
+  } catch (err) {
+    asyncColumnError = err
+  }
+  t.equal(
+    asyncColumnError?.code,
+    'LEVEL_INVALID_COLUMN',
+    'async probes reject foreign column handles'
+  )
 
   await Promise.all([first.close(), second.close()])
   t.end()
@@ -149,6 +220,20 @@ test('manyKeyMayExist validates packed layouts before probing', async function (
     }),
     /offsets are outside its buffer/,
     'out-of-range packed layouts are rejected'
+  )
+  let asyncLayoutError
+  try {
+    await db._manyKeyMayExistAsync({
+      offsets: new Uint32Array([0, 1]),
+      buffer: Buffer.alloc(0)
+    })
+  } catch (err) {
+    asyncLayoutError = err
+  }
+  t.match(
+    asyncLayoutError?.message,
+    /offsets are outside its buffer/,
+    'async packed layouts are validated'
   )
 
   await db.close()

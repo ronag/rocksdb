@@ -503,8 +503,31 @@ class RocksLevel extends AbstractLevel<any, any, any> {
   }
 
   // Supported unsafe user-space existence probe. The database must already be
-  // open and remain open for the synchronous call. This bypasses public codecs,
+  // open and remain open until settlement. This bypasses public codecs,
   // prefixes, hooks, events and operation queues; callers pass encoded keys.
+  _manyKeyMayExistAsync(keys, options, callback) {
+    if (DEBUG) {
+      assert.strictEqual(
+        this.status,
+        'open',
+        'unsafe _manyKeyMayExistAsync() requires an open database'
+      )
+    }
+
+    callback = fromCallback(callback, kPromise)
+    const promise = callback[kPromise]
+    let complete
+    try {
+      complete = once(callback)
+      binding.db_many_key_may_exist(this[kContext], keys, options, complete)
+    } catch (err) {
+      process.nextTick(complete ?? callback, err)
+    }
+    return promise
+  }
+
+  // Synchronous counterpart to _manyKeyMayExistAsync(). The database must
+  // remain open for the call, which can block the JavaScript event loop.
   _manyKeyMayExistSync(keys, options?) {
     if (DEBUG) {
       assert.strictEqual(
