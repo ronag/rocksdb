@@ -1095,8 +1095,9 @@ export class RocksLevel<KDefault = string, VDefault = string> extends AbstractLe
    * Probe encoded keys on a native worker without performing disk I/O. Each
    * result byte is `0` when RocksDB can prove the key is absent and `1` when
    * the key may exist. Positive results can be false positives; negative
-   * results are definitive. Inputs are copied before this method returns, but
-   * the database must already be open and remain open until settlement.
+   * results are definitive. Unexpected RocksDB errors reject the operation.
+   * Inputs are copied before this method returns, but the database must already
+   * be open and remain open until settlement.
    *
    * This bypasses public codecs, prefixes, hooks, events and queues. Array and
    * packed inputs preserve their input order.
@@ -1116,7 +1117,8 @@ export class RocksLevel<KDefault = string, VDefault = string> extends AbstractLe
    * Probe encoded keys synchronously without performing disk I/O. Each result
    * byte is `0` when RocksDB can prove the key is absent and `1` when the key
    * may exist. Positive results can be false positives; negative results are
-   * definitive. The database must already be open and outlive the call.
+   * definitive. Unexpected RocksDB errors are thrown. The database must already
+   * be open and outlive the call.
    *
    * This bypasses public codecs, prefixes, hooks, events and queues, and can
    * block the event loop. Array and packed inputs preserve their input order.
