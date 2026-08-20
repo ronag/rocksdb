@@ -250,6 +250,7 @@ enum ResourceName {
   ResourceLeveldownOpen,
   ResourceLeveldownClose,
   ResourceLeveldownGetMany,
+  ResourceLeveldownManyKeyMayExist,
   ResourceLeveldownFlushWal,
   ResourceLeveldownFlush,
   ResourceLeveldownIteratorInit,
@@ -966,10 +967,13 @@ static constexpr napi_type_tag kUpdatesReferenceTag = {0xe254e64dfaa9406bULL, 0x
 
 static napi_status GetResourceName(napi_env env, ResourceName name, napi_value& result) {
   static constexpr const char* names[] = {
-      "iterator.nextv",          "leveldown.open",         "leveldown.close",
-      "leveldown.get_many",      "leveldown.flush_wal",    "leveldown.flush",
-      "leveldown.iterator_init", "leveldown.iterator_seek", "leveldown.batch_write",
-      "leveldown.updates_since", "leveldown.compact_range", "leveldown.clear"};
+      "iterator.nextv",               "leveldown.open",
+      "leveldown.close",              "leveldown.get_many",
+      "leveldown.many_key_may_exist", "leveldown.flush_wal",
+      "leveldown.flush",              "leveldown.iterator_init",
+      "leveldown.iterator_seek",      "leveldown.batch_write",
+      "leveldown.updates_since",      "leveldown.compact_range",
+      "leveldown.clear"};
   static_assert(std::size(names) == ResourceNameCount);
   return napi_create_string_utf8(env, names[name], NAPI_AUTO_LENGTH, &result);
 }
@@ -4235,6 +4239,104 @@ static napi_status GetGetManyInputKeys(napi_env env,
   return napi_ok;
 }
 
+static void ManyKeyMayExist(rocksdb::DB* database,
+                            rocksdb::ColumnFamilyHandle* column,
+                            const std::vector<rocksdb::Slice>& keys,
+                            uint8_t* result) {
+  rocksdb::ReadOptions readOptions;
+  for (size_t index = 0; index < keys.size(); ++index) {
+    result[index] = database->KeyMayExist(readOptions, column, keys[index], nullptr) ? 1 : 0;
+  }
+}
+
+static napi_status ConvertManyKeyMayExistResult(napi_env env,
+                                                const std::vector<uint8_t>& values,
+                                                napi_value* result) {
+  napi_value backing;
+  void* data = nullptr;
+  NAPI_STATUS_RETURN(napi_create_arraybuffer(env, values.size(), &data, &backing));
+  if (!values.empty()) {
+    std::copy(values.begin(), values.end(), static_cast<uint8_t*>(data));
+  }
+  return napi_create_typedarray(env, napi_uint8_array, values.size(), backing, 0, result);
+}
+
+NAPI_METHOD(db_many_key_may_exist) {
+  NAPI_ARGV(4);
+
+  Database* database;
+  std::shared_ptr<DatabaseReference> reference;
+  NAPI_STATUS_THROWS(GetDatabase(env, argv[0], database, &reference));
+  std::shared_ptr<DatabaseOperation> databaseOperation;
+  NAPI_STATUS_THROWS(BeginDatabaseOperation(env, database, reference, databaseOperation));
+
+  rocksdb::ColumnFamilyHandle* column = database->db->DefaultColumnFamily();
+  NAPI_STATUS_THROWS(GetColumnProperty(env, argv[2], database, column));
+
+  GetManyInputKeys inputKeys;
+  inputKeys.owned.poolAsyncPackedData = true;
+  // Async work owns a byte snapshot of every key. JavaScript may mutate or
+  // release its original arrays and buffers as soon as this method returns.
+  NAPI_STATUS_THROWS(GetGetManyInputKeys(env, argv[1], false, false, inputKeys));
+
+  auto callback = argv[3];
+  napi_value resourceName;
+  NAPI_STATUS_THROWS(GetResourceName(env, ResourceLeveldownManyKeyMayExist, resourceName));
+
+  struct State {
+    std::vector<uint8_t> values;
+  };
+
+  NAPI_STATUS_THROWS(runAsyncKeepAlive<State>(
+      resourceName, env, callback, argv[0],
+      [=, inputKeys = std::move(inputKeys)](auto& state) {
+        (void)databaseOperation;
+        const auto keys = inputKeys.slices();
+        state.values.resize(keys.size());
+        ManyKeyMayExist(database->db.get(), column, keys, state.values.data());
+        return rocksdb::Status::OK();
+      },
+      [](auto& state, napi_env env, napi_value* result) {
+        return ConvertManyKeyMayExistResult(env, state.values, result);
+      }));
+
+  return 0;
+}
+
+NAPI_METHOD(db_many_key_may_exist_sync) {
+  NAPI_ARGV(3);
+
+  Database* database;
+  std::shared_ptr<DatabaseReference> reference;
+  NAPI_STATUS_THROWS(GetDatabase(env, argv[0], database, &reference));
+  std::shared_ptr<DatabaseOperation> databaseOperation;
+  NAPI_STATUS_THROWS(BeginDatabaseOperation(env, database, reference, databaseOperation));
+
+  rocksdb::ColumnFamilyHandle* column = database->db->DefaultColumnFamily();
+  NAPI_STATUS_THROWS(GetColumnProperty(env, argv[2], database, column));
+
+  ReusableSyncGetManyStringSlabLease slabLease(reusableSyncGetManyStringSlab);
+  GetManyInputKeys inputKeys;
+  inputKeys.owned.reusablePackedData = slabLease.data();
+  // JavaScript cannot run after synchronous admission, so byte-backed keys can
+  // be borrowed while KeyMayExist inspects them. Immutable strings are copied
+  // into the reusable native slab during conversion.
+  NAPI_STATUS_THROWS(GetGetManyInputKeys(env, argv[1], true, false, inputKeys));
+  const auto keys = inputKeys.slices();
+
+  const auto count = static_cast<uint32_t>(keys.size());
+
+  napi_value backing;
+  napi_value result;
+  void* data = nullptr;
+  NAPI_STATUS_THROWS(napi_create_arraybuffer(env, count, &data, &backing));
+  NAPI_STATUS_THROWS(napi_create_typedarray(env, napi_uint8_array, count, backing, 0, &result));
+
+  ManyKeyMayExist(database->db.get(), column, keys, static_cast<uint8_t*>(data));
+
+  return result;
+}
+
 static napi_value db_get_many_sync_impl(napi_env env, napi_callback_info info, const PackedMode mode) {
   NAPI_ARGV(3);
 
@@ -6452,6 +6554,8 @@ NAPI_INIT() {
   NAPI_EXPORT_FUNCTION(db_get_many);
   NAPI_EXPORT_FUNCTION(db_get_many_packed);
   NAPI_EXPORT_FUNCTION(db_get_many_auto);
+  NAPI_EXPORT_FUNCTION(db_many_key_may_exist);
+  NAPI_EXPORT_FUNCTION(db_many_key_may_exist_sync);
   NAPI_EXPORT_FUNCTION(db_get_many_sync);
   NAPI_EXPORT_FUNCTION(db_get_many_packed_sync);
   NAPI_EXPORT_FUNCTION(db_get_many_auto_sync);

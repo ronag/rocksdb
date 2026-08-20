@@ -125,6 +125,32 @@ expectTrue<
     RocksUnexposedGetManyReadResult<'buffer', 'auto', false>
   >
 >()
+expectType<Uint8Array>(db._manyKeyMayExistSync(readonlyRawKeys))
+expectType<Uint8Array>(
+  db._manyKeyMayExistSync({ offsets: new Uint32Array([0, 3]), buffer: Buffer.from('key') })
+)
+expectType<Uint8Array>(db._manyKeyMayExistSync(readonlyRawKeys, { column: defaultColumn }))
+expectType<Promise<Uint8Array>>(db._manyKeyMayExistAsync(readonlyRawKeys))
+expectType<Promise<Uint8Array>>(
+  db._manyKeyMayExistAsync({
+    offsets: new Uint32Array([0, 3]),
+    buffer: Buffer.from('key'),
+  })
+)
+expectType<void>(
+  db._manyKeyMayExistAsync(readonlyRawKeys, { column: defaultColumn }, (err, result) => {
+    expectType<Error | null | undefined>(err)
+    expectType<Uint8Array | undefined>(result)
+  })
+)
+// @ts-expect-error Raw may-exist keys cannot be null
+db._manyKeyMayExistSync([null])
+// @ts-expect-error Async raw may-exist keys cannot be null
+db._manyKeyMayExistAsync([null])
+// @ts-expect-error May-exist probes accept only column selection options
+db._manyKeyMayExistSync(readonlyRawKeys, { timeout: 1 })
+// @ts-expect-error Async may-exist probes accept only column selection options
+db._manyKeyMayExistAsync(readonlyRawKeys, { timeout: 1 })
 
 type CompleteRawUtf8Value = RocksRawGetManyResult<'utf8', false, false>[number]
 expectTrue<Equal<CompleteRawUtf8Value, string | undefined>>()
