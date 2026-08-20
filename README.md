@@ -104,11 +104,27 @@ native RocksDB batch. Raw writes submit the current native operations but do not
 consume, clear or close them; another raw write replays those operations. The
 caller must explicitly clear or close the raw-managed batch after writing.
 
+### Batched key-may-exist probes
+
+`_manyKeyMayExistSync(keys, options)` admits an array or packed table of encoded
+keys once and probes all of them in native code. It returns a `Uint8Array` in
+input order: `0` means RocksDB proved that the key is absent, while `1` means the
+key may exist. Positive results can be false positives. The probe performs no
+disk I/O and does not copy values into JavaScript. `options.column` selects a
+column family. Unexpected RocksDB statuses throw instead of being reported as
+definite misses.
+
+This method is useful only as a guard for more expensive reads: skip a read for
+`0`, and preserve the normal read path for `1`. It is not an existence test for
+user-visible behavior because a positive result does not prove that a key is
+present.
+
 ### Blocking behavior
 
 Unsafe synchronous methods can perform RocksDB I/O and block the JavaScript
-event loop. In particular this includes `_getManySync()`, `_refreshSync()`,
-`_seekSync()`, `_nextvSync()`, `_writeSync()` and `_closeSync()`.
+event loop. In particular this includes `_manyKeyMayExistSync()`,
+`_getManySync()`, `_refreshSync()`, `_seekSync()`, `_nextvSync()`,
+`_writeSync()` and `_closeSync()`.
 Iterator `_closeAsync()` also performs native cleanup synchronously and defers
 only its completion notification.
 

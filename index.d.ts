@@ -271,6 +271,8 @@ export interface RocksBatchAppendManyOptions extends RocksColumnOperationOptions
   inputType?: 'string' | 'buffer'
 }
 
+export type RocksManyKeyMayExistOptions = RocksColumnOperationOptions
+
 export interface RocksReadOptions extends RocksColumnOperationOptions {
   fillCache?: boolean
   asyncIO?: boolean
@@ -1088,6 +1090,20 @@ export class RocksLevel<KDefault = string, VDefault = string> extends AbstractLe
 
   clear(): Promise<void>
   clear<K = KDefault>(options: RocksClearOptions<K>): Promise<void>
+
+  /**
+   * Probe encoded keys synchronously without performing disk I/O. Each result
+   * byte is `0` when RocksDB can prove the key is absent and `1` when the key
+   * may exist. Positive results can be false positives; negative results are
+   * definitive. The database must already be open and outlive the call.
+   *
+   * This bypasses public codecs, prefixes, hooks, events and queues, and can
+   * block the event loop. Array and packed inputs preserve their input order.
+   */
+  _manyKeyMayExistSync(
+    keys: readonly RocksSlice[] | RocksPackedGetManyInput,
+    options?: RocksManyKeyMayExistOptions
+  ): Uint8Array
 
   /**
    * Read encoded keys asynchronously. Keys are copied before this method

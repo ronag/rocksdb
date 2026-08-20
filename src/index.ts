@@ -502,6 +502,21 @@ class RocksLevel extends AbstractLevel<any, any, any> {
     )
   }
 
+  // Supported unsafe user-space existence probe. The database must already be
+  // open and remain open for the synchronous call. This bypasses public codecs,
+  // prefixes, hooks, events and operation queues; callers pass encoded keys.
+  _manyKeyMayExistSync(keys, options?) {
+    if (DEBUG) {
+      assert.strictEqual(
+        this.status,
+        'open',
+        'unsafe _manyKeyMayExistSync() requires an open database'
+      )
+    }
+
+    return binding.db_many_key_may_exist_sync(this[kContext], keys, options)
+  }
+
   // Supported unsafe user-space read. The database must already be open and
   // must not close until settlement. This path deliberately bypasses public
   // admission, codecs, sublevel prefixing, hooks and events; callers pass

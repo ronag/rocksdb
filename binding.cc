@@ -4235,6 +4235,60 @@ static napi_status GetGetManyInputKeys(napi_env env,
   return napi_ok;
 }
 
+NAPI_METHOD(db_many_key_may_exist_sync) {
+  NAPI_ARGV(3);
+
+  Database* database;
+  std::shared_ptr<DatabaseReference> reference;
+  NAPI_STATUS_THROWS(GetDatabase(env, argv[0], database, &reference));
+  std::shared_ptr<DatabaseOperation> databaseOperation;
+  NAPI_STATUS_THROWS(BeginDatabaseOperation(env, database, reference, databaseOperation));
+
+  rocksdb::ColumnFamilyHandle* column = database->db->DefaultColumnFamily();
+  NAPI_STATUS_THROWS(GetColumnProperty(env, argv[2], database, column));
+
+  ReusableSyncGetManyStringSlabLease slabLease(reusableSyncGetManyStringSlab);
+  GetManyInputKeys inputKeys;
+  inputKeys.owned.reusablePackedData = slabLease.data();
+  // JavaScript cannot run after synchronous admission, so byte-backed keys can
+  // be borrowed while KeyMayExist inspects them. Immutable strings are copied
+  // into the reusable native slab during conversion.
+  NAPI_STATUS_THROWS(GetGetManyInputKeys(env, argv[1], true, false, inputKeys));
+  const auto keys = inputKeys.slices();
+
+  rocksdb::ReadOptions readOptions;
+  readOptions.fill_cache = false;
+  readOptions.read_tier = rocksdb::kBlockCacheTier;
+
+  const auto count = static_cast<uint32_t>(keys.size());
+  std::vector<rocksdb::Status> statuses(count);
+  std::vector<rocksdb::PinnableSlice> values(count);
+  database->db->MultiGet(readOptions, column, count, keys.data(), values.data(), statuses.data());
+
+  napi_value backing;
+  napi_value result;
+  void* data = nullptr;
+  NAPI_STATUS_THROWS(napi_create_arraybuffer(env, count, &data, &backing));
+  NAPI_STATUS_THROWS(napi_create_typedarray(env, napi_uint8_array, count, backing, 0, &result));
+
+  auto* mayExist = static_cast<uint8_t*>(data);
+  for (uint32_t index = 0; index < count; ++index) {
+    const auto& status = statuses[index];
+    if (status.IsNotFound()) {
+      mayExist[index] = 0;
+    } else if (status.ok() || status.IsIncomplete()) {
+      mayExist[index] = 1;
+    } else {
+      // DB::KeyMayExist collapses every status other than OK/Incomplete to
+      // false. MultiGet at the same cache-only read tier lets this batched API
+      // preserve the stronger contract: only NotFound proves absence.
+      ROCKS_STATUS_THROWS_NAPI(status);
+    }
+  }
+
+  return result;
+}
+
 static napi_value db_get_many_sync_impl(napi_env env, napi_callback_info info, const PackedMode mode) {
   NAPI_ARGV(3);
 
@@ -6452,6 +6506,7 @@ NAPI_INIT() {
   NAPI_EXPORT_FUNCTION(db_get_many);
   NAPI_EXPORT_FUNCTION(db_get_many_packed);
   NAPI_EXPORT_FUNCTION(db_get_many_auto);
+  NAPI_EXPORT_FUNCTION(db_many_key_may_exist_sync);
   NAPI_EXPORT_FUNCTION(db_get_many_sync);
   NAPI_EXPORT_FUNCTION(db_get_many_packed_sync);
   NAPI_EXPORT_FUNCTION(db_get_many_auto_sync);
