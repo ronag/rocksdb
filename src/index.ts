@@ -50,6 +50,16 @@ function once(callback) {
   }
 }
 
+// Every entry point that touches the native handle must reject a non-open
+// database with a catchable error rather than crashing the process. Raw
+// (underscore) methods name themselves so a misuse is easy to locate.
+function notOpenError(method?: string) {
+  return new ModuleError(
+    method === undefined ? 'Database is not open' : `unsafe ${method}() requires an open database`,
+    { code: 'LEVEL_DATABASE_NOT_OPEN' }
+  )
+}
+
 function aggregateErrors(errors: any[], message) {
   return errors.length === 1 ? errors[0] : new AggregateError(errors, message, { cause: errors[0] })
 }
@@ -357,6 +367,12 @@ class RocksLevel extends AbstractLevel<any, any, any> {
     this[kReferenceResource] = attachReferenceResource(this, context)
   }
 
+  #assertOpen(method?: string) {
+    if (this.status !== 'open') {
+      throw notOpenError(method)
+    }
+  }
+
   static async open(...args: any[]) {
     const Constructor: any = this
     const db = new Constructor(...args)
@@ -365,11 +381,7 @@ class RocksLevel extends AbstractLevel<any, any, any> {
   }
 
   get sequence() {
-    if (this.status !== 'open') {
-      throw new ModuleError('Database is not open', {
-        code: 'LEVEL_DATABASE_NOT_OPEN',
-      })
-    }
+    this.#assertOpen()
 
     return binding.db_get_latest_sequence(this[kContext])
   }
@@ -379,11 +391,7 @@ class RocksLevel extends AbstractLevel<any, any, any> {
   }
 
   get handle() {
-    if (this.status !== 'open') {
-      throw new ModuleError('Database is not open', {
-        code: 'LEVEL_DATABASE_NOT_OPEN',
-      })
-    }
+    this.#assertOpen()
 
     return binding.db_get_handle(this[kContext])
   }
@@ -477,12 +485,16 @@ class RocksLevel extends AbstractLevel<any, any, any> {
   }
 
   _put(key, value, options) {
+    this.#assertOpen('_put')
+
     return this[kWithRef](() =>
       this[kBatchAsync]([{ type: 'put', key, value }], options ?? kEmpty, undefined, options)
     )
   }
 
   async _get(key, options) {
+    this.#assertOpen('_get')
+
     const values = await this[kWithRef](() =>
       this[kGetManyAsync](
         [key],
@@ -497,6 +509,8 @@ class RocksLevel extends AbstractLevel<any, any, any> {
   }
 
   _getMany(keys, options) {
+    this.#assertOpen('_getMany')
+
     return this[kWithRef](() =>
       this[kGetManyAsync](keys, options, fromCallback(undefined, kPromise), false, false, false)
     )
@@ -506,13 +520,7 @@ class RocksLevel extends AbstractLevel<any, any, any> {
   // open and remain open until settlement. This bypasses public codecs,
   // prefixes, hooks, events and operation queues; callers pass encoded keys.
   _manyKeyMayExistAsync(keys, options, callback) {
-    if (DEBUG) {
-      assert.strictEqual(
-        this.status,
-        'open',
-        'unsafe _manyKeyMayExistAsync() requires an open database'
-      )
-    }
+    this.#assertOpen('_manyKeyMayExistAsync')
 
     callback = fromCallback(callback, kPromise)
     const promise = callback[kPromise]
@@ -529,13 +537,7 @@ class RocksLevel extends AbstractLevel<any, any, any> {
   // Synchronous counterpart to _manyKeyMayExistAsync(). The database must
   // remain open for the call, which can block the JavaScript event loop.
   _manyKeyMayExistSync(keys, options?) {
-    if (DEBUG) {
-      assert.strictEqual(
-        this.status,
-        'open',
-        'unsafe _manyKeyMayExistSync() requires an open database'
-      )
-    }
+    this.#assertOpen('_manyKeyMayExistSync')
 
     return binding.db_many_key_may_exist_sync(this[kContext], keys, options)
   }
@@ -548,9 +550,7 @@ class RocksLevel extends AbstractLevel<any, any, any> {
   // INPUT is set, and this wrapper snapshots result-conversion options before
   // returning.
   _getManyAsync(keys, options, callback) {
-    if (DEBUG) {
-      assert.strictEqual(this.status, 'open', 'unsafe _getManyAsync() requires an open database')
-    }
+    this.#assertOpen('_getManyAsync')
 
     callback = fromCallback(callback, kPromise)
     const { allowPartial, exposePacked } = readRawGetManyControls(options)
@@ -657,9 +657,7 @@ class RocksLevel extends AbstractLevel<any, any, any> {
   // loop, and honours the same allowPartial / packed / exposePacked options.
   // Returned values and packed arenas own their backing bytes.
   _getManySync(keys, options?) {
-    if (DEBUG) {
-      assert.strictEqual(this.status, 'open', 'unsafe _getManySync() requires an open database')
-    }
+    this.#assertOpen('_getManySync')
 
     const { allowPartial, exposePacked } = readRawGetManyControls(options)
     return this[kGetManySync](keys, options, allowPartial, undefined, exposePacked)
@@ -731,12 +729,16 @@ class RocksLevel extends AbstractLevel<any, any, any> {
   }
 
   _del(key, options) {
+    this.#assertOpen('_del')
+
     return this[kWithRef](() =>
       this[kBatchAsync]([{ type: 'del', key }], options ?? kEmpty, undefined, options)
     )
   }
 
   _clear(options) {
+    this.#assertOpen('_clear')
+
     return this[kWithRef](
       () =>
         new Promise<void>((resolve, reject) => {
@@ -760,6 +762,8 @@ class RocksLevel extends AbstractLevel<any, any, any> {
   }
 
   _batch(operations, options) {
+    this.#assertOpen('_batch')
+
     return this[kWithRef](() => this[kBatchAsync](operations, options, undefined))
   }
 
@@ -819,11 +823,7 @@ class RocksLevel extends AbstractLevel<any, any, any> {
   }
 
   get identity() {
-    if (this.status !== 'open') {
-      throw new ModuleError('Database is not open', {
-        code: 'LEVEL_DATABASE_NOT_OPEN',
-      })
-    }
+    this.#assertOpen()
 
     return binding.db_get_identity(this[kContext])
   }
@@ -834,11 +834,7 @@ class RocksLevel extends AbstractLevel<any, any, any> {
     }
 
     // Is synchronous, so can't be deferred
-    if (this.status !== 'open') {
-      throw new ModuleError('Database is not open', {
-        code: 'LEVEL_DATABASE_NOT_OPEN',
-      })
-    }
+    this.#assertOpen()
 
     return binding.db_get_property(this[kContext], property, options ?? kEmpty)
   }
@@ -858,11 +854,7 @@ class RocksLevel extends AbstractLevel<any, any, any> {
     }
 
     // Is synchronous, so can't be deferred
-    if (this.status !== 'open') {
-      throw new ModuleError('Database is not open', {
-        code: 'LEVEL_DATABASE_NOT_OPEN',
-      })
-    }
+    this.#assertOpen()
 
     return binding.db_get_properties(this[kContext], properties, options ?? kEmpty)
   }
@@ -871,11 +863,7 @@ class RocksLevel extends AbstractLevel<any, any, any> {
   // attached and false otherwise. On a RocksStatistics resource this changes
   // collection globally for every DB sharing that resource.
   setStatisticsEnabled(enabled) {
-    if (this.status !== 'open') {
-      throw new ModuleError('Database is not open', {
-        code: 'LEVEL_DATABASE_NOT_OPEN',
-      })
-    }
+    this.#assertOpen()
 
     if (typeof enabled !== 'boolean') {
       throw new TypeError("The 'enabled' argument must be a boolean")
@@ -888,11 +876,7 @@ class RocksLevel extends AbstractLevel<any, any, any> {
   // RocksStatistics resource. Shared snapshots cover all attached DBs. Values
   // above Number.MAX_SAFE_INTEGER may lose integer precision.
   getStatistics() {
-    if (this.status !== 'open') {
-      throw new ModuleError('Database is not open', {
-        code: 'LEVEL_DATABASE_NOT_OPEN',
-      })
-    }
+    this.#assertOpen()
 
     return binding.db_get_statistics(this[kContext])
   }
@@ -905,12 +889,7 @@ class RocksLevel extends AbstractLevel<any, any, any> {
     callback = fromCallback(callback, kPromise)
 
     if (this.status !== 'open') {
-      process.nextTick(
-        callback,
-        new ModuleError('Database is not open', {
-          code: 'LEVEL_DATABASE_NOT_OPEN',
-        })
-      )
+      process.nextTick(callback, notOpenError())
       return callback[kPromise]
     }
 
@@ -931,21 +910,13 @@ class RocksLevel extends AbstractLevel<any, any, any> {
   }
 
   querySync(options) {
-    if (this.status !== 'open') {
-      throw new ModuleError('Database is not open', {
-        code: 'LEVEL_DATABASE_NOT_OPEN',
-      })
-    }
+    this.#assertOpen()
 
     return convertIteratorStopReason(binding.db_query_sync(this[kContext], options ?? kEmpty))
   }
 
   async *updates(options) {
-    if (this.status !== 'open') {
-      throw new ModuleError('Database is not open', {
-        code: 'LEVEL_DATABASE_NOT_OPEN',
-      })
-    }
+    this.#assertOpen()
 
     const handle = binding.updates_init(this[kContext], options)
     let iterationError
@@ -1004,12 +975,7 @@ class RocksLevel extends AbstractLevel<any, any, any> {
     callback = fromCallback(callback, kPromise)
 
     if (this.status !== 'open') {
-      process.nextTick(
-        callback,
-        new ModuleError('Database is not open', {
-          code: 'LEVEL_DATABASE_NOT_OPEN',
-        })
-      )
+      process.nextTick(callback, notOpenError())
       return callback[kPromise]
     }
 
@@ -1033,12 +999,7 @@ class RocksLevel extends AbstractLevel<any, any, any> {
     callback = fromCallback(callback, kPromise)
 
     if (this.status !== 'open') {
-      process.nextTick(
-        callback,
-        new ModuleError('Database is not open', {
-          code: 'LEVEL_DATABASE_NOT_OPEN',
-        })
-      )
+      process.nextTick(callback, notOpenError())
       return callback[kPromise]
     }
 
@@ -1066,12 +1027,7 @@ class RocksLevel extends AbstractLevel<any, any, any> {
     callback = fromCallback(callback, kPromise)
 
     if (this.status !== 'open') {
-      process.nextTick(
-        callback,
-        new ModuleError('Database is not open', {
-          code: 'LEVEL_DATABASE_NOT_OPEN',
-        })
-      )
+      process.nextTick(callback, notOpenError())
       return callback[kPromise]
     }
 

@@ -108,7 +108,7 @@ test('manyKeyMayExist preserves key order for array and packed inputs', async fu
   t.throws(
     () => reopened._manyKeyMayExistSync(['default-present']),
     /requires an open database/,
-    'the raw probe rejects a closed database in development'
+    'the raw probe rejects a closed database'
   )
   t.end()
 })
