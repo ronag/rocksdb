@@ -328,6 +328,26 @@ export interface RocksIteratorReadOptions extends RocksColumnOperationOptions {
   highWaterMarkBytes?: number
   keyFilter?: string
   valueFilter?: string
+  /**
+   * Register an implicit RocksDB snapshot for this iterator. Default `true`.
+   *
+   * Distinct from `abstract-level`'s `snapshot` option, which takes an
+   * `AbstractSnapshot` instance rather than a flag.
+   *
+   * Taking and releasing the snapshot each acquire `DBImpl::mutex_`, and both
+   * happen synchronously on the calling thread — unlike `NewIterator()` and the
+   * initial seek, which are deferred to the thread pool. On a database whose
+   * mutex is contended (flushes, compactions, `getProperty` reads) that turns
+   * iterator creation and close into unbounded stalls on the calling thread.
+   *
+   * With `false` the iterator instead reads at the database's latest sequence as
+   * of `NewIterator()`, and remains internally consistent for its lifetime
+   * through the SuperVersion reference it holds. Safe when the iterator is a
+   * single bounded scan; keep the snapshot when several reads must share one
+   * view, or when compaction must be prevented from dropping versions
+   * superseded after the iterator opened.
+   */
+  implicitSnapshot?: boolean
   backgroundPurgeOnIteratorCleanup?: boolean
   tailing?: boolean
   fillCache?: boolean

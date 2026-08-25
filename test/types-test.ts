@@ -435,7 +435,8 @@ expectType<Array<undefined>>(db.querySync({ keys: false, values: false }).rows)
 expectType<Array<Buffer | undefined>>(db.querySync({ keys: booleanFlag, values: true }).rows)
 expectType<Promise<void>>(db.compactRange({ start: slice, end: Buffer.from('z') }))
 
-const iterator = db._iterator({ gte: slice, valueEncoding: 'buffer' })
+const iterator = db._iterator({ gte: slice, valueEncoding: 'buffer', implicitSnapshot: false })
+db.iterator({ implicitSnapshot: true }).close()
 iterator._seekSync(slice)
 expectType<Promise<void>>(iterator._seekAsync(slice))
 expectType<Promise<RocksPackedIteratorResult | RocksRawIteratorResult<Buffer, Buffer>>>(

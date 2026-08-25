@@ -1593,7 +1593,8 @@ struct BaseIterator : public Closable {
                const std::optional<std::string>& gt,
                const std::optional<std::string>& gte,
                const int limit,
-               rocksdb::ReadOptions readOptions = {})
+               rocksdb::ReadOptions readOptions = {},
+               const bool implicitSnapshot = true)
       : database_(database),
         reference_(std::move(reference)),
         column_(column),
@@ -1633,7 +1634,19 @@ struct BaseIterator : public Closable {
       readOptions_.iterate_lower_bound = &*lower_bound_;
     }
 
-    if (!readOptions_.tailing) {
+    // GetSnapshot() appends to the DB's snapshot list under DBImpl::mutex_, and
+    // the matching ReleaseSnapshot() in CloseResources() takes it again — two
+    // acquisitions of a lock that flushes, compactions and every
+    // need_out_of_mutex=false property read also contend for. Callers that do
+    // not need a pinned read sequence skip both with `implicitSnapshot: false`
+    // (named to avoid abstract-level's own `snapshot` option, which expects an
+    // AbstractSnapshot instance rather than a flag); the
+    // iterator then reads at the DB's latest sequence when NewIterator() runs
+    // and stays consistent for its lifetime via the SuperVersion reference it
+    // holds. Only cross-operation consistency (several iterators/reads sharing
+    // one view) and protection from compaction dropping superseded versions
+    // below the read point actually require the snapshot.
+    if (implicitSnapshot && !readOptions_.tailing) {
       snapshot_ = database_->db->GetSnapshot();
       readOptions_.snapshot = snapshot_;
     }
@@ -2010,6 +2023,9 @@ struct IteratorOptions {
   std::optional<std::string> gte;
   std::optional<std::string> keyFilter;
   std::optional<std::string> valueFilter;
+  // Register a RocksDB snapshot for this iterator (default). Opting out makes
+  // iterator creation and close free of DBImpl::mutex_ — see BaseIterator.
+  bool implicitSnapshot = true;
   rocksdb::ColumnFamilyHandle* column = nullptr;
   Encoding keyEncoding = Encoding::Buffer;
   Encoding valueEncoding = Encoding::Buffer;
@@ -2059,6 +2075,7 @@ static napi_status GetIteratorOptions(napi_env env,
   NAPI_STATUS_RETURN(GetProperty(env, options, "gte", result.gte));
   NAPI_STATUS_RETURN(GetProperty(env, options, "keyFilter", result.keyFilter));
   NAPI_STATUS_RETURN(GetProperty(env, options, "valueFilter", result.valueFilter));
+  NAPI_STATUS_RETURN(GetProperty(env, options, "implicitSnapshot", result.implicitSnapshot));
 
   result.column = database->db->DefaultColumnFamily();
   NAPI_STATUS_RETURN(GetColumnProperty(env, options, database, result.column));
@@ -2139,7 +2156,7 @@ class Iterator final : public BaseIterator, public std::enable_shared_from_this<
            std::shared_ptr<DatabaseReference> reference,
            IteratorOptions options)
       : BaseIterator(database, std::move(reference), options.column, options.reverse, options.lt, options.lte,
-                     options.gt, options.gte, options.limit, options.readOptions),
+                     options.gt, options.gte, options.limit, options.readOptions, options.implicitSnapshot),
         keys_(options.keys),
         values_(options.values),
         highWaterMarkBytes_(static_cast<size_t>(options.highWaterMarkBytes)),
