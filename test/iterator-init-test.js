@@ -254,8 +254,8 @@ test('lazy initialization preserves its construction view and refreshes cleanly'
     t.equal(snapshotCount(db), 0, 'refresh leaves no explicit snapshot registered')
     await refresh.close()
 
-    tailing = db.iterator({ tailing: true })
-    t.equal(snapshotCount(db), 0, 'tailing iterators do not acquire snapshots')
+    tailing = db.iterator({ tailing: true, implicitSnapshot: true })
+    t.equal(snapshotCount(db), 0, 'tailing iterators ignore implicit snapshots')
     await tailing.close()
   } finally {
     await iterator?.close()
