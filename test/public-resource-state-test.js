@@ -91,7 +91,7 @@ test('inherited iterator admission rejects overlapping reads before native entry
   await db.open()
   await db.put('a', '1')
 
-  const iterator = db.iterator()
+  const iterator = db.iterator({ implicitSnapshot: true })
   const originalInitNextv = binding.iterator_init_nextv
   let completeRead
   let nativeReads = 0
@@ -180,7 +180,7 @@ test('retryable empty native pages do not silently end inherited iterators', asy
 test('inherited all rejects rather than returning a truncated timeout prefix', async function (t) {
   const db = testCommon.factory({ keyEncoding: 'utf8', valueEncoding: 'utf8' })
   await db.open()
-  const iterator = db.iterator()
+  const iterator = db.iterator({ implicitSnapshot: true })
   const originalInitNextv = binding.iterator_init_nextv
   const originalNextv = binding.iterator_nextv
   const originalClose = binding.iterator_close_sync

@@ -170,7 +170,7 @@ test('iterator initialization is lazy and asynchronous', async function (t) {
   })
 
   try {
-    const unused = db.iterator()
+    const unused = db.iterator({ implicitSnapshot: true })
     t.equal(initCalls, 0, 'construction does not initialize the native iterator')
     t.equal(snapshotCount(db), 1, 'construction captures one snapshot')
     unused.seek('b')
@@ -179,7 +179,7 @@ test('iterator initialization is lazy and asynchronous', async function (t) {
     t.equal(initCalls, 0, 'closing an unused iterator does not initialize it')
     t.equal(snapshotCount(db), 0, 'closing an unused iterator releases its snapshot')
 
-    const iterator = db.iterator()
+    const iterator = db.iterator({ implicitSnapshot: true })
     hook.enable()
     const first = iterator.next()
     t.equal(initCalls, 1, 'the first read starts initialization once')
@@ -194,7 +194,7 @@ test('iterator initialization is lazy and asynchronous', async function (t) {
     await iterator.close()
     t.equal(snapshotCount(db), 0, 'closing the initialized iterator releases its snapshot')
 
-    const sought = db.iterator()
+    const sought = db.iterator({ implicitSnapshot: true })
     sought.seek('b')
     t.equal(snapshotCount(db), 1, 'a pending seek retains the construction snapshot')
     t.same(await sought.next(), ['b', '2'], 'the initialization worker applies a pending seek')
@@ -224,7 +224,7 @@ test('lazy initialization preserves its construction view and refreshes cleanly'
       { type: 'put', key: 'b', value: 'old-b' }
     ])
 
-    iterator = db.iterator()
+    iterator = db.iterator({ implicitSnapshot: true })
     t.equal(snapshotCount(db), 1, 'lazy iterator owns a snapshot before first use')
     await db.batch([
       { type: 'put', key: 'a', value: 'new-a' },
@@ -238,7 +238,11 @@ test('lazy initialization preserves its construction view and refreshes cleanly'
     ], 'first use observes the view captured at construction')
     t.equal(snapshotCount(db), 0, 'auto-closed all() releases the iterator snapshot')
 
-    refresh = db.iterator({ keyEncoding: 'utf8', valueEncoding: 'utf8' })
+    refresh = db.iterator({
+      keyEncoding: 'utf8',
+      valueEncoding: 'utf8',
+      implicitSnapshot: true
+    })
     await db.put('d', 'new-d')
     refresh._refreshSync()
     const refreshed = refresh._nextvSync(10, { packed: false })
@@ -250,8 +254,8 @@ test('lazy initialization preserves its construction view and refreshes cleanly'
     t.equal(snapshotCount(db), 0, 'refresh leaves no explicit snapshot registered')
     await refresh.close()
 
-    tailing = db.iterator({ tailing: true })
-    t.equal(snapshotCount(db), 0, 'tailing iterators do not acquire snapshots')
+    tailing = db.iterator({ tailing: true, implicitSnapshot: true })
+    t.equal(snapshotCount(db), 0, 'tailing iterators ignore implicit snapshots')
     await tailing.close()
   } finally {
     await iterator?.close()
@@ -285,8 +289,8 @@ test('failed initialization releases native resources and preserves its error', 
     return originalCloseSync(...args)
   }
 
-  const invalidKey = db.iterator({ keyFilter: '[' })
-  const invalidValue = db.iterator({ valueFilter: '[' })
+  const invalidKey = db.iterator({ keyFilter: '[', implicitSnapshot: true })
+  const invalidValue = db.iterator({ valueFilter: '[', implicitSnapshot: true })
   try {
     t.equal(snapshotCount(db), 2, 'failed candidates start with owned snapshots')
 
@@ -330,7 +334,7 @@ test('iterator close waits for held failed initialization cleanup', async functi
     const err = heldInitialization.resume()
     if (err) throw err
   })
-  const iterator = db.iterator({ keyFilter: '[' })
+  const iterator = db.iterator({ keyFilter: '[', implicitSnapshot: true })
   let pending
   let closing
   let cleanupError
@@ -371,7 +375,7 @@ test('sync initialization failure clears its target and closes native state', as
   const db = testCommon.factory()
   await db.open()
 
-  const iterator = db.iterator({ keyFilter: '[' })
+  const iterator = db.iterator({ keyFilter: '[', implicitSnapshot: true })
   try {
     const target = Buffer.alloc(1024 * 1024, 0x62)
     iterator.seek(target)
@@ -412,7 +416,7 @@ test('database close waits for held iterator initialization', async function (t)
     const err = heldInitialization.resume()
     if (err) throw err
   })
-  const iterator = db.iterator()
+  const iterator = db.iterator({ implicitSnapshot: true })
   let pending
   let closing
   let cleanupError
@@ -512,7 +516,7 @@ test('initialization and cleanup errors are both observable', async function (t)
     throw cleanupError
   }
 
-  const iterator = db.iterator()
+  const iterator = db.iterator({ implicitSnapshot: true })
   try {
     const err = await rejection(iterator.next())
     t.ok(err instanceof AggregateError, 'cleanup failure produces an AggregateError')

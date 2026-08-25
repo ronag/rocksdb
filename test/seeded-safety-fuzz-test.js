@@ -614,7 +614,8 @@ test('raw async resources survive forced GC and finalizers release snapshots and
       for (let index = 0; index < operationCount; index++) {
         let iterator = binding.iterator_create(context, {
           keyEncoding: 'buffer',
-          valueEncoding: 'buffer'
+          valueEncoding: 'buffer',
+          implicitSnapshot: true
         })
         registry.register(iterator, 'iterator-' + index)
         iteratorReads.push(nextv(iterator))

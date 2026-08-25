@@ -416,7 +416,7 @@ const annotatedBoundedOptions: RocksGetManyOptions<string, string> = {
 const annotatedBoundedValues = db.getMany(['key'], annotatedBoundedOptions)
 expectTrue<Equal<Awaited<typeof annotatedBoundedValues>, Array<string | undefined>>>()
 
-const query = db.querySync({ gte: slice, lt: Buffer.from('z') })
+const query = db.querySync({ gte: slice, lt: Buffer.from('z'), implicitSnapshot: true })
 expectType<Array<Buffer>>(query.rows)
 expectType<Array<string>>(db.querySync({ keyEncoding: 'utf8', valueEncoding: 'utf8' }).rows)
 expectType<Array<string>>(db.querySync({ keyEncoding: 'utf-8', valueEncoding: 'utf-8' }).rows)
@@ -426,7 +426,7 @@ expectType<
     readonly finished: boolean
     readonly limited: boolean
   }>
->(db.query({ keyEncoding: 'utf-8', valueEncoding: 'utf-8' }))
+>(db.query({ keyEncoding: 'utf-8', valueEncoding: 'utf-8', implicitSnapshot: false }))
 expectType<Array<Buffer | undefined>>(db.querySync({ keys: false, values: true }).rows)
 expectType<Array<string | undefined>>(
   db.querySync({ keyEncoding: 'utf8', keys: true, values: false }).rows
@@ -435,7 +435,8 @@ expectType<Array<undefined>>(db.querySync({ keys: false, values: false }).rows)
 expectType<Array<Buffer | undefined>>(db.querySync({ keys: booleanFlag, values: true }).rows)
 expectType<Promise<void>>(db.compactRange({ start: slice, end: Buffer.from('z') }))
 
-const iterator = db._iterator({ gte: slice, valueEncoding: 'buffer' })
+const iterator = db._iterator({ gte: slice, valueEncoding: 'buffer', implicitSnapshot: false })
+void db.iterator({ implicitSnapshot: true }).close()
 iterator._seekSync(slice)
 expectType<Promise<void>>(iterator._seekAsync(slice))
 expectType<Promise<RocksPackedIteratorResult | RocksRawIteratorResult<Buffer, Buffer>>>(

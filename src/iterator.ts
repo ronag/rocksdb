@@ -327,8 +327,11 @@ class Iterator extends AbstractIterator<any, any, any> {
         this[kValueEncoding]
       )
 
-      // Capture the RocksDB snapshot synchronously, but defer NewIterator and
-      // its initial seek (the potentially blocking work) to the first operation.
+      // By default, defer the RocksDB read point, NewIterator and the initial
+      // seek to the first operation. For non-tailing iterators,
+      // `implicitSnapshot: true` instead captures the read point synchronously
+      // here, preserving construction-time state. Tailing mode does not support
+      // snapshots and keeps the read point deferred.
       this[kContext] = binding.iterator_create(context, bindingOptions)
       this[kInitState] = kUninitialized
       this[kInitCallbacks] = []

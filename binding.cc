@@ -1593,7 +1593,8 @@ struct BaseIterator : public Closable {
                const std::optional<std::string>& gt,
                const std::optional<std::string>& gte,
                const int limit,
-               rocksdb::ReadOptions readOptions = {})
+               rocksdb::ReadOptions readOptions,
+               const bool implicitSnapshot)
       : database_(database),
         reference_(std::move(reference)),
         column_(column),
@@ -1633,7 +1634,13 @@ struct BaseIterator : public Closable {
       readOptions_.iterate_lower_bound = &*lower_bound_;
     }
 
-    if (!readOptions_.tailing) {
+    // When requested, capture the read point synchronously at wrapper
+    // construction. Otherwise RocksDB fixes an implicit, internally consistent
+    // read point when NewIterator() runs. Skipping this package-owned snapshot
+    // avoids the synchronous DBImpl::mutex_ acquisitions in GetSnapshot() and
+    // ReleaseSnapshot(); destroying an initialized iterator may still acquire
+    // that mutex while cleaning up its SuperVersion.
+    if (implicitSnapshot && !readOptions_.tailing) {
       snapshot_ = database_->db->GetSnapshot();
       readOptions_.snapshot = snapshot_;
     }
@@ -2010,6 +2017,8 @@ struct IteratorOptions {
   std::optional<std::string> gte;
   std::optional<std::string> keyFilter;
   std::optional<std::string> valueFilter;
+  // Capture the read point at wrapper construction instead of NewIterator().
+  bool implicitSnapshot = false;
   rocksdb::ColumnFamilyHandle* column = nullptr;
   Encoding keyEncoding = Encoding::Buffer;
   Encoding valueEncoding = Encoding::Buffer;
@@ -2059,6 +2068,7 @@ static napi_status GetIteratorOptions(napi_env env,
   NAPI_STATUS_RETURN(GetProperty(env, options, "gte", result.gte));
   NAPI_STATUS_RETURN(GetProperty(env, options, "keyFilter", result.keyFilter));
   NAPI_STATUS_RETURN(GetProperty(env, options, "valueFilter", result.valueFilter));
+  NAPI_STATUS_RETURN(GetProperty(env, options, "implicitSnapshot", result.implicitSnapshot));
 
   result.column = database->db->DefaultColumnFamily();
   NAPI_STATUS_RETURN(GetColumnProperty(env, options, database, result.column));
@@ -2139,7 +2149,7 @@ class Iterator final : public BaseIterator, public std::enable_shared_from_this<
            std::shared_ptr<DatabaseReference> reference,
            IteratorOptions options)
       : BaseIterator(database, std::move(reference), options.column, options.reverse, options.lt, options.lte,
-                     options.gt, options.gte, options.limit, options.readOptions),
+                     options.gt, options.gte, options.limit, options.readOptions, options.implicitSnapshot),
         keys_(options.keys),
         values_(options.values),
         highWaterMarkBytes_(static_cast<size_t>(options.highWaterMarkBytes)),

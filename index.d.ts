@@ -328,6 +328,25 @@ export interface RocksIteratorReadOptions extends RocksColumnOperationOptions {
   highWaterMarkBytes?: number
   keyFilter?: string
   valueFilter?: string
+  /**
+   * Capture the iterator's read point synchronously when the wrapper is
+   * constructed. Default `false`.
+   *
+   * Distinct from `abstract-level`'s `snapshot` option, which takes an
+   * `AbstractSnapshot` instance rather than a flag.
+   *
+   * With `false`, RocksDB fixes an implicit, internally consistent read point
+   * when `NewIterator()` runs. Public asynchronous iterators defer that work
+   * and their initial seek to the thread pool.
+   *
+   * With `true`, this package registers a RocksDB snapshot immediately and
+   * releases it on close. Those calls synchronously acquire `DBImpl::mutex_`,
+   * so opt in only when writes made between wrapper construction and the first
+   * read must remain invisible. Tailing iterators ignore this option because
+   * RocksDB does not support snapshots in tailing mode. Native iterator cleanup
+   * can still acquire the database mutex regardless of this option.
+   */
+  implicitSnapshot?: boolean
   backgroundPurgeOnIteratorCleanup?: boolean
   tailing?: boolean
   fillCache?: boolean
