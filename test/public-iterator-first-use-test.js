@@ -178,7 +178,7 @@ test('explicit nextv option errors precede lazy native filter errors', async fun
   const db = testCommon.factory()
   await db.open()
 
-  const iterator = db.iterator({ keyFilter: '[' })
+  const iterator = db.iterator({ keyFilter: '[', implicitSnapshot: true })
   const originalInitNextv = binding.iterator_init_nextv
   const optionError = new Error('timeout getter failed during combined admission')
   let initNextvCalls = 0
@@ -215,7 +215,7 @@ test('first all with explicit options uses the combined worker', async function 
   await db.open()
   await seed(db, 2)
 
-  const iterator = db.iterator({ limit: 1 })
+  const iterator = db.iterator({ limit: 1, implicitSnapshot: true })
   const originalInit = binding.iterator_init
   const originalInitNextv = binding.iterator_init_nextv
   let initCalls = 0
@@ -263,7 +263,7 @@ test('combined public read scheduling failures are sticky and retain cleanup err
   const originalClose = binding.iterator_close_sync
   const initializationError = new Error('combined read scheduling failed')
   const cleanupError = new Error('combined read scheduling cleanup failed')
-  const iterator = db.iterator()
+  const iterator = db.iterator({ implicitSnapshot: true })
   let initCalls = 0
   let closeCalls = 0
 
@@ -312,7 +312,7 @@ test('combined public reads distinguish sticky initialization failures from reco
     return originalInitNextv(...args)
   }
 
-  const invalid = db.iterator({ keyFilter: '[' })
+  const invalid = db.iterator({ keyFilter: '[', implicitSnapshot: true })
   let recoverable
   let autoClosing
   try {
@@ -332,7 +332,7 @@ test('combined public reads distinguish sticky initialization failures from reco
       return originalInitNextv(...args)
     }
 
-    recoverable = db.iterator()
+    recoverable = db.iterator({ implicitSnapshot: true })
     t.equal(await rejection(recoverable.nextv(1)), readError,
       'nextv() preserves the post-initialization error object')
     t.equal(snapshotCount(db), 1, 'a recoverable read keeps its live snapshot')
@@ -350,7 +350,7 @@ test('combined public reads distinguish sticky initialization failures from reco
       args[args.length - 1] = (err, result) => callback(err || readError, result)
       return originalInitNextv(...args)
     }
-    autoClosing = db.iterator({ limit: 1 })
+    autoClosing = db.iterator({ limit: 1, implicitSnapshot: true })
     t.equal(await rejection(autoClosing.all()), readError,
       'all() preserves the post-initialization error object')
     t.equal(snapshotCount(db), 0, 'failed all() auto-closes and releases its snapshot')
@@ -373,7 +373,7 @@ for (const operation of ['nextv', 'all']) {
     await db.open()
     await seed(db, 2)
 
-    const iterator = db.iterator({ limit: 1 })
+    const iterator = db.iterator({ limit: 1, implicitSnapshot: true })
     const originalInitNextv = binding.iterator_init_nextv
     let nativeCompletion
     let nativeCompleted

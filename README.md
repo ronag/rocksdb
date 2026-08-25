@@ -130,6 +130,19 @@ event loop. In particular this includes `_manyKeyMayExistSync()`,
 Iterator `_closeAsync()` also performs native cleanup synchronously and defers
 only its completion notification.
 
+## Iterator read points
+
+By default, an iterator fixes its internally consistent RocksDB read point when
+the native iterator is created on first use. Writes made after `db.iterator()`
+but before the first read can therefore be visible.
+
+Set `implicitSnapshot: true` on `iterator()`, `keys()`, `values()`, `query()` or
+`querySync()` to capture the read point synchronously when the wrapper is
+constructed. This preserves construction-time state, but registering and
+releasing that package-owned snapshot both acquire RocksDB's database mutex on
+the calling thread. An initialized native iterator can also acquire that mutex
+during cleanup regardless of this option.
+
 ## Deferred iterator `all()` options
 
 Abstract-level 3.1.1 does not forward per-read options from `all(options)` when

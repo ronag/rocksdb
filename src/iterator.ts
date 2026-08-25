@@ -327,11 +327,9 @@ class Iterator extends AbstractIterator<any, any, any> {
         this[kValueEncoding]
       )
 
-      // Capture the RocksDB snapshot synchronously, but defer NewIterator and
-      // its initial seek (the potentially blocking work) to the first operation.
-      // The snapshot itself still takes DBImpl::mutex_ here (and again on
-      // close), so a bounded single scan can drop it with `implicitSnapshot: false` and
-      // leave this constructor free of database locks entirely.
+      // By default, defer the RocksDB read point, NewIterator and the initial
+      // seek to the first operation. `implicitSnapshot: true` instead captures
+      // the read point synchronously here, preserving construction-time state.
       this[kContext] = binding.iterator_create(context, bindingOptions)
       this[kInitState] = kUninitialized
       this[kInitCallbacks] = []

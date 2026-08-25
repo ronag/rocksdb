@@ -1593,8 +1593,8 @@ struct BaseIterator : public Closable {
                const std::optional<std::string>& gt,
                const std::optional<std::string>& gte,
                const int limit,
-               rocksdb::ReadOptions readOptions = {},
-               const bool implicitSnapshot = true)
+               rocksdb::ReadOptions readOptions,
+               const bool implicitSnapshot)
       : database_(database),
         reference_(std::move(reference)),
         column_(column),
@@ -1634,18 +1634,12 @@ struct BaseIterator : public Closable {
       readOptions_.iterate_lower_bound = &*lower_bound_;
     }
 
-    // GetSnapshot() appends to the DB's snapshot list under DBImpl::mutex_, and
-    // the matching ReleaseSnapshot() in CloseResources() takes it again — two
-    // acquisitions of a lock that flushes, compactions and every
-    // need_out_of_mutex=false property read also contend for. Callers that do
-    // not need a pinned read sequence skip both with `implicitSnapshot: false`
-    // (named to avoid abstract-level's own `snapshot` option, which expects an
-    // AbstractSnapshot instance rather than a flag); the
-    // iterator then reads at the DB's latest sequence when NewIterator() runs
-    // and stays consistent for its lifetime via the SuperVersion reference it
-    // holds. Only cross-operation consistency (several iterators/reads sharing
-    // one view) and protection from compaction dropping superseded versions
-    // below the read point actually require the snapshot.
+    // When requested, capture the read point synchronously at wrapper
+    // construction. Otherwise RocksDB fixes an implicit, internally consistent
+    // read point when NewIterator() runs. Skipping this package-owned snapshot
+    // avoids the synchronous DBImpl::mutex_ acquisitions in GetSnapshot() and
+    // ReleaseSnapshot(); destroying an initialized iterator may still acquire
+    // that mutex while cleaning up its SuperVersion.
     if (implicitSnapshot && !readOptions_.tailing) {
       snapshot_ = database_->db->GetSnapshot();
       readOptions_.snapshot = snapshot_;
@@ -2023,9 +2017,8 @@ struct IteratorOptions {
   std::optional<std::string> gte;
   std::optional<std::string> keyFilter;
   std::optional<std::string> valueFilter;
-  // Register a RocksDB snapshot for this iterator (default). Opting out makes
-  // iterator creation and close free of DBImpl::mutex_ — see BaseIterator.
-  bool implicitSnapshot = true;
+  // Capture the read point at wrapper construction instead of NewIterator().
+  bool implicitSnapshot = false;
   rocksdb::ColumnFamilyHandle* column = nullptr;
   Encoding keyEncoding = Encoding::Buffer;
   Encoding valueEncoding = Encoding::Buffer;

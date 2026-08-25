@@ -17,7 +17,7 @@ test('private cleanup retries transient iterator and batch failures', async func
   const db = testCommon.factory()
   await db.open()
 
-  const iterator = db.iterator()
+  const iterator = db.iterator({ implicitSnapshot: true })
   const originalIteratorClose = binding.iterator_close_sync
   const iteratorErrors = [
     new Error('first iterator cleanup failed'),
@@ -75,7 +75,7 @@ for (const method of ['keys', 'values']) {
     const db = testCommon.factory()
     await db.open()
 
-    const iterator = db[method]()
+    const iterator = db[method]({ implicitSnapshot: true })
     const originalClose = binding.iterator_close_sync
     const cleanupErrors = [
       new Error(`first ${method} iterator cleanup failed`),
@@ -111,7 +111,7 @@ for (const method of ['keys', 'values']) {
 test('inherited iterator close reports exhausted private cleanup attempts once', async function (t) {
   const db = testCommon.factory()
   await db.open()
-  const iterator = db.iterator()
+  const iterator = db.iterator({ implicitSnapshot: true })
   const originalClose = binding.iterator_close_sync
   const cleanupErrors = [
     new Error('first iterator cleanup failed'),
@@ -187,7 +187,7 @@ test('inherited chained batch close reports exhausted private cleanup attempts o
 test('database close recovers exhausted iterator and batch cleanup resources', async function (t) {
   const db = testCommon.factory()
   await db.open()
-  const iterator = db.iterator()
+  const iterator = db.iterator({ implicitSnapshot: true })
   const batch = db.batch().put('key', 'value')
   const originalIteratorClose = binding.iterator_close_sync
   const originalBatchClear = binding.batch_clear
@@ -585,9 +585,9 @@ test('database close cleans inherited iterator and batch resources', async funct
   await db.open()
   const location = db.location
 
-  db.iterator()
-  db.keys()
-  db.values()
+  db.iterator({ implicitSnapshot: true })
+  db.keys({ implicitSnapshot: true })
+  db.values({ implicitSnapshot: true })
   db.batch().put('key', 'value')
 
   t.ok(Number(db.getProperty('rocksdb.num-snapshots')) > 0,
@@ -607,7 +607,7 @@ test('started inherited async iteration closes its native snapshot', async funct
   await db.open()
   await db.put('key', 'value')
 
-  const iterator = db.iterator()
+  const iterator = db.iterator({ implicitSnapshot: true })
   const protocol = iterator[Symbol.asyncIterator]()
 
   t.deepEqual(await protocol.next(), {
