@@ -342,8 +342,9 @@ export interface RocksIteratorReadOptions extends RocksColumnOperationOptions {
    * With `true`, this package registers a RocksDB snapshot immediately and
    * releases it on close. Those calls synchronously acquire `DBImpl::mutex_`,
    * so opt in only when writes made between wrapper construction and the first
-   * read must remain invisible. Native iterator cleanup can still acquire the
-   * database mutex regardless of this option.
+   * read must remain invisible. Tailing iterators ignore this option because
+   * RocksDB does not support snapshots in tailing mode. Native iterator cleanup
+   * can still acquire the database mutex regardless of this option.
    */
   implicitSnapshot?: boolean
   backgroundPurgeOnIteratorCleanup?: boolean

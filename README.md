@@ -140,8 +140,9 @@ Set `implicitSnapshot: true` on `iterator()`, `keys()`, `values()`, `query()` or
 `querySync()` to capture the read point synchronously when the wrapper is
 constructed. This preserves construction-time state, but registering and
 releasing that package-owned snapshot both acquire RocksDB's database mutex on
-the calling thread. An initialized native iterator can also acquire that mutex
-during cleanup regardless of this option.
+the calling thread. Tailing iterators ignore this option because RocksDB does
+not support snapshots in tailing mode. An initialized native iterator can also
+acquire that mutex during cleanup regardless of this option.
 
 ## Deferred iterator `all()` options
 
